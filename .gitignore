@@ -1,0 +1,7 @@
+__pycache__
+charts/
+plans/
+renders/
+target/
+node_modules/
+backends/scrcpy-server*
