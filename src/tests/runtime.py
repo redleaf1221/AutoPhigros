@@ -131,13 +131,25 @@ def check_gate() -> tuple[list[str], str]:
         seen: list[tuple[str, object]] = []
         agent.on_play_state = lambda playing, moment: seen.append(("play", (playing, moment)))
         agent.on_level_gone = lambda moment: seen.append(("gone", moment))
+        if agent.playing is not None:
+            problems.append("还没观测到的时候，播放状态该是 None，不是 False")
+        # 主来源是 progress 采样里带的 isPlaying —— `Play` 起播时不响，只有它能说"在走"
+        feed(agent, "progress", time=7.5, playing=True)
+        if agent.playing is not True:
+            problems.append("progress 里带的 isPlaying 没被采纳（status 会一直说'没观测到'）")
+        feed(agent, "progress", time=7.6, playing=None)
+        if agent.playing is not True:
+            problems.append("读不到 isPlaying 的那一次不该把上一次的观测抹掉")
+        feed(agent, "progress", time=7.7, playing=False)
+        if agent.playing is not False:
+            problems.append("progress 里的 isPlaying=false 没被采纳")
         feed(agent, "play-state", playing=False, time=7.8)
         feed(agent, "play-state", playing=True, time=7.8)
         feed(agent, "level-gone", time=7.9)
         if seen != [("play", (False, 7.8)), ("play", (True, 7.8)), ("gone", 7.9)]:
             problems.append(f"播放状态 / 关卡销毁没有原样转给主机：{seen}")
-        if agent.playing:
-            problems.append("关卡销毁之后 agent 还说自己'在播'")
+        if agent.playing is not None:
+            problems.append(f"关卡销毁之后不该继续替游戏说播放状态：{agent.playing!r}")
 
     captured = buffer.getvalue()
     return problems, captured if problems else ""

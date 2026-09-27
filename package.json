@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Automated Phigros play.",
   "license": "AGPL-3.0",
-  "author": "",
+  "author": "MathTangent",
   "main": "",
   "scripts": {
     "build": "esbuild frida/index.ts --bundle --outfile=./target/_.js"

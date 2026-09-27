@@ -37,14 +37,7 @@ export const state = {
     /** 安装 hook 时留下的类引用，采集时直接复用，不重复查表。 */
     classes: {
         gameInformation: null as Il2Cpp.Class | null
-    },
-
-    /**
-     * 游戏自己在说"音乐在走还是停着"（``ProgressControl::Play(bool)`` 的最近一次调用）。
-     *
-     * 有了它，主机不必再靠"值多久没变"去猜暂停 —— 这一项是**观测结果**，不是推断。
-     */
-    playing: false
+    }
 };
 
 /** 换一关：把只属于上一局的账清掉。 */

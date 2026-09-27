@@ -9,11 +9,15 @@
  *
  * 反编译依据（详见 protocol.ts 里两个常量的注释）：
  *
- *     ProgressControl::Play(bool)   0x1d34270   ← 暂停菜单的每一条路都汇到这里
+ *     ProgressControl::Play(bool)   0x1d34270   ← 暂停 / 恢复 / 退场三条路汇到这里
  *       play == false: isPlaying = 0 / 音量归零 / audioSource.Pause() / 开 pauseBar
  *       play == true : 音量恢复 / audioSource 继续 / 关 pauseBar
  *
  *     LevelControl::OnDestroy()     0x1d25118   ← 退出、重开、结算清场都走它
+ *
+ * **别把它当成"音乐在走吗"的唯一来源**：全 .so 里只有四个调用点，**开谱起播一个都不是**
+ * （`isPlaying` 在构造函数里就是 true）。所以"现在在不在走"要看 ``progress`` 采样里带的
+ * 那个字段，"刚刚变了"才看这里的事件。踩过：一局 All Perfect，主机却一直在报"音乐没在走"。
  *
  * 顺带解决了一件计时上的老问题：**"时钟为什么停住"不用再靠 250ms 的值不变去猜** ——
  * 游戏在这一刻明说了。
@@ -22,7 +26,6 @@
 import { findClass, readNumberField } from "../bridge";
 import { LEVEL_DESTROY_METHOD, PLAY_METHOD, PROGRESS_CONTROL_TYPE } from "../protocol";
 import type { LevelGoneEvent, PlayStateEvent } from "../protocol";
-import { state } from "../state";
 
 /** `ProgressControl` 上那个"当前游戏时间"，暂停时它就钉住不动。 */
 const NOW_TIME_FIELD = "nowTime";
@@ -52,7 +55,6 @@ export function installPlayStateHook(ProgressControl: Il2Cpp.Class): void {
                 time: nowTime(this as Il2Cpp.Object),
                 at: Date.now()
             };
-            state.playing = message.playing;
             send(message);
         } catch (error) {
             send({ event: "warn", reason: `上报播放状态失败：${String(error)}` });
@@ -93,8 +95,6 @@ export function installLevelGoneHook(LevelControl: Il2Cpp.Class): void {
         } catch (error) {
             send({ event: "warn", reason: `上报关卡销毁失败：${String(error)}` });
         }
-        state.playing = false;
-
         (this as Il2Cpp.Object).method<void>(LEVEL_DESTROY_METHOD, 0).invoke();
     };
 

@@ -102,14 +102,21 @@ export const NOTE_TABLE_METHOD = "SetInformation";
 export const LEVEL_RESULT_METHOD = "GetLevelResultInfo";
 
 /**
- * 播放状态的总闸：``ProgressControl::Play(bool)``（``0x1d34270``）。
+ * 暂停 / 恢复 / 退场的那个闸：``ProgressControl::Play(bool)``（``0x1d34270``）。
  *
- * 暂停菜单的每一条路都汇到它这里（反编译依据）：
+ * **全部调用点只有四处**（把整个 .so 里指向它的调用点列出来数的，一个不漏）：
  *
  * * ``Pause::Update`` 里 tag 为 ``"Resume"`` 的按钮 → ``Play(true)``；
  * * 暂停动作（``Pause::Update`` 尾部 ``SetActive(false)`` + 0.5s 延时）→ ``Play(false)``；
  * * 右上角手势 ``JudgeControl::CheckPause``（``0x1d20a38``）→ ``Play(false)``；
- * * 开谱起播 ``ProgressControl::Update`` → ``Play(true)``。
+ * * ``ProgressControl::Update``（``0x1d3483c``）里 ``leave`` 那条分支 → ``Play(false)``。
+ *
+ * **开谱起播不经过它，一次都不响。** 这条踩过，代价是一整局都在说反话：早先这里写着
+ * "``Update`` → 起播 → ``Play(true)``"，于是主机把 ``play-state`` 当成"音乐在走吗"的唯一
+ * 来源，结果一局 All Perfect 打完，`status` 从头到尾都在报"音乐没在走"（真机日志
+ * `logs/2026-09-27_21-46-38.log`）。真正的原因是 ``isPlaying`` 在 ``ProgressControl`` 的
+ * **构造函数**里就被置成 ``true``（``_ZN15ProgressControlC1Ev``），起播不需要谁去调 ``Play``。
+ * 所以"现在在不在走"要**读字段**（见 ``ProgressEvent.playing``），事件只负责说"它刚变了"。
  *
  * ``play == false`` 的实现体里做的是：``isPlaying = 0``、音量归零、``audioSource.Pause()``、
  * 打开 ``pauseBar`` / ``pauseCamera``、把 Guide 的 Animator 速度设 0 —— 也就是说
@@ -237,6 +244,14 @@ export interface ReleasedEvent {
 export interface ProgressEvent {
     event: "progress";
     time: number;
+    /**
+     * ``ProgressControl.isPlaying``（字段偏移 ``0x82``）：游戏自己在说的"音乐在走吗"。
+     *
+     * 为什么跟着时钟一起回传：``Play`` **起播时不响**（见 ``PLAY_METHOD``），所以光靠那个
+     * 事件，主机在第一声之前永远不知道状态 —— 而字段是构造函数置的初值 + ``Play`` 的写，
+     * 读它是**观测**。读不到（换版本、字段名对不上）就是 ``null``，由主机决定怎么退化。
+     */
+    playing: boolean | null;
 }
 
 /**
@@ -270,10 +285,10 @@ export interface NoteIndexEvent {
     at: number;
 }
 
-/** ``ProgressControl::Play(bool)`` 的每一次调用：游戏自己在说"我停住了 / 我继续了"。 */
+/** ``ProgressControl::Play(bool)`` 的每一次调用：游戏自己在说"我停住了 / 我又走了"。 */
 export interface PlayStateEvent {
     event: "play-state";
-    /** true = 起播或恢复，false = 暂停。 */
+    /** true = 从暂停恢复（**起播不走这条路**），false = 暂停 / 退场。 */
     playing: boolean;
     /** 调用这一刻游戏的 ``nowTime``（秒）—— 暂停时它就是"停在哪一秒"。 */
     time: number | null;

@@ -6,6 +6,7 @@ import contextlib
 import io
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from formats.storage import ChartRef
 from .stubs import Recorder, make_config, make_controller
@@ -461,7 +462,12 @@ def _check_shutdown() -> list[str]:
     code, calls = run_main(spy, "park")
     expect(code == 0 and calls[-1:] == ["shutdown"], f"控制台自然结束之后没有收工：{calls}")
 
-    # 7) 一直等不到时钟、一个事件都没发：必须出声（那种局会一个音符都按不到）。
+    # 7) 等不到时钟：**判据是游戏时钟自己**，不是墙上的时间。
+    #    踩过（logs/2026-09-27_21-46-38.log）：原先只看"播放器起来之后过了几秒还没发第一个
+    #    事件"，而播放器是在**闸门放行之前**架好的 —— 闸门一开游戏还得起播、再走到谱面 1.8s，
+    #    加起来轻松超过 3s，于是每一局都误报"这一局很可能一个音符都按不到"，紧接着打出一个
+    #    All Perfect。用墙上的时间量游戏里的事，必然这样。
+    #
     #    注意这里**只报不改状态** —— "这一局还在不在"由 agent 的暂停/退场 hook 说了算，
     #    不许拿"多久没样本"去猜（暂停与退出在样本上只差一次抖动那么宽）。
     class IdlePlayer:
@@ -476,33 +482,57 @@ def _check_shutdown() -> list[str]:
         def join(self, timeout: float | None = None) -> bool:
             return True
 
-    controller = make_controller()
-    controller._report = lambda player: None  # type: ignore[method-assign]
-    now = time.monotonic()
-    controller.clock.feed(0.00001, host_time=now)  # 起播前：钉着的值
-    player = IdlePlayer()
-    controller.player = player
-    controller._player_started = now - 5.0  # noqa: SLF001
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-        controller._check_clock_wait()  # noqa: SLF001
-    expect("还没发出第一个事件" in buffer.getvalue(), f"等不到时钟却没吭声：{buffer.getvalue()!r}")
-    expect(player.stopped == 0, "等时钟不是收工，不该把播放器停掉")
-    expect(controller.player is player, "报一声就够了，不许顺手把状态改了")
+    def waiting(
+        now: float | None,
+        *,
+        elapsed: float = 5.0,
+        held: bool = False,
+        playing: bool | None = None,
+    ) -> tuple[str, IdlePlayer]:
+        """架一个"一个事件都没发"的现场，返回 (报出来的话, 播放器)。"""
+        controller = make_controller()
+        controller._report = lambda player: None  # type: ignore[method-assign]
+        if playing is not None:
+            controller.agent = SimpleNamespace(pid=None, level_label="?", playing=playing)  # type: ignore[assignment]
+        player = IdlePlayer()
+        controller.player = player
+        moment = time.monotonic()
+        if now is not None:
+            controller.clock.feed(now, host_time=moment)
+        if held:
+            controller.clock.hold()
+        controller._clock_wait_from = moment - elapsed  # noqa: SLF001
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            controller._check_clock_wait()  # noqa: SLF001
+        return buffer.getvalue(), player
 
-    # 8) 暂停（样本照来、值不变）不该放行后面的事件 —— 这一条在时钟自检里已覆盖，
-    #    这里只确认"停住"不会把播放器看跑掉
-    controller = make_controller()
-    controller._report = lambda player: None  # type: ignore[method-assign]
-    now = time.monotonic()
-    for offset in (0.0, 0.5, 1.0, 1.5):
-        controller.clock.feed(5.0, host_time=now - 1.6 + offset)
-    player = IdlePlayer()
-    controller.player = player
-    controller._player_started = now - 5.0  # noqa: SLF001
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        controller._check_clock_wait()  # noqa: SLF001
-    expect(player.stopped == 0, "暂停期间不该把播放器停掉（那是 hook 的活）")
+    # 7a) **这次那个假警报的回归**：时钟在走、只是还没走到第一个事件 —— 等着就是对的
+    text, player = waiting(0.00001)
+    expect(not text, f"时钟还没走到第一个事件就报警了（就是那个假警报）：{text!r}")
+    expect(player.stopped == 0, "等时钟不是收工，不该把播放器停掉")
+
+    # 7b) 真故障：游戏时钟已经越过第一个事件，却一个事件都没发 —— 必须出声
+    text, player = waiting(2.400)
+    expect("越过了首个事件" in text, f"时钟过了第一个事件还没发事件，却一声不吭：{text!r}")
+    expect(player.stopped == 0, "报一声就够了，不许顺手把状态改了")
+
+    # 7b') 但"刚过一点点"不算：poll 每 0.2s 一眼、播放器 2ms 醒一次，判据得留余量
+    #      （`CLOCK_LATE_MARGIN`）—— 没余量就会与播放器赛跑，而这条只报一次
+    text, _ = waiting(1.600)
+    expect(not text, f"才刚过第一个事件就报警（会与播放器赛跑）：{text!r}")
+
+    # 7c) 时钟 hook 断了（一个样本都没来）也要出声，但不能太早
+    text, _ = waiting(None)
+    expect("一个时钟样本都没来" in text, f"一个样本都没有却一声不吭：{text!r}")
+    text, _ = waiting(None, elapsed=1.0)
+    expect(not text, f"才等了 1s 就报「一个样本都没来」：{text!r}")
+
+    # 8) 暂停不算"等不到"：时钟被我们自己按住、或者游戏说没在走 —— 谁都不该发事件
+    text, _ = waiting(2.400, held=True)
+    expect(not text, f"暂停（时钟按住）期间不该报等不到时钟：{text!r}")
+    text, _ = waiting(2.400, playing=False)
+    expect(not text, f"游戏自己说停着的时候不该报等不到时钟：{text!r}")
 
     # 9) 游戏自己报的暂停 / 退场：**信号驱动**，不是计时推断
     #    暂停 = 把按着的手指抬起来（排期停了不等于手抬了），但**不停播放器**（时钟只是钉住，
@@ -588,6 +618,27 @@ def _check_shutdown() -> list[str]:
     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         controller.detach()
     expect("没在注入" in buffer.getvalue(), f"没 agent 时要说明白：{buffer.getvalue()!r}")
+
+    # 11) `status` 里那句"游戏在不在走"：**没观测到就说不知道**，不许替游戏下结论。
+    #     踩过（logs/2026-09-27_21-46-38.log）：`agent.playing` 原先是个初值 False 的 bool，
+    #     而 `Play` 起播时不响 —— 于是一局 All Perfect 打完，status 从头到尾报"音乐没在走"。
+    controller = make_controller()
+    controller._report = lambda player: None  # type: ignore[method-assign]
+    controller.agent_state = "ok"
+    agent = SimpleNamespace(pid=None, level_label="?", playing=None)
+    controller.agent = agent  # type: ignore[assignment]
+
+    def playing_line() -> str:
+        return next((line for line in controller.status_lines() if "游戏那边" in line), "")
+
+    expect("还没观测到" in playing_line(), f"没观测到时不该下结论：{playing_line()!r}")
+    agent.playing = True
+    expect(
+        "在走" in playing_line() and "没在走" not in playing_line(),
+        f"游戏在走时没说对：{playing_line()!r}",
+    )
+    agent.playing = False
+    expect("没在走" in playing_line(), f"游戏停着时没说对：{playing_line()!r}")
 
     return problems
 

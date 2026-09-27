@@ -108,18 +108,25 @@ agent 拆成模块之后，`../frida/index.ts` 只剩"找类、按顺序装、�
 
 ### 暂停、退场：让游戏自己说，别拿计时去猜
 
-`ProgressControl::Play(bool)`（`0x1d34270`）是**播放状态的唯一总闸**，反编译出来的调用点：
+`ProgressControl::Play(bool)`（`0x1d34270`）是**暂停 / 恢复 / 退场**的那个闸，反编译出来的
+调用点（整个 `.so` 里指向它的都在这儿）：
 
 | 谁调它 | 什么时候 | 参数 |
 |---|---|---|
 | `JudgeControl::CheckPause` `0x1d20a38` | 右上角暂停手势（`pauseTime = 1.2`，见 §6.8） | `false` |
 | `Pause::Update` `0x1d33920` 尾部 | 暂停动作（`SetActive(false)` + `SimpleDelay(0.5s)` 之后） | `false` |
 | `Pause::Update` 里 tag 为 `"Resume"` 的按钮 | 点"继续" | `true` |
-| `ProgressControl::Update` | 开谱起播 | `true` |
+| `ProgressControl::Update` 的 `leave` 分支 | 退出这一局 | `false` |
 
 `play == false` 的实现体里干的是：`isPlaying = 0`、音量归零、`audioSource.Pause()`、打开
 `pauseBar` / `pauseCamera`、把 Guide 的 `Animator.speed` 设 0 —— **游戏自己的时钟就是在这一刻
 停住的**。所以"暂停/恢复"根本不用主机去推断（原先靠"250ms 值不变"认，现在有信号了）。
+
+**但"音乐现在在不在走"不能只看它**：`Play` **开谱起播时不响**（`isPlaying` 在
+`ProgressControl` 的构造函数里就已经是 true，起播不需要谁去调 `Play`）。状态要**读字段** ——
+`progress` 采样每次都把 `isPlaying`（偏移 `0x82`）捎回来，事件只负责说"它刚变了"。
+实机踩过：一局 All Perfect 从头到尾被报成"音乐没在走"，就是拿事件当唯一来源
+（`logs/2026-09-27_21-46-38.log`）。
 
 `Pause::Update` 里剩下的分支（同一帧里对触点做 `Physics2D` 射线、读命中物体的 tag）：
 

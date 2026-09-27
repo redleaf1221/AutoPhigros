@@ -1061,7 +1061,8 @@ if (nowTime > (note->realTime + note->holdTime + 0.25)) {
 
 `JudgeControl::CheckPause` @ `0x1d20a38`：手指落在右上角（世界坐标 `x ∈ [−8.8, −8.0]`、`y ∈ [4.05, 4.85]`，窄屏另有换算）触发暂停，`pauseTime = 1.2`；长按则继续播放。
 
-**播放状态的唯一总闸：`ProgressControl::Play(bool)` @ `0x1d34270`。**
+**暂停 / 恢复 / 退场的总闸：`ProgressControl::Play(bool)` @ `0x1d34270`。**
+"现在在不在走"看的是 `isPlaying` 字段（偏移 `0x82`），**不是**这个方法的调用记录 —— 见下面的勘误。
 
 ```c
 void ProgressControl::Play(bool play) {
@@ -1079,14 +1080,23 @@ void ProgressControl::Play(bool play) {
 }
 ```
 
-调用点（全部反编译确认）：
+调用点（整个 `.so` 里指向它的调用点全列出来了，一个不漏）：
 
 | 调用者 | 时机 | 参数 |
 |---|---|---|
 | `JudgeControl::CheckPause` @ `0x1d20a38` | 右上角手势 | `false` |
 | `Pause::Update` @ `0x1d33920` 尾部 | 暂停动作（`SetActive(false)` + `SimpleDelay(0.5s)` 之后经 `Pause::__c__DisplayClass8_0::_Update_b__0`） | `false` |
 | `Pause::Update` 中 tag 为 `"Resume"` 的按钮 | 点"继续" | `true` |
-| `ProgressControl::Update` @ `0x1d3483c` | 开谱起播 | `true` |
+| `ProgressControl::Update` @ `0x1d3483c` 的 `leave` 分支 | 退出这一局 | `false` |
+
+> **勘误（实机踩到，`logs/2026-09-27_21-46-38.log`）**：上面最后一格原先写的是
+> 「`ProgressControl::Update` | **开谱起播** | `true`」—— **错的**。`Update` 里那处调用走的是
+> `leave` 分支、参数是 `false`；**开谱起播根本不调 `Play`**。
+>
+> 状态的真身在字段上：`isPlaying`（偏移 `0x82`）在 `ProgressControl` 的**构造函数**里就是
+> `true`（`_ZN15ProgressControlC1Ev`），`Play(false)` 清 0、`Play(true)` 置回 1。
+> 于是"现在在不在走"必须**读字段**，`Play` 的调用只能说明"它刚变了"。
+> 把事件当成唯一来源的代价：一局 All Perfect 打完，主机从头到尾报"音乐没在走"。
 
 **暂停菜单本体：`Pause` 类**（`OnEnable` `0x1d343fc`、`Update` `0x1d33920`、`StartNextScene` 协程 `0x1d34210`）。`Update` 每帧对触点做 `Physics2D` 射线，按命中物体的 **tag** 分流：
 

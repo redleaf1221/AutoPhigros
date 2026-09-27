@@ -171,8 +171,21 @@ class Agent:
         self.on_level_gone: Callable[[float | None], None] | None = None
         """这一局没了（关卡对象销毁）时调它，由 :class:`Controller` 装上。"""
 
-        self.playing = False
-        """游戏自己在说的"音乐在走吗"。``False`` 一开始就成立：还没起播。"""
+        self.playing: bool | None = None
+        """游戏自己在说的"音乐在走吗"。``None`` = 还没观测到。
+
+        两个来源，都是**观测**：
+
+        * ``progress`` 采样里带的 ``ProgressControl.isPlaying``（每 100ms 一次，主力）——
+          它在 ``ProgressControl`` 的构造函数里就是 true、``Play(false)`` 才清 0，
+          所以从起播第一刻起就是准的；
+        * ``play-state`` 事件（``Play`` 的调用）—— 只在**暂停 / 恢复 / 退场**三条路上响，
+          **开谱起播不经过它**。
+
+        踩过：这两个字段以前是个 bool、初值 False，而事件永远等不到第一声 —— 于是一局
+        All Perfect 打完，`status` 从头到尾都在报"音乐没在走"。那是把"没听到"当成了
+        "没在走"。现在没观测到就是 None，`status` 照实说不知道。
+        """
 
         self.on_result: Callable[[int], None] | None = None
         """一局结算时报一声（主机拿它做延迟自校准），由 :class:`Controller` 装上。"""
@@ -415,6 +428,10 @@ class Agent:
         elif event == "note-index":
             log(f"[notes] 音符表就绪：{int(payload.get('notes') or 0)} 个音符")
         elif event == "progress":
+            # 播放状态跟时钟一起采样：它是"音乐在走吗"唯一的观测，读不到就是 None
+            observed = payload.get("playing")
+            if observed is not None:
+                self.playing = bool(observed)
             if self.clock is not None:
                 self.clock.feed(float(payload.get("time") or 0.0))
         elif event == "play-state":
@@ -484,7 +501,8 @@ class Agent:
         这是"关卡跑掉了"唯一的**信号**（不是计时推断）。剩下的排期没有去处，所以回调
         那边会停触控、清时钟并明说一句。
         """
-        self.playing = False
+        self.playing = None
+        """这一局没了：播放状态无从谈起，别再替游戏说。"""
         self.perfect_deltas = []
         moment = payload.get("time")
         if self.on_level_gone is not None:
@@ -671,6 +689,8 @@ class Agent:
         self.level_label = f"{song} [{level}]"
         self.judge_mismatches = 0
         self.perfect_deltas = []
+        self.playing = None
+        """新的一局：上一局的播放状态对它没有意义，等这一次采样。"""
         self.gate_open = start.seq
         log(f"[gate #{start.seq:04d}] 谱面启动：{song}，镜像 {state}（游戏已停住）")
         log(f"            游戏延迟 {_offset_text(start.offset)}")

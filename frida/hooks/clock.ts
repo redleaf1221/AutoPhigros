@@ -2,10 +2,16 @@
  * hook 6：游戏时钟回流
  * ========================================================================== */
 
-import { readNumberField } from "../bridge";
+import { readBoolField, readNumberField } from "../bridge";
 import { PROGRESS_INTERVAL_MS } from "../protocol";
 import type { ProgressEvent } from "../protocol";
 import { state } from "../state";
+
+/**
+ * ``ProgressControl`` 上"音乐在走吗"那个字段。``Play(false)`` 把它清 0，构造函数置它 1
+ * —— 所以**起播之后不用等谁调 ``Play``**，读它就够了（见 protocol.ts 的 ``PLAY_METHOD``）。
+ */
+const PLAYING_FIELD = "isPlaying";
 
 /**
  * 把 ``ProgressControl.nowTime`` 定期回传，供主机的触控播放对表。
@@ -13,6 +19,9 @@ import { state } from "../state";
  * 为什么是它：``nowTime = audioTime − (mainOffset + chart.offset + 用户offset)``，
  * 是**判定用的时间基**，也正是规划结果里那些时刻的坐标系。跟着它走，游戏侧的延迟设置、
  * 加载、起播前那三秒、掉帧、暂停恢复就全都自动对齐了，主机一个都不用自己算。
+ *
+ * 顺带捎一个 ``isPlaying``：它是"音乐在走吗"唯一的**观测**（那个 ``Play`` hook 起播时不响，
+ * 主机单靠事件会一直以为没在走）。两件事共用同一份节流，不额外花一次注入。
  *
  * 两个细节：
  *
@@ -36,7 +45,11 @@ export function installProgressHook(ProgressControl: Il2Cpp.Class): void {
             state.lastProgressSent = now;
             const time = readNumberField(self, "nowTime");
             if (time !== null) {
-                const message: ProgressEvent = { event: "progress", time };
+                const message: ProgressEvent = {
+                    event: "progress",
+                    time,
+                    playing: readBoolField(self, PLAYING_FIELD)
+                };
                 send(message);
             }
         } catch {

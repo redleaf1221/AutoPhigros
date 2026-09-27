@@ -36,10 +36,23 @@ MAX_AUTO_STEP = 0.1
 """延迟自校准单次最多挪这么多（秒）。越过就说明不是"送达延迟"那么简单。"""
 
 CLOCK_WAIT_WARN = 3.0
-"""播放器等游戏时钟等这么久就报一声。
+"""**一个时钟样本都没有**的时候，等这么久就报一声（秒）。
 
-正常情况下第一个样本 100ms 内就来。等不到只有两种可能：时钟停着（还在起播前），或者
-排期映射错了 —— 后者会表现为"一个事件都不发、音符一个个被 Miss 掉"，所以必须让它出声。
+时钟 hook 活着的话第一个样本 100ms 内就来（`ProgressControl::Update` 每帧都跑、100ms 一采），
+3 秒都没有就是它断了。
+
+**别拿这个常数去量"游戏怎么还没走到第一个事件"** —— 那是游戏里的事，用墙上的时间量它必然
+误报：闸门放行、音乐起播、走到谱面 1.8s，加起来轻松超过 3 秒。那条判据看时钟自己（见
+`Controller._check_clock_wait`）。
+"""
+
+
+CLOCK_LATE_MARGIN = 0.2
+"""游戏时钟越过第一个事件这么多还没发出来，才算"排期错了"（秒）。
+
+播放器只在目标时刻前后 2ms 内醒一次（`touch.POLL`），而 `poll()` 每 `POLL_INTERVAL`（0.2s）
+才看一眼 —— 没有这点余量，"poll 恰好落在播放器刚要发的那一瞬间"就会误报，而
+`_clock_warned` 只报一次，那一局就永远带着一条假警报。
 """
 
 
@@ -85,8 +98,12 @@ class Controller:
         self.player_seq = 0
         self.agent_state = "未启动"
         """最近一次探活的结果：``未启动`` / ``ok`` / ``hang`` / ``dead``。"""
-        self._player_started = 0.0
-        """当前播放器是何时架起来的（主机单调时钟）：用来判断"静默多久才算这一局没了"。"""
+        self._clock_wait_from = 0.0
+        """从这一刻起"连一个时钟样本都没来"才可疑（主机单调时钟）。
+
+        就是播放器架好的那一刻 —— 闸门随即放行，游戏开始跑。**只用于"时钟 hook 是不是断了"
+        这一条判据**：别拿它去量"游戏怎么还没走到第一个事件"，那个要看游戏时钟自己。
+        """
         self._clock_warned = False
         """这一局已经报过"等不到时钟"了没有（只报一次，别刷屏）。"""
 
@@ -562,7 +579,7 @@ class Controller:
         # 上一局的时钟样本对这一局没有意义（开播前 nowTime 是钉住的），清掉重新对表
         self.clock.reset()
         self.player_seq = seq
-        self._player_started = time.monotonic()
+        self._clock_wait_from = time.monotonic()
         self._clock_warned = False
         self.player = touch.Player(
             plan, self.backend, self.clock, mirror=mirror, options=self.options
@@ -578,26 +595,55 @@ class Controller:
     def _check_clock_wait(self) -> None:
         """播放器等游戏时钟等太久了就报一声（**只是报，不改状态**）。
 
-        正常第一个样本 100ms 内就到。等不到要么是时钟停着（还在起播前），要么是排期映射
-        错了 —— 后者会表现为"一个事件都不发、音符一个个被判 Miss"，所以必须让它出声。
+        两条判据，各对应一种真故障：
+
+        1. **排期映射错了** —— 游戏时钟已经越过第一个事件，却一个事件都没发出去。
+           这一局会一个音符都按不到，必须出声；
+        2. **时钟一个样本都没来** —— `ProgressControl::Update` 那个 hook 断了（`CLOCK_WAIT_WARN`）。
+
+        "还在等"的情形一律不算数：**时钟还没走到第一个事件**（排期本来就是这样）、
+        **时钟被我们自己按住了**（暂停，谁都不该发事件）。
+
+        踩过（真机日志 `logs/2026-09-27_21-46-38.log`）：原先只有一条判据 —— "播放器起来
+        之后过了 3 秒还没发第一个事件"。而播放器是在**闸门放行之前**架好的，闸门一开游戏还得
+        起播、走到谱面 1.8s，于是每一局都误报"这一局很可能一个音符都按不到"，紧接着打出一个
+        All Perfect。**用墙上的时间量游戏里的事，必然这样。**
 
         "这一局还在不在"这件事**不在这里判断**：靠计时去猜（"多久没样本了"）会把"暂停"
-        和"退出"混成一锅（两者在样本上的差别只有一次抖动那么宽），而且暂停时样本照样每
-        100ms 来一次、只是值不变。这种事要由 agent 的 hook 直说 —— 见 `agent.py` 的暂停
-        / 退场 hook。
+        和"退出"混成一锅，那要由 agent 的暂停 / 退场 hook 直说 —— 见 `agent.py`。
         """
         player = self.player
-        if player is None or self._clock_warned:
+        if player is None or self._clock_warned or player.sent:
             return
-        alive = time.monotonic() - self._player_started
-        if alive > CLOCK_WAIT_WARN and player.sent == 0:
-            self._clock_warned = True
-            log(
-                f"[touch #{self.player_seq:04d}] 已经等了 {alive:.1f}s 还没发出第一个事件，"
-                f"首个事件在谱面 {player.first_seconds:.3f}s。"
-                f"（这一局很可能一个音符都按不到，盯着 `[judge]` 看）",
-                file=sys.stderr,
+
+        agent = self.agent
+        if agent is not None and agent.playing is False:
+            # 游戏自己在说"音乐没在走"（暂停 / 还没起播）：时钟不走是应该的，不是我们的错。
+            # 这一条能成立，是因为 `playing` 现在是**读字段**来的观测（见 agent.playing）。
+            return
+
+        moment = self.clock.now()
+        if moment is None:
+            alive = time.monotonic() - self._clock_wait_from
+            if alive <= CLOCK_WAIT_WARN:
+                return
+            reason = f"已经 {alive:.1f}s 一个时钟样本都没来"
+        elif self.clock.held:
+            return
+        elif moment < player.first_seconds + CLOCK_LATE_MARGIN:
+            return
+        else:
+            reason = (
+                f"游戏时钟已经走到 {moment:.3f}s，越过了首个事件"
+                f"（谱面 {player.first_seconds:.3f}s），却一个事件都没发出去"
             )
+
+        self._clock_warned = True
+        log(
+            f"[touch #{self.player_seq:04d}] {reason}。"
+            f"（这一局很可能一个音符都按不到，盯着 `[judge]` 看）",
+            file=sys.stderr,
+        )
 
     def handle_result(self, seq: int) -> None:
         """这一局**完整打完了**：按需用这一局的判定做延迟自校准。
@@ -879,7 +925,14 @@ class Controller:
                 f"       本局 {level}；已发 {player.sent} / {player.plan.event_count} 个事件，"
                 f"最大迟到 {player.late * 1000:.1f}ms"
             )
-        if agent is not None and not agent.playing:
-            lines.append("       游戏那边：音乐没在走（暂停 / 还没起播）")
+        if agent is not None:
+            if agent.playing is True:
+                lines.append("       游戏那边：音乐在走")
+            elif agent.playing is False:
+                lines.append("       游戏那边：音乐没在走（暂停 / 还没起播）")
+            else:
+                # 没读到 isPlaying，也没听到过 Play —— 不知道就说不知道。
+                # （以前这里默认 False，于是一局 All Perfect 打完还在报"音乐没在走"。）
+                lines.append("       游戏那边：播放状态还没观测到（isPlaying 没读到）")
         return lines
 
