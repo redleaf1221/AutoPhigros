@@ -26,6 +26,7 @@ JUDGE_RE = re.compile(
 
 CHART_RE = re.compile(r"^\[chart #\d+\]\s+已保存\s+(?P<name>\S+\.json)")
 PLAN_RE = re.compile(r"^\[plan #\d+\]\s+(?P<planner>[\w-]+):")
+LATENCY_RE = re.compile(r"手工补偿\s*(?P<value>[+-]?\d+(?:\.\d+)?)ms")
 RESULT_RE = re.compile(
     r"^\[result #\d+\].*?\s+(?P<score>\d+)\s*分（(?P<percent>[\d.]+)%）\s*最大连击\s*(?P<combo>\d+)"
 )
@@ -71,6 +72,12 @@ class DeviceRun:
     """采集时存下来的谱面文件名（``[chart #…] 已保存 …``）。"""
     planner: str | None = None
     """这一局用的规划器（``[plan #…] <名字>:``）。"""
+    latency: float | None = None
+    """那一局的**手工补偿**（秒，从 ``[main] 就绪 —— … 手工补偿 +0ms`` 读）。
+
+    对账时必须用它重放：计划里的落点是"音符自己那一时刻的判定点"，补偿没抵掉处理延迟时
+    落点就会偏（Credits IN 上 11 个丢音全是这么来的）。不填等于拿理想送达去解释实机结果。
+    """
     judges: dict[tuple[int, bool, int], DeviceJudge] = field(default_factory=dict)
     result: dict[str, float | int] = field(default_factory=dict)
     """``score`` / ``percent`` / ``maxCombo`` / 四个计数；读不到的键就不在。"""
@@ -129,6 +136,8 @@ def parse(text: str, *, path: Path | None = None) -> DeviceRun:
             run.chart = found.group("name")
         if run.planner is None and (found := PLAN_RE.match(line)):
             run.planner = found.group("planner")
+        if run.latency is None and (found := LATENCY_RE.search(line)):
+            run.latency = float(found.group("value")) / 1000.0
         if (found := RESULT_RE.match(line)) and not run.result:
             run.result = {
                 "score": int(found.group("score")),

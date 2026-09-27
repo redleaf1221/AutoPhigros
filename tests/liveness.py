@@ -556,5 +556,38 @@ def _check_shutdown() -> list[str]:
     expect(controller.clock.now() is None, "这一局没了就该把时钟清空（下一局重新对表）")
     expect("不在了" in buffer.getvalue(), f"这一局没了却没有明说：{buffer.getvalue()!r}")
 
+    # 10) detach：只断会话，**设备与触控后端都留着**（之后还能 attach / spawn 接回来）
+    class DetachAgent:
+        def __init__(self) -> None:
+            self.stopped = 0
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+    controller = make_controller()
+    controller._report = lambda player: None  # type: ignore[method-assign]
+    controller.agent = DetachAgent()
+    controller.agent_state = "ok"
+    controller.backend = object()  # 假装后端起着
+    player = CountingPlayer()
+    controller.player = player
+    controller.clock.feed(5.0, host_time=time.monotonic())
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller.detach()
+    expect(controller.agent is None, "detach 之后该没有 agent 了")
+    expect(controller.agent_state != "ok", f"detach 之后状态该变：{controller.agent_state}")
+    expect(player.stopped == 1, "detach 要先把播放器停掉")
+    expect(controller.clock.now() is None, "detach 要清游戏时钟（下一局重新对表）")
+    expect(controller.backend is not None, "detach **不该**关触控后端（那是 quit 的事）")
+    expect(not controller.stopping, "detach 不是收工：主干还要继续跑")
+
+    # 没在注入时也不该炸，而且要说清楚
+    controller = make_controller()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller.detach()
+    expect("没在注入" in buffer.getvalue(), f"没 agent 时要说明白：{buffer.getvalue()!r}")
+
     return problems
 

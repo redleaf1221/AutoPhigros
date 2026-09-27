@@ -169,6 +169,13 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
 
     run = device_log.read(log_path)
     print(f"{log_path.name}：{len(run.judges)} 条判定，设备自己的账目是 {run.label}")
+    if run.latency is not None:
+        # 拿这一局**真实的**送达补偿去重放。计划里的落点是"音符自己那一时刻的判定点"，
+        # 补偿没抵掉处理延迟时那个落点就是偏的 —— 拿理想送达去解释实机结果会冤枉规划。
+        import algorithms.judging as judging
+
+        judging.DELIVERED_LATENCY = run.latency
+        print(f"  按这一局的送达补偿重放：手工补偿 {run.latency * 1000:+.0f}ms")
     if not run.judges:
         print("  这份日志里一条判定都没有 —— 没什么可比的")
         return 1

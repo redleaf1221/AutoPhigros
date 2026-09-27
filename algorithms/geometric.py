@@ -128,8 +128,16 @@ class PointerAllocator:
             if not merged:
                 drag_areas.append(note.judge)
 
-        for area in tap_areas:
-            position = centre_of(area)
+        for note in frame.taps:
+            # **按在音符自己的判定点上**，不要按"合并区域"的中心。
+            # 踩过（Credits IN 上 11 个丢音）：drag 并进来之后，按下点被拉到了两个窄带的
+            # 中间，于是横向偏差比隔壁那个 TAP 大一点点（0.011），而游戏挑的是**度量最小的
+            # 那个候选** —— 这一下就被隔壁抢走、它自己去判了隔壁的音符（Good −139ms），
+            # 原来瞄的那个音符什么都没得到。
+            # 自己的判定点上横向偏差是 0（度量的下界），别的音符除非位置完全相同比不过它；
+            # 合并仍然保留在两件事上：drag 不再单独占一根手指、以及"已经在屏幕上的手指
+            # 落进并后的区域也算它被顺手判掉"。
+            position = note.position
             pointer = self._take_idle_or_resting(position)
             if isinstance(pointer, Pointer):
                 self._insert(pointer.expire, pointer.position, Touch.UP, pointer.id)

@@ -122,6 +122,38 @@ PROCESS_DELAY = 0.029
   这一条属于"送达"，不属于"计划"——`.psap` 里不该出现设备常数。
 """
 
+DELIVERED_LATENCY = PROCESS_DELAY
+"""裁判重放时假设的"送达补偿"（秒）—— 播放器那边就是 `options.latency`。
+
+这一条为什么必须建模：**计划里的落点是"音符自己那一时刻的判定点"**（规范解，`.psap` 是
+谱面的纯函数）。判定发生在游戏处理这次按下的那一帧，那一帧判定线已经又走了一点；只要送达
+补偿正好抵掉处理延迟，手指在判定的那一刻就正好压在音符上。
+
+* `DELIVERED_LATENCY = PROCESS_DELAY`（默认）：按"送达准时"重放 —— 这是**开着延迟自校准**
+  时该有的样子；
+* 拿一局实机日志做对账时必须填那一局**真实的**补偿（`judge.py --compare` 从日志里的
+  `手工补偿 +0ms` 那一行读），否则等于拿"理想送达"去解释"晚 29ms 送达"的结果。
+"""
+
+"""我们发出的触摸，游戏是在**之后某一帧**才处理并读 `nowTime` 的：实测中位差 **+28.9ms**。
+
+怎么量的：拿一局实机日志（`logs/2026-09-27_19-49-47.log`，AT + geometric）与裁判逐音符比
+"同一个音符、两边同档"的 `delta` 之差，1149 条的中位数是 +28.9ms、分布 12~48ms。
+
+这 12~48ms 的形状就是**帧量化**：游戏在下一帧处理这次触摸，所以延迟 = 固定管线 + 0~1 帧
+（60Hz 一帧 16.7ms）。**固定部分可以建模，帧相位不行** —— 日志里看不到游戏那一帧的相位，
+所以裁判这里按中位数取常数；残差 ±1 帧是这个模型**理论上就到不了**的地方，谁也别假装能算准。
+
+它的用处有两面：
+
+* **裁判**：判定时刻要用"游戏处理它的时刻"（`发出 + PROCESS_DELAY`），否则同一个音符的
+  档位会整体偏早一档 —— 实机那一局 100.000s 的两个音符，裁判报 Bad、设备报 Good，
+  差的就是这 29ms 跨过了 0.18 的边界；
+* **计划/播放**：既然游戏晚 29ms 才处理，播放器就该**早 29ms 发**（等于把 `latency` 的
+  默认值从 0 提到 29ms），这样设备那边量到的 `delta` 会以 0 为中心，而不是稳定 +25ms。
+  这一条属于"送达"，不属于"计划"——`.psap` 里不该出现设备常数。
+"""
+
 HOLD_TIMEOUT = 0.25
 """Hold 的兜底超时：按住结束之后再过 0.25s 还没判就是 Miss。"""
 
@@ -286,6 +318,23 @@ class Fingers:
                 positions.append(position)
         return positions
 
+    def dwell_ms(self, pointer: int, moment: int) -> int:
+        """这根手指在 `moment` 按下去之后**待了多久**（毫秒）。
+
+        用来分辨"这一次按下是什么手势"：tap 是按下即抬（本算法里 8ms），drag / flick 的
+        起手要按住一段时间再划（≥24ms）—— 而它们**都会**被 `CheckNote` 当成一次"按下"，
+        于是 drag / flick 的起手会顺手把够得着的 TAP 判掉（实机踩过：`夢の降る日に` 里
+        一根 144ms 的 drag 起手把线 21 上一个 TAP 判成了 Good(−180ms)）。
+        """
+        items = self.items.get(pointer)
+        if not items:
+            return 0
+        index = bisect_right(self.timestamps[pointer], moment) - 1
+        for later, action, _ in items[index + 1 :]:
+            if action is Touch.UP:
+                return later - moment
+        return 0
+
     def downs_between(self, lo_ms: float, hi_ms: float) -> list[tuple[int, complex]]:
         """时间窗里的所有按下（含指针号）。"""
         return [
@@ -396,6 +445,14 @@ class Graze:
     delta: float
     pointer: int
     stolen: bool
+    dwell_ms: int = 0
+    """抢人的那一下按了多久（毫秒）。
+
+    tap 是按下即抬（8ms 上下），**drag / flick 的起手**要按住一段时间（≥24ms）——
+    而两者在 `CheckNote` 眼里都只是一次"按下"。实机踩过：`夢の降る日に` 里一根 144ms 的
+    drag 起手把线 21 上一个 TAP 判成了 Good(−180ms)。有了这个数，报告能一眼分出
+    "是 tap 抢的还是 drag/flick 起手抢的" —— 修法完全不同。
+    """
 
     def text(self) -> str:
         tail = (
@@ -403,10 +460,14 @@ class Graze:
             if self.stolen
             else "计划本来也没按到它（覆盖判据同样会报）"
         )
+        if self.dwell_ms >= 24:
+            kind = f"drag / flick 的起手（按住 {self.dwell_ms}ms）"
+        else:
+            kind = f"一次点按（{self.dwell_ms}ms）"
         return (
             f"蹭键：{self.note.kind.name} @ {self.note.seconds:.3f}s（线 {self.line}）"
             f"被判成 {self.verdict.label}（{self.delta * 1000:+.0f}ms，指针 {self.pointer}）"
-            f"—— {tail}"
+            f"—— 抢它的是{kind}；{tail}"
         )
 
 
@@ -629,8 +690,9 @@ def judge_taps(
     judgements: list[Judgement] = []
     grazes: list[Graze] = []
     for timestamp, pointer, position in fingers.downs:
-        # 判定发生在**游戏处理这一下按下的那一帧**，不是我们发出去的那一刻（见 PROCESS_DELAY）
-        moment = timestamp / 1000.0 + PROCESS_DELAY
+        # 判定发生在**游戏处理这一下按下的那一帧**，而不是我们发出去的那一刻；
+        # 播放器那边按 `latency` 提前发，正好把它抵掉（见 DELIVERED_LATENCY）。
+        moment = timestamp / 1000.0 + PROCESS_DELAY - DELIVERED_LATENCY
         best: tuple[float, Slot, Judgement] | None = None
         lo = bisect_right(moments, moment - SCAN_BACK)
         hi = bisect_right(moments, moment + SCAN_AHEAD)
@@ -694,6 +756,7 @@ def judge_taps(
                         delta=judgement.delta,
                         pointer=pointer,
                         stolen=slot.index in proper,
+                        dwell_ms=fingers.dwell_ms(pointer, timestamp),
                     )
                 )
             continue
@@ -711,6 +774,7 @@ def judge_taps(
                 delta=judgement.delta,
                 pointer=pointer,
                 stolen=slot.index in proper,
+                dwell_ms=fingers.dwell_ms(pointer, timestamp),
             )
         )
 

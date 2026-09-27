@@ -174,6 +174,22 @@ class Controller:
         if agent is not None:
             agent.stop()
 
+    def detach(self) -> None:
+        """断开注入：把 agent 拆掉（放行闸门、unload、detach），**设备与触控后端都留着**。
+
+        和 `quit` 的区别就在"剩下的东西留不留"：`quit` 把整条主干收掉（后端也关），
+        `detach` 只断会话 —— 之后 `attach` / `spawn` 可以立刻接回来，后端那条 scrcpy 连接
+        也不用重开。想自己手打一局、或者只想让游戏先安静下来的时候用它。
+        """
+        if self.agent is None:
+            log("[main] 现在就没在注入（没有 agent）")
+            return
+        self.stop_player()
+        self._stop_agent()
+        self.agent_state = "未启动"
+        self.clock.reset()
+        log("[main] 已断开注入（设备与触控后端留着；attach / spawn 接回来）")
+
     def list_devices(self) -> list[frida.core.Device]:
         """列出**能跑这个项目的**设备：USB 的，以及手动加过的远程 server。
 

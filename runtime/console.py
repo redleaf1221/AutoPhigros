@@ -269,6 +269,11 @@ def _verbose(controller: Controller, argv: list[str]) -> None:
     log(f"判定流水（含 Perfect）-> {'开' if value else '关'}（不落盘）")
 
 
+def _detach(controller: Controller, argv: list[str]) -> None:
+    """断开注入：设备与触控后端**留着**，之后还能 attach / spawn 接回来。"""
+    controller.detach()
+
+
 def _status(controller: Controller, argv: list[str]) -> None:
     lines = controller.status_lines()
     for line in lines:
@@ -293,6 +298,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("device", "device <id>", "选中一台设备（记住）", _device),
     Command("spawn", "spawn", "在选中的设备上启动游戏并注入", _spawn),
     Command("attach", "attach [pid]", "附加到已经在跑的游戏（pid 可选）", _attach),
+    Command("detach", "detach", "断开注入（设备与后端留着，可再 attach）", _detach),
     Command("status", "status", "现在什么情况：设备、agent、后端、时钟、这一局", _status),
     Command("planner", "planner [名字]", "看可用规划器 / 换一个（下一关生效，记住）", _planner),
     Command("latency", "latency [值]", "看 / 改注入补偿：0.02、20ms、+5ms（记住）", _latency),
