@@ -6,7 +6,7 @@
   "author": "",
   "main": "",
   "scripts": {
-    "build": "esbuild index.ts --bundle --outfile=./target/_.js"
+    "build": "esbuild frida/index.ts --bundle --outfile=./target/_.js"
   },
   "devDependencies": {
     "@types/frida-gum": "^19.11.0",

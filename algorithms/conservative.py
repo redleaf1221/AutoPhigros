@@ -48,11 +48,31 @@ class ConservativeConfig:
     ``nowTime`` 按音频往前跳一大截，整个时间轴就和谱面错开了。
 
     8ms 不是拍脑袋：``geometric`` 一直用 8ms 的 tick，过的是同一个覆盖率自检，
-    48 事件/秒就把 393 个音符全覆盖了。设备那边一帧最多消费一个位置，比 125Hz 更密
+    48 个事件/秒就把 393 个音符全覆盖了。设备那边一帧最多消费一个位置，比 125Hz 更密
     只是白灌。
     """
     flick_direction: int = 0
     """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
+    flick_repeats: int = 2
+    """一次滑键手势重复划几下。**别调回 1。**
+
+    游戏判 flick 用的是 ``JudgeControl::CheckFlick``（``0x1d21828``）：只有手指那一帧带
+    ``Fingers.isNewFlick``（一次"新起手"，由 ``FingerManagement::Update`` 按手指的瞬时
+    速度算出来，阈值 ``flickJudgeSpeed`` 在 ``Start`` 里按 dpi 归一）时它才跑；跑的时候在
+    ``nowTime ± 0.14s`` 里挑**时刻最早**的那个还没判过的 flick，只要
+    ``|positionX − fingerPositionX| < 2.1`` 就把它标记成已划中。也就是说：**一次"新起手"
+    只能点亮一个音符**，而且会被窗口里更早的音符抢走。
+
+    原先每个 flick 只划一下（一个来回），于是那个音符的命全押在**唯一那一次**起手上：
+    实测 70 个 flick 里随机漏掉一个，每次漏的还不一样（抢不抢得着取决于那一帧落在哪儿）。
+    重复两下就是给每个音符两次独立的机会：前面被抢了，后面还有。
+
+    取 2 是量出来的，不是拍的：离线按游戏那套规则模拟"哪些 flick 会被点亮"，只划一下时
+    Dlyrotz HD 上有 **7 个 flick 永远点不亮**（`CheckFlick` 的窗口被更早的音符抢走），
+    划两下之后**所有谱面都归零**。三下能再多一点余量，但峰值注入率从 167 涨到 197 个/秒
+    （Eradication Catastrophe IN），而注入链的承受力正是这条链上最紧的一环 —— 划两下够用，
+    真碰上偶发漏音再往上调。
+    """
     max_pointers: int = 10
 
 
@@ -319,30 +339,41 @@ class ConservativePlanner:
                             SemiNote(SemiKind.DRAG, screen.remap(position, rotation), note_id)
                         )
                     case NoteType.FLICK:
-                        start = config.flick_start
-                        end = config.flick_end
-                        frames[timestamp + start].append(
-                            SemiNote(
-                                SemiKind.FLICK_HEAD,
-                                _sway(screen, position, rotation, sway, start, start, duration),
-                                note_id,
-                            )
-                        )
-                        for offset in range(start + 1, end, config.sample_delay):
-                            frames[timestamp + offset].append(
+                        # 同一次手势划几下（见 ConservativeConfig.flick_repeats）：
+                        # 每一下都从 +半径**跳**回 +半径一侧再划到 -半径，于是每一下
+                        # 都是一次"新起手"，游戏那边就是一次独立的判定机会。
+                        # 整段关于判定时刻对称；只有最后一下收手（其它几下中途就跳回去）。
+                        first = -(config.flick_repeats * duration) // 2
+                        for repeat in range(config.flick_repeats):
+                            base = timestamp + first + repeat * duration
+                            kind = SemiKind.FLICK_HEAD if repeat == 0 else SemiKind.FLICK
+                            frames[base].append(
                                 SemiNote(
-                                    SemiKind.FLICK,
-                                    _sway(screen, position, rotation, sway, offset, start, duration),
+                                    kind,
+                                    _sway(screen, position, rotation, sway, 0, 0, duration),
                                     note_id,
                                 )
                             )
-                        frames[timestamp + end].append(
-                            SemiNote(
-                                SemiKind.FLICK_TAIL,
-                                _sway(screen, position, rotation, sway, end, start, duration),
-                                note_id,
-                            )
-                        )
+                            for offset in range(
+                                config.sample_delay, duration, config.sample_delay
+                            ):
+                                frames[base + offset].append(
+                                    SemiNote(
+                                        SemiKind.FLICK,
+                                        _sway(screen, position, rotation, sway, offset, 0, duration),
+                                        note_id,
+                                    )
+                                )
+                            if repeat == config.flick_repeats - 1:
+                                frames[base + duration].append(
+                                    SemiNote(
+                                        SemiKind.FLICK_TAIL,
+                                        _sway(
+                                            screen, position, rotation, sway, duration, 0, duration
+                                        ),
+                                        note_id,
+                                    )
+                                )
                     case NoteType.HOLD:
                         frames[timestamp].append(
                             SemiNote(SemiKind.HOLD_HEAD, screen.remap(position, rotation), note_id)
@@ -382,7 +413,11 @@ def _sway(
     flick_start: int,
     duration: int,
 ) -> Position:
-    """滑键手势在第 ``offset`` 毫秒时的触点：沿 ``sway`` 方向从 +半径 划到 -半径。"""
+    """滑键手势在**这一段划动**第 ``offset`` 毫秒时的触点：沿 ``sway`` 从 +半径划到 -半径。
+
+    ``offset`` 是这一段内的相对时刻（0 = 起手、``duration`` = 收尾），所以 ``rate`` 从 +1
+    线性走到 -1。**下一段又从 +1 开始** —— 那个跳变就是游戏要找的"新起手"。
+    """
     rate = 1 - 2 * (offset - flick_start) / duration
     return screen.remap(position + rotation * sway * screen.flick_radius * rate, rotation)
 

@@ -28,6 +28,23 @@ class RadicalConfig:
     flick_start: int = -17
     """滑键手势相对判定时刻的起点偏移（毫秒）。"""
     flick_end: int = 17
+    flick_repeats: int = 2
+    """一次滑键手势重复划几下。**别调回 1。**
+
+    游戏那边一次"新起手"（``Fingers.isNewFlick``）只够点亮一个 flick，而且会被判定窗口里
+    更早的音符抢走 —— 一个音符只划一下就是一次机会，漏了就是漏了（``conservative`` 那边
+    同样的理由与测算写在 ``ConservativeConfig.flick_repeats``）。这里每多划一下，
+    就多一次独立机会：第二下从 ``+半径`` **跳**回去重新划，跳变本身就是一次新起手。
+    """
+    flick_sample_ms: int = 2
+    """滑键手势里隔多少毫秒补一个触点。
+
+    本来是 1ms（这个算法的时间栅格就是 1ms），但重复两下之后事件数直接翻倍：实测
+    ``Eradication Catastrophe`` IN 的峰值冲到 **419 个/秒** —— 而 362 个/秒正是本项目
+    量出来"会把注入链和游戏主线程一起拖住"的那个量级（见 ``ConservativeConfig.sample_delay``）。
+    改成 2ms 之后每个 flick 的事件数与改之前一样多（34 个），峰值回到 200 出头，
+    而每 2ms 走完 ``2/34`` 个半径的位移，比游戏的速度阈值宽得多。
+    """
     flick_direction: int = 1
     """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
     recycle_scope_ratio: float = 0.05
@@ -92,6 +109,8 @@ class PointerAllocator:
         "screen",
         "flick_start",
         "flick_duration",
+        "flick_repeats",
+        "flick_sample_ms",
         "rotate_factor",
         "recycle_scope",
         "ignore_allocation_errors",
@@ -107,6 +126,10 @@ class PointerAllocator:
         self.flick_duration = config.flick_end - config.flick_start
         if self.flick_duration <= 0:
             raise PlanningError(f"flick 手势时长非正：{config.flick_start} -> {config.flick_end}")
+        self.flick_repeats = max(1, config.flick_repeats)
+        if config.flick_sample_ms <= 0:
+            raise PlanningError(f"flick 采样间隔非正：{config.flick_sample_ms}")
+        self.flick_sample_ms = config.flick_sample_ms
         self.rotate_factor = 1j if config.flick_direction == 0 else 1
         self.recycle_scope = (screen.width + screen.height) * config.recycle_scope_ratio
         self.ignore_allocation_errors = config.ignore_allocation_errors
@@ -173,13 +196,19 @@ class PointerAllocator:
         self._insert(self.now, note.position, action, pointer.id)
 
         swipe = note.position
-        for delta in range(self.flick_duration):
-            rate = 1 - 2 * delta / self.flick_duration
-            swipe = note.position + note.rotation * self.rotate_factor * rate * self.screen.flick_radius
-            self._insert(self.now + delta, swipe, Touch.MOVE, pointer.id)
+        for repeat in range(self.flick_repeats):
+            # 每一下都从 +半径 跳到 一侧再划到 -半径（见 RadicalConfig.flick_repeats）
+            base = self.now + repeat * self.flick_duration
+            for delta in range(0, self.flick_duration, self.flick_sample_ms):
+                rate = 1 - 2 * delta / self.flick_duration
+                swipe = (
+                    note.position
+                    + note.rotation * self.rotate_factor * rate * self.screen.flick_radius
+                )
+                self._insert(base + delta, swipe, Touch.MOVE, pointer.id)
 
         pointer.note = note._replace(position=swipe)
-        pointer.age = -self.flick_duration
+        pointer.age = -self.flick_duration * self.flick_repeats
 
     def _drag(self, note: PlainNote) -> None:
         pointer = self._reusable(note)

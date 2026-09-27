@@ -50,6 +50,13 @@ WARNING_LIMIT = 20
 class GeometricConfig:
     flick_ticks: int = 3
     """滑键手势的持续 tick 数（3 tick = 24 毫秒）。"""
+    flick_repeats: int = 2
+    """一次滑键手势重复划几下。**别调回 1。**
+
+    游戏那边一次"新起手"（``Fingers.isNewFlick``）只够点亮一个 flick，而且会被判定窗口
+    里更早的音符抢走 —— 只划一下就是一个音符只有一次机会（``conservative`` 那边同样的
+    理由与测算写在 ``ConservativeConfig.flick_repeats``）。每多划一下，多一次独立机会。
+    """
     flick_direction: int = 0
     """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
     max_pointers: int = 10
@@ -80,11 +87,12 @@ class Pointer:
 
 
 class PointerAllocator:
-    __slots__ = ("screen", "flick_ticks", "rotate_factor", "idle", "on_screen", "track", "now")
+    __slots__ = ("screen", "flick_ticks", "flick_repeats", "rotate_factor", "idle", "on_screen", "track", "now")
 
     def __init__(self, screen: Screen, config: GeometricConfig) -> None:
         self.screen = screen
         self.flick_ticks = config.flick_ticks
+        self.flick_repeats = max(1, config.flick_repeats)
         # 方向与另外两个算法相反：从 note 中心朝一侧划出去
         self.rotate_factor = -1j if config.flick_direction == 0 else 1
         self.idle: set[int] = set(range(1000, 1000 + config.max_pointers))
@@ -131,17 +139,26 @@ class PointerAllocator:
         for note in frame.flicks:
             chosen = self._take_resting_or_idle(note.position)
             action = Touch.DOWN if isinstance(chosen, int) else Touch.MOVE
-            bound = self._bind(chosen, note.position, self.flick_ticks + 1)
-            self._insert(self.now, note.position, action, bound.id)
+            # 整段（repeats 下）都占着这根手指，中途不松手
+            bound = self._bind(
+                chosen, note.position, (self.flick_ticks + 1) * self.flick_repeats
+            )
 
             swipe = note.position
-            for delta in range(1, self.flick_ticks + 1):
-                rate = delta / self.flick_ticks
-                swipe = (
-                    note.position
-                    + note.rotation * self.rotate_factor * rate * self.screen.flick_radius
+            for repeat in range(self.flick_repeats):
+                base = self.now + repeat * (self.flick_ticks + 1)
+                # 每一下都先**蹦回**判定点再划出去（见 GeometricConfig.flick_repeats），
+                # 那一下跳变就是游戏要找的"新起手"
+                self._insert(
+                    base, note.position, action if repeat == 0 else Touch.MOVE, bound.id
                 )
-                self._insert(self.now + delta, swipe, Touch.MOVE, bound.id)
+                for delta in range(1, self.flick_ticks + 1):
+                    rate = delta / self.flick_ticks
+                    swipe = (
+                        note.position
+                        + note.rotation * self.rotate_factor * rate * self.screen.flick_radius
+                    )
+                    self._insert(base + delta, swipe, Touch.MOVE, bound.id)
             bound.position = swipe
 
         for area in drag_areas:

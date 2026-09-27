@@ -113,7 +113,10 @@ def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
     command += list(args)
     try:
         finished = subprocess.run(
-            command, capture_output=True, timeout=timeout, check=False
+            # stdin 必须是 DEVNULL，不能让它继承我们的：`adb shell` 会把本地 stdin
+            # 转发给设备端的 shell，于是用户在控制台里敲的那一行会被 adb 半路吃掉 ——
+            # 表现就是"敲了没反应，再敲一条上一条才生效"。adp 一个字节的输入都不需要。
+            command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False
         )
     except FileNotFoundError as error:
         raise ScrcpyError(f"找不到 adb：{ADB}") from error
@@ -261,7 +264,13 @@ class ScrcpyBackend:
             "tunnel_forward=true",
         ]
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0
+            command,
+            # 同上：这条 `adb shell` **整局都活着**，stdin 一旦继承，它就是个一直在
+            # 等着抢用户输入的家伙。DEVNULL 一劳永逸。
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
         )
         # server 会一直往 stdout 写日志，不抽走的话管道满了会把它自己堵死
         self._drain = threading.Thread(target=self._drain_logs, args=(process,), daemon=True)

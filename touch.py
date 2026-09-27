@@ -47,6 +47,7 @@ import backends
 from algorithms.geometry import Screen
 from algorithms.utils import PlanResult, TouchEvent
 from backends import Backend, catalog, create
+from options import Options
 from storage import decode_plan
 
 POLL = 0.002
@@ -242,7 +243,12 @@ class LocalClock:
 
 
 class Player:
-    """按时钟把规划结果推出去。跑在自己的线程上，不占 frida 的消息线程。"""
+    """按时钟把规划结果推出去。跑在自己的线程上，不占 frida 的消息线程。
+
+    ``options`` 是**共享的**运行时设置（``options.py``），不是构造时抄一份的副本：
+    延迟改了下一个事件就按新值发、注入开关改了立刻生效。抄一份的话就得在每个改设置
+    的地方都记得同步正在跑的那个播放器 —— 迟早会漏。
+    """
 
     def __init__(
         self,
@@ -251,13 +257,13 @@ class Player:
         clock: Clock,
         *,
         mirror: bool = False,
-        latency: float = 0.0,
+        options: Options | None = None,
     ) -> None:
         # 镜像只在执行时改：.psap 里存的是规范解
         self.plan = plan.mirrored() if mirror else plan
         self.backend = backend
         self.clock = clock
-        self.latency = latency
+        self.options = options if options is not None else Options()
         self.sent = 0
         self.late = 0.0
         """最晚发出去的那一次迟到了多少秒（含发送本身的耗时；负数=早发）。"""
@@ -269,6 +275,8 @@ class Player:
         """单次 `backend.send()` 最长花了多久。发送被阻塞的话它会露出来。"""
         self.skipped = 0
         """因为迟到太多而干脆没发的事件数。"""
+        self.muted = 0
+        """因为 :attr:`~options.Options.inject` 关着而没发出去的事件数。"""
         self.error: BaseException | None = None
 
         self._frames: list[tuple[float, tuple[TouchEvent, ...]]] = [
@@ -313,7 +321,7 @@ class Player:
                     time.sleep(POLL)
                     continue
 
-                remaining = host - self.latency - time.monotonic()
+                remaining = host - self.options.latency - time.monotonic()
                 if remaining > 0:
                     nap = COARSE_NAP if remaining > COARSE_NAP else POLL
                     time.sleep(min(remaining, nap))
@@ -327,7 +335,12 @@ class Player:
                     continue
 
                 started = time.monotonic()
-                self.backend.send(events)
+                if self.options.inject:
+                    self.backend.send(events)
+                else:
+                    # 注入关着：照样按排期走到这里、照样记迟到，只是不碰设备。
+                    # 于是"关掉注入"仍然是一次完整的调度演练，而不是另一种后端。
+                    self.muted += len(events)
                 cost = time.monotonic() - started
                 self.max_send = max(self.max_send, cost)
 
@@ -385,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(
-        f"[touch] {args.plan.name}：{len(plan.frames)} 帧 / {plan.event_count} 事件 / "
+        f"[touch] {args.plan.name}：{len(plan.frames)} 帧 / {plan.event_count} 个事件 / "
         f"{plan.duration_ms / 1000:.1f}s -> {args.backend}"
     )
     try:
@@ -394,7 +407,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[touch] 后端起不来：{error}", file=sys.stderr)
         return 1
 
-    player = Player(plan, backend, LocalClock(), mirror=args.mirror, latency=args.latency)
+    player = Player(
+        plan, backend, LocalClock(), mirror=args.mirror, options=Options(latency=args.latency)
+    )
     print(f"[touch] {LEAD_IN:.0f} 秒后开始{'（已镜像）' if args.mirror else ''}")
     try:
         player.start()
@@ -409,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"[touch] 发了 {player.sent} 个事件，最大迟到 {player.late * 1000:.1f}ms")
+    if player.muted:
+        print(f"[touch] 另有 {player.muted} 个事件因为注入关着没发")
     return 0
 
 

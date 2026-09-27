@@ -161,7 +161,7 @@ def load_plan_meta(ref: ChartRef, planner_name: str, directory: Path) -> dict[st
 #
 #   'APSP' | u8 版本 | u8 名字长度 | utf8 规划器名
 #   f64 屏宽 | f64 屏高 | u32 帧数
-#   每帧: i64 时间戳(ms) | u16 事件数 | 每事件: u8 动作 | u32 指针号 | f64 x | f64 y
+#   每帧: i64 时间戳(ms) | 事件个数 u16 | 每个事件: u8 动作 | u32 指针号 | f64 x | f64 y
 #
 # 坐标是虚拟屏幕坐标（官谱 16x9，y 轴向上）；映射到真实分辨率是触控模块的事。
 

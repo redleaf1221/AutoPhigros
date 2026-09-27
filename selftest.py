@@ -30,6 +30,9 @@
 4. **闸门放行** —— 拿假消息喂 ``main.Agent``，确认"该放行时一定放行、一局只放行一次"。
    游戏是停在闸门上等主机的：少放一次游戏永远卡死，多放一次下一关的闸门会被提前放掉。
 
+5. **控制台** —— ``console.py`` 的命令解析与那几个运行时旋钮，重点是 ``latency`` 的
+   三种写法和"打错命令不该把面板带走"。
+
 用法（conda 环境 auto_phigros）：``python selftest.py``
 """
 
@@ -376,6 +379,21 @@ def check_storage(text: str, planner_name: str, result) -> list[str]:
     return problems
 
 
+def _legacy_mirror(value: float) -> float:
+    """v1 打包坐标 ``x*1000 + y`` 的水平镜像，照抄 ``JudgeLine::Mirror`` 那三行。
+
+    反编译 0x1d28afc，``oldVersion`` 那一支算的是（0x4956D800 = ``880000.0f``）：
+
+    .. code-block:: text
+
+        新值 = 880000 − 旧值 + 2 × (旧值 mod 1000)
+
+    把 ``旧值 = 1000X + Y`` 代进去就是 ``1000(880 − X) + Y`` —— 即 ``x → 880 − x``、``y`` 不动。
+    照抄而不是化简，是为了让"模型"与"游戏"的差别一眼可见。
+    """
+    return 880000.0 - value + 2.0 * math.fmod(value, 1000.0)
+
+
 def mirror_chart(text: str) -> str:
     """把一份官谱按 ``Chart::Mirror`` 的规则镜像过来 —— 测试用的"游戏行为"模型。
 
@@ -383,14 +401,20 @@ def mirror_chart(text: str) -> str:
     移动事件 ``x → 1 − x``、旋转事件 ``θ → −θ``、音符 ``positionX → −positionX``。
     有了它，就能直接验"把规划结果翻一下"是不是镜像后谱面的解，而不用真去开一次游戏。
 
-    只处理 ``formatVersion >= 2``（本项目采到的谱面都是 v3）；v1 的老整数打包格式
-    要按 ``i → 880 − i`` 走，这里不伺候。
+    v1 的老谱要另算：``Chart::Mirror`` 把 ``formatVersion == 1`` 作为 ``oldVersion`` 传下去，
+    ``JudgeLine::Mirror`` 于是走打包整数的分支（见 :func:`_legacy_mirror`）。这个分支是**真存在**的
+    —— 采到的 ``Credits`` HD 就是 v1，所以这里不能只伺候 v3。
     """
     chart = json.loads(text)
+    old_version = int(chart.get("formatVersion") or 0) == 1
     for line in chart["judgeLineList"]:
         for event in line.get("judgeLineMoveEvents") or ():
-            event["start"] = 1.0 - event["start"]
-            event["end"] = 1.0 - event["end"]
+            if old_version:
+                event["start"] = _legacy_mirror(event["start"])
+                event["end"] = _legacy_mirror(event["end"])
+            else:
+                event["start"] = 1.0 - event["start"]
+                event["end"] = 1.0 - event["end"]
         for event in line.get("judgeLineRotateEvents") or ():
             event["start"] = -event["start"]
             event["end"] = -event["end"]
@@ -425,6 +449,92 @@ def check_mirror(text: str, result: PlanResult) -> tuple[int, list[str], float]:
     return check_coverage(mirrored_chart, flipped)
 
 
+FLICK_WINDOW_MS = 140
+"""``JudgeControl::CheckFlick`` 的候选窗口：``PerfectTimeRange × 1.75 = 0.08 × 1.75``。"""
+
+FLICK_JUMP = 1.0
+"""多大的位移算一次"手指跳变"（虚拟屏单位）。
+
+这判据是**保守**的那一侧：只有跳变才一定够快、让 ``FingerManagement::Update`` 把
+``Fingers.isNewFlick`` 置起来。真机上慢一点的划动有时也算数 —— 所以它说没问题就是真没问题
+（那时机会只会更多），它报问题就值得看一眼。
+"""
+
+
+def check_flick(chart: Chart, result: PlanResult) -> list[str]:
+    """滑键手势自检：每个 flick 在游戏那套规则下都得**点得亮**。
+
+    ``FlickControl::Judge`` 自己不看手指 —— 它只等 ``ChartNote.isJudgedForFlick``。点灯的是
+    ``JudgeControl::CheckFlick``（``0x1d21828``）：只有那一帧手指带 ``Fingers.isNewFlick``
+    （一次"新起手"，由 ``FingerManagement::Update`` 按瞬时速度算）时才跑；跑的时候在
+    ``nowTime ± 0.14s`` 里**按时间顺序**挑第一个还没判过、且
+    ``|positionX − fingerPositionX| < 2.1`` 的 flick 点亮，然后把手指那个标志清掉。
+
+    两条推论就是这个自检的全部内容：
+
+    1. **一次"新起手"只点亮一个音符**，还会被窗口里更早的 flick 抢走；
+    2. 一个 flick 只划一下 = 只有一次机会，被抢走就必然漏。
+
+    实测就是这么漏的：``conservative`` 原先每个 flick 只划一下，按这套规则走一遍，
+    Dlyrotz HD 上 70 个 flick 里有 **7 个永远点不亮** —— 而真机上一局只漏一两个，
+    因为慢划动偶尔也算一次起手。把每个 flick 划两下之后就全归零了
+    （``flick_repeats``，见 ``ConservativeConfig``）。
+    """
+    flicks = sorted(
+        (
+            (note.seconds, index, note, line)
+            for index, line in enumerate(chart.lines)
+            for note in line.notes
+            if note.kind is NoteType.FLICK
+        ),
+        key=lambda item: item[0],
+    )
+    if not flicks:
+        return []
+
+    # 每一次"新起手"：手指位置的一次跳变（同一根手指、相邻两个事件之间）
+    edges: list[tuple[int, complex]] = []
+    for items in Tracks(result).items.values():
+        previous = None
+        for timestamp, action, position in items:
+            if previous is not None and action is not Touch.UP and abs(position - previous) >= FLICK_JUMP:
+                edges.append((timestamp, position))
+            previous = position
+    edges.sort(key=lambda edge: edge[0])
+
+    # 照 CheckFlick 的规则点亮：窗口里时刻最早的那个
+    marked: set[int] = set()
+    for timestamp, position in edges:
+        chosen = None
+        for seconds, index, note, line in flicks:
+            if id(note) in marked or abs(seconds * 1000 - timestamp) > FLICK_WINDOW_MS:
+                continue
+            if _deviation(line, note, position, timestamp / 1000.0) >= DRAG_TOLERANCE:
+                continue
+            if chosen is None or seconds < chosen[0]:
+                chosen = (seconds, index, note)
+        if chosen is not None:
+            marked.add(id(chosen[2]))
+
+    missing = [item for item in flicks if id(item[2]) not in marked]
+    if not missing:
+        return []
+    chances = min(
+        sum(
+            1
+            for timestamp, position in edges
+            if abs(seconds * 1000 - timestamp) <= FLICK_WINDOW_MS
+            and _deviation(line, note, position, timestamp / 1000.0) < DRAG_TOLERANCE
+        )
+        for seconds, _, note, line in missing
+    )
+    problems = [
+        f"有 {len(missing)} 个 flick 点不亮（最少的那个只有 {chances} 次起手机会）："
+        + "、".join(f"{seconds:.3f}s" for seconds, _, _, _ in missing[:5])
+    ]
+    return problems
+
+
 class Recorder:
     """顶掉 frida 的 script，只记下 post 出去的东西。"""
 
@@ -439,14 +549,15 @@ class Recorder:
         return [int(message.get("payload", {}).get("seq", 0)) for message in self.posted]
 
 
-class FakeSession:
-    """顶掉真打歌现场，只记下"架了哪个规划结果、带什么运行时设置"。"""
-
-    def __init__(self) -> None:
-        self.plays: list[tuple[object, bool, int]] = []
-
-    def play(self, plan, *, mirror: bool, seq: int) -> None:
-        self.plays.append((plan, mirror, seq))
+def _trunk_args(**overrides) -> argparse.Namespace:
+    """``Controller`` 真正会读的那几个命令行参数 —— 就这几个，多一个都不给。"""
+    fields = {
+        "planner": "stub",
+        "latency": 0.0,
+        "save_chart": False,
+        "cache": True,
+    }
+    return argparse.Namespace(**{**fields, **overrides})
 
 
 def check_gate() -> tuple[list[str], str]:
@@ -505,7 +616,11 @@ def check_gate() -> tuple[list[str], str]:
         for mirror, expected in ((True, True), (False, False), (None, False)):
             agent, recorder = build()
             calls: list[dict] = []
-            session = FakeSession()
+            plays: list[tuple[object, bool, int]] = []
+            # 真正跑的是 Controller.handle_level_start，只把最后一步"架播放器"换成记账 ——
+            # 于是这一段验的是真代码，而不是它的一份复述
+            controller = trunk.Controller(_trunk_args())
+            controller.play = lambda plan, *, mirror, seq: plays.append((plan, mirror, seq))
             real_plan = trunk.planner.plan
             real_progress = trunk.planner.TqdmProgress
 
@@ -519,8 +634,7 @@ def check_gate() -> tuple[list[str], str]:
             trunk.planner.TqdmProgress = lambda: None
             try:
                 feed(agent, "chart", seq=7, hash="aaaa", json=chart_text)
-                args = argparse.Namespace(planner="stub", save_chart=False, cache=True)
-                agent.on_level_start = lambda start: trunk.handle_level_start(start, args, session)
+                agent.on_level_start = controller.handle_level_start
                 feed(agent, "level-start", seq=3, chartSeq=7, mirror=mirror)
             finally:
                 trunk.planner.plan = real_plan
@@ -536,17 +650,16 @@ def check_gate() -> tuple[list[str], str]:
             if "mirror" in calls[0]["ref"].context:
                 problems.append(f"mirror={mirror} 时镜像被塞进了缓存的身份里")
 
-            if len(session.plays) != 1:
-                problems.append(f"mirror={mirror} 时播放器应当被架一次，实际 {len(session.plays)} 次")
-            elif session.plays[0][1] is not expected:
-                problems.append(
-                    f"mirror={mirror} 时播放器拿到的是 {session.plays[0][1]!r}"
-                )
+            if len(plays) != 1:
+                problems.append(f"mirror={mirror} 时播放器应当被架一次，实际 {len(plays)} 次")
+            elif plays[0][1] is not expected:
+                problems.append(f"mirror={mirror} 时播放器拿到的是 {plays[0][1]!r}")
 
         # 4) 没收到谱面就直接放行，不能崩也不能卡
         agent, recorder = build()
-        args = argparse.Namespace(planner="stub", save_chart=False, cache=True)
-        agent.on_level_start = lambda start: trunk.handle_level_start(start, args, FakeSession())
+        controller = trunk.Controller(_trunk_args())
+        controller.play = lambda plan, *, mirror, seq: None
+        agent.on_level_start = controller.handle_level_start
         feed(agent, "level-start", seq=4, chartSeq=99, mirror=True)
         if recorder.released != [4]:
             problems.append(f"没有谱面时也必须放行，实际 {recorder.released}")
@@ -750,6 +863,7 @@ def check_player() -> list[str]:
     from algorithms.geometry import Screen
     from algorithms.utils import PlanResult, TouchEvent
     from backends import create
+    from options import Options
 
     problems: list[str] = []
     moments = (1000, 1500, 2000)
@@ -767,7 +881,9 @@ def check_player() -> list[str]:
         backend = create("recording")
         backend.open(plan.screen)
         clock = touch.LocalClock(lead_in=0.05)
-        player = touch.Player(plan, backend, clock, mirror=mirror, latency=latency)
+        player = touch.Player(
+            plan, backend, clock, mirror=mirror, options=Options(latency=latency)
+        )
         player.start()
         if not player.join(10.0):
             problems.append(f"mirror={mirror} 时播放器没跑完")
@@ -791,6 +907,415 @@ def check_player() -> list[str]:
         want = [16.0 - x for x in xs] if mirror else list(xs)
         if any(abs(a - b) > 1e-9 for a, b in zip(got, want, strict=True)):
             problems.append(f"mirror={mirror} 时坐标是 {got}，应当是 {want}")
+
+    return problems
+
+
+def check_console() -> list[str]:
+    """控制台自检：命令解析与那几个旋钮。
+
+    盯的是 ``latency`` 的三种写法（绝对值 / 毫秒 / 增减）与"打错命令不该把控制台带走"。
+    控制台是运行时唯一的面板，解析错了的表现是"改了但没生效"或者"面板没了"，
+    比直接报错难查得多，所以值得钉住。
+    """
+    from console import Console
+    from options import Options
+
+    class FakeController:
+        """只放控制台真正会碰的那几样东西 —— 控制台对主干的依赖就这么多。"""
+
+        def __init__(self) -> None:
+            self.options = Options()
+            self.stopping = False
+            self.restarts: list[bool] = []
+
+        def status_lines(self) -> list[str]:
+            return ["（替身）状态"]
+
+        def restart(self, *, spawn: bool) -> None:
+            self.restarts.append(spawn)
+
+        def stop(self) -> None:
+            self.stopping = True
+
+    problems: list[str] = []
+    fake = FakeController()
+    console = Console(fake)
+
+    def run(line: str) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            console.execute(line)
+        return buffer.getvalue()
+
+    def expect(condition: bool, complaint: str) -> None:
+        if not condition:
+            problems.append(complaint)
+
+    # latency：绝对值、毫秒、增减三种写法
+    run("latency 0.02")
+    expect(abs(fake.options.latency - 0.02) < 1e-9, f"latency 0.02 没生效：{fake.options.latency}")
+    run("latency 20ms")
+    expect(
+        abs(fake.options.latency - 0.02) < 1e-9, f"latency 20ms 没生效：{fake.options.latency}"
+    )
+    run("latency +5ms")
+    expect(
+        abs(fake.options.latency - 0.025) < 1e-9, f"latency +5ms 不成增量：{fake.options.latency}"
+    )
+    run("latency -30ms")
+    expect(
+        abs(fake.options.latency + 0.005) < 1e-9, f"latency -30ms 不成增量：{fake.options.latency}"
+    )
+    run("latency 说不清")
+    expect(
+        abs(fake.options.latency + 0.005) < 1e-9, "看不懂的数不该改动设置"
+    )
+
+    # 开关
+    run("inject off")
+    expect(not fake.options.inject, "inject off 没生效")
+    run("inject on")
+    expect(fake.options.inject, "inject on 没生效")
+    run("verbose on")
+    expect(fake.options.verbose, "verbose on 没生效")
+
+    # 规划器：认识的要换、不认识的原样不动
+    run("planner radical")
+    expect(fake.options.planner == "radical", f"planner radical 没生效：{fake.options.planner}")
+    run("planner 没有这个")
+    expect(fake.options.planner == "radical", "换到不存在的规划器时不该改动设置")
+
+    # 重连与收工
+    run("respawn")
+    run("reattach")
+    expect(fake.restarts == [True, False], f"respawn/reattach 没走对：{fake.restarts}")
+    run("quit")
+    expect(fake.stopping, "quit 没有让主干收工")
+
+    # 打错、打空、打注释都不该炸，也不该被当成命令
+    for line in ("没这个命令", "", "   ", "# 只是注释", "status 多余的参数"):
+        try:
+            run(line)
+        except Exception as error:  # noqa: BLE001 - 就是来看它炸不炸的
+            problems.append(f"执行 {line!r} 时抛了 {type(error).__name__}: {error}")
+
+    # 每一条命令都要说话 —— 包括"看不懂"的。空回显是最难查的一种"没反应"。
+    for line in ("没这个命令", "latency 说不清", "inject 说不清", "verbose", "planner 没有这个", "status"):
+        if not run(line).strip():
+            problems.append(f"{line!r} 一个字都没回")
+
+    # status 就算拿不到任何一行，也不能沉默
+    class EmptyController(FakeController):
+        def status_lines(self) -> list[str]:
+            return []
+
+    silent = Console(EmptyController())
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        silent.execute("status")
+    expect(bool(buffer.getvalue().strip()), "status_lines() 是空的时候，status 不该一声不吭")
+
+    # 管道/重定向：命令要回显出来，日志里才看得出哪条命令配哪行输出
+    class FakeStdin:
+        """一根假 stdin：按行喂命令，喂完就是 EOF。"""
+
+        def __init__(self, *lines: str, tty: bool = False) -> None:
+            self.lines = list(lines)
+            self._tty = tty
+
+        def isatty(self) -> bool:
+            return self._tty
+
+        def readline(self) -> str:
+            return self.lines.pop(0) if self.lines else ""
+
+    buffer = io.StringIO()
+    piped = Console(FakeController(), stdin=FakeStdin("status\n"))
+    with contextlib.redirect_stdout(buffer):
+        piped._loop()  # noqa: SLF001 - 直接跑循环，喂完就 EOF
+    text = buffer.getvalue()
+    for fragment in ("auto> status", "EOF"):
+        if fragment not in text:
+            problems.append(f"管道模式下少了 {fragment!r}：{text!r}")
+
+    # 提示符会被别的线程的输出顶掉，输出完必须画回来：擦掉 -> 打印 -> 再画
+    from console import PROMPT
+    from output import log, set_prompt_hooks
+
+    buffer = io.StringIO()
+    console = Console(FakeController(), stdin=FakeStdin(tty=True))
+    console._waiting = True  # noqa: SLF001 - 模拟"正等着输入"
+    set_prompt_hooks(console._clear_prompt, console._draw_prompt)  # noqa: SLF001
+    try:
+        with contextlib.redirect_stdout(buffer):
+            log("[main] 别的线程说话了")
+    finally:
+        set_prompt_hooks()
+    text = buffer.getvalue()
+    expect(text.count("[main] 别的线程说话了") == 1, f"那行输出应当只出现一次：{text!r}")
+    expect(text.startswith("\r"), f"打印前应当先擦掉提示符：{text!r}")
+    expect(text.endswith(PROMPT), f"打印完应当把提示符画回来，而不是擦掉就完事：{text!r}")
+    expect(PROMPT in text.split("[main]")[1], f"提示符应当在那行输出之后：{text!r}")
+
+    # 没在等输入的时候（正在执行命令）不该乱插提示符
+    buffer = io.StringIO()
+    console._waiting = False  # noqa: SLF001
+    set_prompt_hooks(console._clear_prompt, console._draw_prompt)  # noqa: SLF001
+    try:
+        with contextlib.redirect_stdout(buffer):
+            log("命令自己的输出")
+    finally:
+        set_prompt_hooks()
+    expect(
+        buffer.getvalue() == "命令自己的输出\n",
+        f"没在等输入时不该动屏幕：{buffer.getvalue()!r}",
+    )
+
+    # 输出必须当场出去，不能攒在缓冲里
+    class FlushSpy(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushes = 0
+
+        def flush(self) -> None:
+            self.flushes += 1
+            super().flush()
+
+    spy = FlushSpy()
+    with contextlib.redirect_stdout(spy):
+        log("必须立刻出去")
+    expect(spy.getvalue() == "必须立刻出去\n", f"log 的内容不对：{spy.getvalue()!r}")
+    expect(
+        spy.flushes >= 1,
+        "log() 没有 flush —— 管道里会攒成「敲了一条没反应、再敲一条上一条才出来」",
+    )
+
+    # 谁都不许继承我们的 stdin：`adb shell` 会把本地 stdin 转发给设备端，
+    # 用户在控制台里敲的那一行就被它半路吃掉了 —— 这种错不报错，只表现为"偶尔有一行没反应"
+    for path in sorted(ROOT.glob("*.py")) + sorted((ROOT / "backends").glob("*.py")):
+        for number in _subprocess_calls_without_stdin(path.read_text(encoding="utf-8")):
+            problems.append(f"{path.name}:{number} 的 subprocess 调用没有 stdin=DEVNULL")
+
+    return problems
+
+
+def _subprocess_calls_without_stdin(text: str) -> list[int]:
+    """找出所有没给 ``stdin=`` 的 subprocess 调用，返回行号。
+
+    判据是"这次调用的括号里有没有 ``stdin=``"，不是"这一行里有没有" —— 参数写成多行
+    是很正常的写法（``scrcpy.py`` 里就是）。
+    """
+    import re
+
+    found: list[int] = []
+    for match in re.finditer(r"subprocess\.(?:run|Popen|call|check_call|check_output)\(", text):
+        depth, index = 1, match.end()
+        while index < len(text) and depth:
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                depth -= 1
+            index += 1
+        if "stdin=" not in text[match.end() : index]:
+            found.append(text[: match.start()].count("\n") + 1)
+    return found
+
+
+def check_liveness() -> list[str]:
+    """存活探测自检：``ok`` / ``hang`` / ``dead`` 三种结局都要认得出来。
+
+    没有设备也验得了 —— 会话与脚本本来就是"能 post、能 ping 的对象"，顶掉它们就行。
+    真设备上验这一段要拔线或者杀进程（还得赌上"拔的是哪一根"），而它恰恰是"游戏没了
+    以后别把剩下的排期灌进去"的唯一依据，所以值得在这里钉住。
+
+    另外钉住两件"很难查"的事：收工只收一次（账别报两遍、播放器别停两次），
+    以及收工时别把刚换上的新播放器顺手摘掉（它的排期还在跑，账却再没人收）。
+    """
+    import threading
+    import time as timing
+
+    import main as trunk
+
+    problems: list[str] = []
+
+    class FakeExports:
+        def __init__(self, behaviour) -> None:
+            self.behaviour = behaviour
+
+        def ping(self) -> object:
+            return self.behaviour()
+
+    class FakeScript:
+        """只要有 ``exports_sync.ping`` 与 ``post`` —— Agent 用到的就这两样。"""
+
+        def __init__(self, behaviour) -> None:
+            self.exports_sync = FakeExports(behaviour)
+            self.posted: list[dict] = []
+
+        def post(self, message: dict) -> None:
+            self.posted.append(message)
+
+    def build(behaviour, *, session: object | None = object()):
+        agent = trunk.Agent(Path("unused.js"))
+        agent._script = FakeScript(behaviour)  # noqa: SLF001 - 自检就是要顶掉真会话
+        agent._session = session  # noqa: SLF001
+        return agent
+
+    def expect(condition: bool, complaint: str) -> None:
+        if not condition:
+            problems.append(complaint)
+
+    # 1) 答得上话 = 活着
+    agent = build(lambda: "pong")
+    expect(agent.probe(0.5) == "ok", "答了 pong 却不认成 ok")
+
+    # 2) 没有会话 = 死了（进程被杀之后 frida 会把会话收掉）
+    expect(build(lambda: "pong", session=None).probe(0.5) == "dead", "没有会话却不认成 dead")
+
+    # 3) ping 抛异常 = 死了，而且要记下原因
+    def boom():
+        raise RuntimeError("进程没了")
+
+    agent = build(boom)
+    expect(agent.probe(0.5) == "dead", "ping 抛异常却不认成 dead")
+    expect(bool(agent.detached), "ping 抛了却没记下断线原因")
+
+    # 4) ping 卡住 = hang（进程被冻住），而且要按给定的超时就回来
+    gate = threading.Event()
+    agent = build(lambda: (gate.wait(5.0), "pong")[1])
+    started = timing.monotonic()
+    state = agent.probe(0.2)
+    cost = timing.monotonic() - started
+    expect(state == "hang", f"ping 卡住时报的是 {state}，应当是 hang")
+    expect(cost < 1.5, f"hang 判定等了 {cost:.2f}s，超时没起作用")
+    expect(agent.probe(0.2) == "hang", "上一次探活还没回来，第二次不该再发一轮")
+    gate.set()
+
+    # 5) 主动断开 = 立刻就是 dead，不必等 teardown 回来
+    agent = build(lambda: "pong")
+    agent.stop()
+    expect(agent.probe(0.5) == "dead", "断开之后还不认成 dead")
+
+    # 6) 收工只收一次：探活与主线程可能同时收同一根棒
+    class FakePlayer:
+        def __init__(self) -> None:
+            self.stopped = 0
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def join(self, timeout: float | None = None) -> bool:
+            return True
+
+    controller = trunk.Controller(_trunk_args())
+    player = FakePlayer()
+    reports: list[object] = []
+    controller.player = player
+    controller._report = reports.append  # type: ignore[method-assign]
+    controller.stop_player()
+    controller.stop_player()
+    expect(player.stopped == 1, f"播放器被停了 {player.stopped} 次，应当只有一次")
+    expect(len(reports) == 1, f"账报了 {len(reports)} 次，应当只有一次")
+    expect(controller.player is None, "收工之后 player 该是空的")
+
+    # 7) "打完收工"不能顺手把刚换上的新播放器摘掉
+    controller = trunk.Controller(_trunk_args())
+    installed = FakePlayer()
+    controller.player = installed
+    if controller._take_if(FakePlayer()):  # noqa: SLF001
+        problems.append("取走的不是当前那个播放器，却报告说取到了")
+    if controller.player is not installed:
+        problems.append("比身份失败时不该动当前的播放器")
+    expect(controller._take_if(installed), "当前那个播放器应当取得到")  # noqa: SLF001
+    expect(controller.player is None, "取到之后 player 该是空的")
+
+    return problems
+
+
+def check_judge() -> list[str]:
+    """判定对账自检：``delta`` 与 ``nowTime − realTime`` 必须对得上。
+
+    这三个数来自三处 —— 游戏判决时算的早晚量、游戏当时的 ``nowTime``、我们从音符表抄来的
+    ``realTime``，它们之间有个恒等式。表抄错了在这里就该露馅，而不必等到"Miss 出现在一个
+    不可能的时刻"再靠人眼看出来（真出过一次：表建早了，``realTime`` 全是 0，
+    89.969 秒判掉的音符被记成 "@ 0.000s"）。
+    """
+    problems: list[str] = []
+    try:
+        import main as trunk
+    except ImportError as error:  # noqa: BLE001 - frida 没装也不该让整份自检跑不起来
+        return [f"导入 main.py 失败，跳过判定对账自检：{error}"]
+
+    agent = trunk.Agent(Path("unused.js"))
+    # 一个真实形状的音符：Dlyrotz 里第 7 条线上方第 0 个，89.969 秒
+    note = {
+        "code": 7000000,
+        "type": 4,
+        "time": 89.969,
+        "x": 6.0,
+        "hold": 0.0,
+        "line": 7,
+        "above": True,
+        "index": 0,
+    }
+
+    def judge(**fields) -> str:
+        payload = {"kind": "Miss", "noteCode": 7000000, "delta": None, "note": dict(note), "at": 0}
+        payload.update(fields)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            agent._on_judge(payload)  # noqa: SLF001
+        return buffer.getvalue()
+
+    def expect(condition: bool, complaint: str) -> None:
+        if not condition:
+            problems.append(complaint)
+
+    # 1) 对得上：Good，晚 32ms
+    text = judge(kind="Good", delta=0.032, time=90.001)
+    expect("对不上账" not in text, f"明明对得上却报了账不平：{text.strip()!r}")
+    expect("[judge] Good" in text, f"Good 那行没打出来：{text.strip()!r}")
+
+    # 2) Miss 的正常情形：刚越过窗口（0.1 秒多一点），不该被冤枉
+    expect("对不上账" not in judge(time=89.969 + 0.12), "正常的 Miss 被冤枉了")
+
+    # 3) 表抄早了：realTime 是 0，而游戏说这个音符在 89.969 秒
+    stale = judge(time=89.969, note=dict(note, time=0.0))
+    expect("对不上账" in stale, "realTime 抄成 0 却没被发现")
+    expect("差 +89.969s" in stale or "89.969" in stale, f"抱怨里没说清差了多少：{stale.strip()!r}")
+    expect(agent.judge_mismatches == 1, f"账不平的条数不对：{agent.judge_mismatches}")
+
+    # 4) 同类问题只报一次，别刷屏
+    again = judge(time=89.969, note=dict(note, time=0.0))
+    expect("对不上账" not in again, "同类问题只该报第一次")
+    expect(agent.judge_mismatches == 2, f"第二次没计上数：{agent.judge_mismatches}")
+
+    # 5) 早晚量与 nowTime 不搭（另一条路径也得被抓住）。先清零，否则会被"同类只报一次"挡住
+    agent.judge_mismatches = 0  # noqa: SLF001
+    skewed = judge(kind="Good", delta=0.032, time=120.0)
+    expect("对不上账" in skewed, "早晚量与 nowTime 差得离谱却没被发现")
+    expect(agent.judge_mismatches == 1, f"换了一条路径却没计上数：{agent.judge_mismatches}")
+
+    # 6) 查不到音符（表里没有它）时不该乱报账不平
+    expect("对不上账" not in judge(note=None), "没有音符可查时不该报账不平")
+
+    # 7) Hold 的收尾判决：早晚量是从"按住结束 − 0.22s"量的，不是从头量的 ——
+    #    拿头判的恒等式去对，每条 hold 都会被冤枉（实测 Dlyrotz HD 上正好冤枉了那 8 个 hold）
+    hold_note = dict(note, type=3, time=10.0, hold=2.416)
+    settle = 10.0 + 2.416 - trunk.HOLD_SETTLE_LEAD
+    agent.judge_mismatches = 0  # noqa: SLF001
+    text = judge(kind="Perfect", delta=0.012, time=settle + 0.012, note=hold_note)
+    expect("对不上账" not in text, f"Hold 的收尾判决被冤枉了：{text.strip()!r}")
+    expect(agent.judge_mismatches == 0, "Hold 的合法收尾不该计成账不平")
+
+    # 8) 但 Hold 的**头判**照样要认（同一条恒等式，参考点是音符时刻）
+    text = judge(kind="Perfect", delta=0.010, time=10.010, note=hold_note)
+    expect("对不上账" not in text, f"Hold 的头判被冤枉了：{text.strip()!r}")
+
+    # 9) Hold 也不许蒙混：两头的参考点都对不上，照样得报
+    text = judge(kind="Perfect", delta=0.012, time=settle + 0.9, note=hold_note)
+    expect("对不上账" in text, "Hold 两头都对不上却没报账不平")
 
     return problems
 
@@ -903,7 +1428,10 @@ def main() -> int:
         ("时钟自检", check_clock()),
         ("坐标换算自检", check_pixels()),
         ("播放器自检", check_player()),
+        ("控制台自检", check_console()),
+        ("存活探测自检", check_liveness()),
         ("结算自检", check_result()),
+        ("判定对账自检", check_judge()),
         ("在位时长自检", check_dwell()),
     ):
         print(f"{label}：" + ("通过" if not problems else "有问题"))
@@ -939,6 +1467,7 @@ def main() -> int:
             problems = check_stream(result)
             total, misses, worst = check_coverage(chart, result)
             problems += check_storage(text, info.name, result)
+            problems += check_flick(chart, result)
             m_total, m_misses, m_worst = check_mirror(text, result)
             if m_misses:
                 problems += [f"镜像后漏掉 {note}" for note in m_misses[:4]]
@@ -948,7 +1477,7 @@ def main() -> int:
             ok = not problems and not misses
             failed = failed or not ok
             print(
-                f"  [{info.name}] {len(result.frames)} 帧 / {result.event_count} 事件 / "
+                f"  [{info.name}] {len(result.frames)} 帧 / {result.event_count} 个事件 / "
                 f"{result.pointer_count} 指针 / {result.duration_ms}ms -> "
                 f"{'全部通过' if ok else '有问题'}"
             )

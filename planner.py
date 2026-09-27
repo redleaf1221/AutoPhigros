@@ -116,7 +116,7 @@ def describe(name: str) -> str:
 
 def summary(result: PlanResult) -> str:
     return (
-        f"{result.planner}: {len(result.frames)} 帧 / {result.event_count} 事件 / "
+        f"{result.planner}: {len(result.frames)} 帧 / {result.event_count} 个事件 / "
         f"{result.pointer_count} 指针 / {result.duration_ms / 1000:.1f}s"
     )
 
