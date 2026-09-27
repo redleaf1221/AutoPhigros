@@ -30,6 +30,25 @@ agent 每半秒被真的问一声（``ping``）：进程被杀 frida 会主动�
 只会更糟），并且**不会自作主张重连**：游戏关掉了就打 ``respawn``，还开着就打
 ``reattach``。重连是人的决定，不是程序的猜测。
 
+收工
+----
+控制台的 ``quit`` 与 Ctrl+C 走的是**同一条路**（``Controller.stop``）：请求主干停手、当场
+unload 脚本并 detach 会话、停播放器、关触控后端。之所以不能"只置一个标志、等主干自己发现"：
+主干可能正卡在启动阶段那些阻塞调用里（frida 找设备自带 10 秒超时、等 agent 握手最长
+``READY_TIMEOUT``、推 scrcpy 要一两秒），那时候置标志等于什么都不做 —— 屏幕上还是那个
+``auto> ``，游戏上却已经挂着我们的 hook。Ctrl+C 看起来干脆，只是因为它能打断阻塞调用。
+
+两条路唯一不同的地方也出在这里：Ctrl+C 是信号，**再按一下就落在拆除中途**，把 unload /
+detach 打断（那就等于没取消注入，还甩一份堆栈出来），所以拆除期间先把它屏蔽掉。
+
+拆除只做一次，谁先到谁做，后到的那个等它做完 —— 主干必须等到：拆除的最后一步只是起了一条
+线程去 detach（进程冻住时它会挂住，所以不能同步等死），主干要是扭头就把进程结束了，
+设备上就留下一个还挂着 hook 的游戏。另外，**闸门还开着就先放行再断会话**：Unity 主线程正卡在
+``recv("release")`` 上，直接断会话的话那条 ``wait()`` 永远等不到消息，游戏会冻在那儿。
+
+收工**只撤我们自己的东西**：脚本、会话、播放器、触控后端。游戏本身一动不动 —— 即使它是我们
+spawn 出来、还没放行的那个，放不放它跑也不是收工该管的事。
+
 判定流水
 --------
 agent 在 ``ScoreControl::Perfect/Good/Bad/Miss`` 上都挂了号，每次判决都把"哪个音符、
@@ -50,7 +69,7 @@ agent 在 ``ScoreControl::Perfect/Good/Bad/Miss`` 上都挂了号，每次判决
     python main.py -D <device-id>               # 指定设备
 
 跑起来之后终端就是控制台，``help`` 看命令（``planner`` / ``latency`` / ``inject`` /
-``verbose`` / ``status`` / ``respawn`` / ``reattach``）。
+``verbose`` / ``status`` / ``respawn`` / ``reattach`` / ``quit``）。
 
 包名、agent 路径、输出目录都是项目内固定常量，不做成参数。
 """
@@ -58,6 +77,7 @@ agent 在 ``ScoreControl::Perfect/Good/Bad/Miss`` 上都挂了号，每次判决
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import threading
 import time
@@ -109,6 +129,13 @@ PING_TIMEOUT = 2.0
 
 TEARDOWN_TIMEOUT = 3.0
 """断开旧会话最多等多久（秒）。进程被冻住时 unload/detach 会挂住，超了就直接丢下它。"""
+
+SHUTDOWN_WAIT = 6.0
+"""``shutdown()`` 里"等已经开始了的那次拆除做完"最多等多久（秒）。
+
+比 ``TEARDOWN_TIMEOUT`` 宽：拆除里 unload/detach 自己最多等 3 秒，还要算上停播放器
+（最多 2 秒）与关后端。真超了也确实该丢下它走人 —— 收工不能变成另一种卡住。
+"""
 
 NOTE_TYPE_NAMES = {int(kind): kind.name.title() for kind in NoteType}
 """``ChartNote.type`` 的数字 -> 名字。与谱面 JSON 的 ``type`` 同源（``algorithms.chart``）。"""
@@ -213,6 +240,12 @@ class Agent:
         self.judge_mismatches = 0
         """本局有多少条判决与音符表对不上账（见 :meth:`_check_judge`）。"""
 
+        self.gate_open: int | None = None
+        """还开着的闸门编号：Unity 主线程正卡在 ``recv("release")`` 上等我们放行。
+
+        收工时它必须**先放行再断会话** —— 见模块开头「收工」。
+        """
+
         self.pid: int | None = None
         """spawn 出来的 pid；attach 模式下是 None。"""
 
@@ -244,8 +277,15 @@ class Agent:
             log(f"[main] 已附加到 {PACKAGE}")
         else:
             self.pid = self.device.spawn([PACKAGE])
+            # 收工可能就落在这几百毫秒到几秒里（spawn 要等进程真起来）：那就不注入了
+            if self._stopped_early():
+                return
             self._session = self.device.attach(self.pid)
             log(f"[main] 已启动 {PACKAGE} (pid={self.pid})")
+
+        if self._stopped_early():
+            self._close_session()
+            return
 
         # 进程没了要第一时间知道：frida 会主动报 detached，比探活快、也不花一次往返
         self._session.on("detached", self._on_detached)
@@ -260,19 +300,20 @@ class Agent:
             self.device.resume(self.pid)
             log("[main] 已恢复运行")
 
-    def wait_ready(self, timeout: float = READY_TIMEOUT) -> bool:
-        """等 agent 报 ready，确认 hook 真的装上了。"""
-        if self.ready.wait(timeout):
-            return True
-        log(f"[main] 警告：{timeout:.0f}s 内未收到 agent 的 ready 消息", file=sys.stderr)
-        return False
-
     def stop(self, timeout: float = TEARDOWN_TIMEOUT) -> None:
         """断开。**尽力而为**：进程冻住时 unload/detach 会挂住，超时就直接丢下它。
 
         丢下是安全的 —— 这条会话只属于这一个 ``Agent`` 对象，进程真的死了 frida 会自己
         收拾；而卡住控制台线程是不可接受的（``respawn`` 就在那条线程上）。
         """
+        # 闸门还开着就先放它走：Unity 主线程正卡在 recv("release") 上，直接断会话的话
+        # 那条 wait() 永远等不到消息 —— 游戏会连着主线程一起冻在那儿，人只能去杀进程。
+        # 放行是"取消注入"的一部分，不是可选项。
+        if self.gate_open is not None:
+            log(f"[gate #{self.gate_open:04d}] 收工，先把这道闸门放行再断会话（游戏不该被我们冻住）")
+            self.release(self.gate_open)
+            self.gate_open = None
+
         # 先把状态标成"已断"，探活与播放器立刻就能据此停手，不必等 teardown 回来
         self._detached = self._detached or "已断开"
         script, session = self._script, self._session
@@ -293,6 +334,27 @@ class Agent:
         thread.join(timeout)
         if thread.is_alive():
             log(f"[main] 旧会话 {timeout:.0f}s 内没断干净（进程可能冻住了），丢下它继续")
+
+    def _stopped_early(self) -> bool:
+        """会话是不是已经在**起它的路上**被收掉了（``quit`` / Ctrl+C 落在这几秒里）。
+
+        依据是 :meth:`stop` 打的那个"已断"标记：它先于一切落下。真的收早了就别再往下
+        注入了 —— 会话刚建好就没人管了。
+        """
+        if self._detached is None:
+            return False
+        log("[main] 注入还没做完就收到了收工，不再往下注入了")
+        return True
+
+    def _close_session(self) -> None:
+        """丢掉一个刚建出来、还没被谁管起来的会话。"""
+        session, self._session = self._session, None
+        if session is None:
+            return
+        try:
+            session.detach()
+        except Exception:  # noqa: BLE001 - 进程可能已经没了
+            pass
 
     def release(self, seq: int) -> None:
         """放行第 seq 道闸门，游戏的下一帧从 ``SortForNoteWithFloorPosition`` 里继续。"""
@@ -551,6 +613,7 @@ class Agent:
             level = context.get("songsLevel") or "?"
         self.level_label = f"{song} [{level}]"
         self.judge_mismatches = 0
+        self.gate_open = start.seq
         log(f"[gate #{start.seq:04d}] 谱面启动：{song}，镜像 {state}（游戏已停住）")
         log(f"            游戏延迟 {_offset_text(start.offset)}")
 
@@ -563,6 +626,8 @@ class Agent:
                 file=sys.stderr,
             )
         finally:
+            # 先销号再放行：收工那条路上会照着 gate_open 补一次放行，销了号就不会重复
+            self.gate_open = None
             self.release(start.seq)
 
 
@@ -654,6 +719,9 @@ class Controller:
         """最近一次探活的结果：``未启动`` / ``ok`` / ``hang`` / ``dead``。"""
 
         self._stopping = threading.Event()
+        self._teardown_lock = threading.Lock()
+        self._teardown_started = False
+        self._teardown_done = threading.Event()
         self._device: frida.core.Device | None = None
         self._watchdog: threading.Thread | None = None
         self._player_lock = threading.Lock()
@@ -666,8 +734,72 @@ class Controller:
         return self._stopping.is_set()
 
     def stop(self) -> None:
-        """收工。可以重复调；控制台的 quit 与 Ctrl+C 都走它。"""
+        """收工：请求主干停手，**并且当场开始拆除**。控制台的 ``quit`` 与 Ctrl+C 都走它。
+
+        两件事一起做，是因为"只置一个标志、等主干自己发现"在这里不成立：主干可能正卡在
+        启动阶段的阻塞调用里（frida 找设备自带 10 秒超时、等 agent 握手、推 scrcpy 要一两秒），
+        那时候置标志等于什么都不做 —— 屏幕上还是那个 ``auto> ``，游戏上却已经挂着我们的 hook，
+        人就以为"退出来了"。Ctrl+C 看起来干脆，只是因为它能打断阻塞调用。
+
+        可重复调、可从任何线程调：拆除只做一次，后来的人只是等它做完。
+        """
         self._stopping.set()
+        self.shutdown()
+
+    def shutdown(self) -> None:
+        """拆除一次，且只拆一次；第二个到的人在这里等第一个拆完。
+
+        为什么**必须等**：拆除的最后一步（``Agent.stop``）只是起了一条线程去 unload / detach
+        —— 进程冻住时它会挂住，所以不能同步等死。主干要是扭头就把进程结束了，设备上就留下
+        一个还挂着 hook 的游戏，而"取消注入"正是收工要办的事。
+
+        为什么拆之前先屏蔽 SIGINT：**Ctrl+C 常常要按两下**（第一下没见动静，人就再按一下），
+        第二下会落在拆除中途，把 unload / detach 打断 —— 那就等于没取消注入，还甩一份
+        ``KeyboardInterrupt`` 的堆栈出来。第一下已经进来了，够了。信号只能在主线程装，
+        装完还原（自检会在同一个进程里反复走这条路）。
+        """
+        previous = None
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with self._teardown_lock:
+                starter = not self._teardown_started
+                self._teardown_started = True
+            if starter:
+                try:
+                    self._teardown()
+                finally:
+                    self._teardown_done.set()
+            self._teardown_done.wait(SHUTDOWN_WAIT)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
+
+    def _teardown(self) -> None:
+        """真正的拆除：停播放器、关触控后端、断会话。每一步都自己兜住异常。
+
+        收工是一串"本来就不一定成功"的动作（进程可能已经没了、后端可能早就退了），中间哪一步
+        失败都不该拦住后面几步 —— 尤其是最后那一步"取消注入"。
+        """
+        for what, step in (
+            ("停播放器", self.stop_player),
+            ("关触控后端", self._close_backend),
+            ("断开 frida 会话", self._stop_agent),
+        ):
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - 收工路上不该再抛
+                log(f"[main] 收工时{what}没做好：{type(error).__name__}: {error}", file=sys.stderr)
+
+    def _close_backend(self) -> None:
+        backend, self.backend = self.backend, None
+        if backend is not None:
+            backend.close()
+
+    def _stop_agent(self) -> None:
+        agent, self.agent = self.agent, None
+        if agent is not None:
+            agent.stop()
 
     def open(self) -> bool:
         """找设备、注入。失败就报清楚并且返回 False（这些是本会话的前提，退不的）。"""
@@ -687,6 +819,11 @@ class Controller:
             log(f"[main] 与 frida-server 的通信中断：{error}", file=sys.stderr)
             return False
         log(f"[main] 设备：{self._device.name} ({self._device.type})")
+
+        if self.stopping:
+            # 找设备这一步（frida 自己的 10 秒超时）打断不了，但"还没注入"是可以不做的
+            log("[main] 刚找到设备就收到收工，注入就不做了")
+            return False
 
         try:
             self.start_agent(attach=self.args.attach)
@@ -719,10 +856,26 @@ class Controller:
         agent = Agent(AGENT, self._device, self.options, attach=attach)
         self.agent = agent
         agent.start()
-        agent.wait_ready()
+        self._await_ready(agent)
         agent.clock = self.clock
         agent.on_level_start = self.handle_level_start
         self.agent_state = "ok"
+
+    def _await_ready(self, agent: Agent) -> None:
+        """等 agent 报 ready —— **按片等**，收工了就不再等。
+
+        一次 ``Event.wait(READY_TIMEOUT)`` 的话，``quit`` 落在这个窗口里就是"按了没反应"
+        （标志位拦不住 ``wait``）。而不明原因等满 30 秒本来就是该报警的事，不是该把人锁在
+        里面按什么都没反应的事。
+        """
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            if agent.ready.wait(0.1):
+                return
+            if self.stopping:
+                log("[main] 还在等 agent 握手就收到了收工，不等了", file=sys.stderr)
+                return
+        log(f"[main] 警告：{READY_TIMEOUT:.0f}s 内未收到 agent 的 ready 消息", file=sys.stderr)
 
     def restart(self, *, spawn: bool) -> None:
         """把 agent 换一个新的：``spawn=True`` 重新启动游戏，否则附加到正在跑的那个。
@@ -732,6 +885,9 @@ class Controller:
         """
         if self._device is None:
             log("[main] 还没找到设备，重连无从谈起", file=sys.stderr)
+            return
+        if self.stopping:
+            log("[main] 已经收工了，不再重连（要接着打就重新起一个 main.py）", file=sys.stderr)
             return
 
         self.stop_player()
@@ -746,6 +902,9 @@ class Controller:
         except Exception as error:  # noqa: BLE001 - 重连失败不该把主机带走
             log(f"[main] 重连失败：{type(error).__name__}: {error}", file=sys.stderr)
             self.agent_state = "未启动"
+            # 半途而废的注入要收干净：会话可能已经建起来了，而这条线路上没人会再来收它
+            # （主干还在跑，不会走收工那一步）
+            self._stop_agent()
             return
         log(f"[main] 重连完成 —— {self.options.summary()}")
         log("[main] 自己点到那首歌，开谱时自动接管")
@@ -761,14 +920,6 @@ class Controller:
             log(f"[main] 触控后端 {name} 起不来，这一把只采集不打：{error}", file=sys.stderr)
             backend = None
         self.backend = backend
-
-    def shutdown(self) -> None:
-        self.stop()
-        self.stop_player()
-        if self.backend is not None:
-            self.backend.close()
-        if self.agent is not None:
-            self.agent.stop()
 
     # ------------------------------------------------------------ 探活
 
@@ -806,6 +957,13 @@ class Controller:
     # ------------------------------------------------------------ 打歌
 
     def play(self, plan: PlanResult, *, mirror: bool, seq: int) -> None:
+        if self.stopping:
+            # 收工是在别处发起的（quit / Ctrl+C）而这条开谱消息刚到：触控后端已经关了、
+            # 会话也快断了，这一局的排期没有任何去处，架播放器只会把事件灌进一个我们
+            # 已经放手的进程。
+            log(f"[touch #{seq:04d}] 正在收工，这一局不架播放器了", file=sys.stderr)
+            return
+
         self.stop_player()
         if self.backend is None:
             log(f"[touch #{seq:04d}] 触控后端没起来，这一局只采集不打", file=sys.stderr)
@@ -904,6 +1062,11 @@ class Controller:
         算出来的就是**规范解**（不镜像、不偏移）。镜像与延迟都是运行时的事，
         由播放器临时改（``touch.Player``），所以缓存对所有局面通用。
         """
+        if self.stopping:
+            # 收工是在别处发起的：这一局不必再算一遍（规划一张谱要几秒），闸门照样由 agent 放行
+            log(f"[gate #{start.seq:04d}] 正在收工，这一局不规划了")
+            return
+
         raw = start.chart
         if raw is None:
             log(
@@ -1047,12 +1210,18 @@ def main() -> int:
     controller = Controller(args)
     try:
         # 面板**第一个**支起来：找设备、注入、等 agent 握手、推 scrcpy 要好几秒
-        # （wait_ready 最长 30s），之前那段时间里敲什么都没人听。控制台只依赖
-        # controller 的 options / status_lines / restart，这几样在 open() 之前就是好的。
+        # （等 ready 最长 READY_TIMEOUT），之前那段时间里敲什么都没人听。控制台只依赖
+        # controller 的 options / status_lines / restart / stop，这几样在 open() 之前就是好的。
         Console(controller).start()
 
         if not controller.open():
-            return 2
+            # 收工在启动阶段就到了（quit / Ctrl+C）不算失败 —— 那是人让它停的
+            return 0 if controller.stopping else 2
+
+        if controller.stopping:
+            # 已经注入了，但后端与探活还没起：这几秒的活也省掉，收工要立刻见效
+            log("[main] 还没开打就收到了收工，后端与探活都不起了")
+            return 0
 
         log(f"[main] {controller.options.summary()}")
         log(f"[main] 规划器 {planner.describe(controller.options.planner)}")
@@ -1067,6 +1236,7 @@ def main() -> int:
             time.sleep(0.2)
             controller.poll()
     except KeyboardInterrupt:
+        # Ctrl+C 不另走一条拆除的路：它和控制台的 quit 都落到底下这一句上
         pass
     finally:
         controller.shutdown()
