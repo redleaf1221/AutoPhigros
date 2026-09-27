@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Callable
 
 import backends
 from algorithms import catalog
-from .config import CHARTS_DIR, PLANS_DIR, log_file_path
+from .config import CHARTS_DIR, log_file_path
 from .output import log, log_path, log_to_file, set_prompt_hooks, stop_file_log
 
 if TYPE_CHECKING:

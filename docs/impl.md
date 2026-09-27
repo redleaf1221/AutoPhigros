@@ -24,40 +24,41 @@ auto_phigros/
     hooks/clock.ts  hook 6    游戏时钟（ProgressControl::Update）
     hooks/score.ts  hook 7/8  判定流水（Perfect/Good/Bad/Miss）、结算（GetLevelResultInfo）
     hooks/level.ts  hook 9/10 播放状态（Play：暂停/恢复）、这一局没了（LevelControl::OnDestroy）
-  main.py           薄入口：读/建 config.json → 起主干（控制台）→ 收工
-  runtime/          主干那一套（不可独立运行；包内用相对 import）
-    console.py        主干：命令表 + 读输入（跑在主线程上）
-    controller.py     设备 / 后端 / 时钟 / 注入 / 播放器 / 收工
-    agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
-    config.py         固定常量 + 落盘的 config.json（ROOT = 上一级目录）
-    options.py        运行时设置（控制台改的就是它）
-    output.py         进程里唯一的写者：整行原子输出 + 补回提示符 + 抄一份到 logs/
-  formats/
-    storage.py        .psap 编解码 + 落盘
-  tools/
-    device_log.py     运行日志的读回（judge --compare 拿它当"设备标准答案"）
-  planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
-  judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
-  touch.py          触控模块：时钟、调度器、命令行，可单独运行
-  backends/         触控后端，按名字现 import
-    __init__.py     对外只暴露 catalog() / create() / register()
-    utils.py        契约：Backend 协议 + 虚拟屏 → 设备像素
-    registry.py     后端注册表
-    scrcpy.py       scrcpy 控制协议（目前唯一的真后端）
-    recording.py    干跑：不连设备，只记录（自检与 backend recording 用）
-  render.py         可视化模块，把 .psap 渲染成视频
-  selftest.py       薄入口：代码自检（判据与替身在 tests/ 里）
-  tests/            自检包：coverage / archive / runtime / console / liveness / accounting /
-                    attach / settings / referee / stubs / cli
-  algorithms/
-    __init__.py     对外只暴露 catalog() / create() / register()
-    utils.py        契约：TouchEvent、PlanResult（含 mirrored()）、Progress、Planner
-    chart.py        官谱模型与解析
-    geometry.py     虚拟屏幕、音符摆位、判定区（垂直判定见下）
-    judging.py      判定规则的唯一出处 + 重放裁判（judge.py 与覆盖率判据都读它）
-    track.py        事件时间轴：按毫秒收事件、压掉原地不动的 MOVE
-    registry.py     规划器注册表，按名字现 import
-    conservative.py / radical.py / geometric.py
+  src/                  源码根：所有 Python 都在这一层（跑法见 README 的"目录一览"）
+    main.py           薄入口：读/建 config.json → 起主干（控制台）→ 收工
+    planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
+    judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
+    touch.py          触控模块：时钟、调度器、命令行，可单独运行
+    render.py         可视化模块，把 .psap 渲染成视频
+    selftest.py       薄入口：代码自检（判据与替身在 tests/ 里）
+    runtime/          主干那一套（不可独立运行；包内用相对 import）
+      console.py        主干：命令表 + 读输入（跑在主线程上）
+      controller.py     设备 / 后端 / 时钟 / 注入 / 播放器 / 收工
+      agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
+      config.py         固定常量 + 落盘的 config.json（ROOT = src 的上一层）
+      options.py        运行时设置（控制台改的就是它）
+      output.py         进程里唯一的写者：整行原子输出 + 补回提示符 + 抄一份到 logs/
+    formats/
+      storage.py        .psap 编解码 + 落盘
+    tools/
+      device_log.py     运行日志的读回（judge --compare 拿它当"设备标准答案"）
+    backends/         触控后端，按名字现 import
+      __init__.py     对外只暴露 catalog() / create() / register()
+      utils.py        契约：Backend 协议 + 虚拟屏 → 设备像素
+      registry.py     后端注册表
+      scrcpy.py       scrcpy 控制协议（目前唯一的真后端）
+      recording.py    干跑：不连设备，只记录（自检与 backend recording 用）
+    tests/            自检包：coverage / archive / runtime / console / liveness / accounting /
+                      attach / settings / referee / stubs / cli
+    algorithms/
+      __init__.py     对外只暴露 catalog() / create() / register()
+      utils.py        契约：TouchEvent、PlanResult（含 mirrored()）、Progress、Planner
+      chart.py        官谱模型与解析
+      geometry.py     虚拟屏幕、音符摆位、判定区（垂直判定见下）
+      judging.py      判定规则的唯一出处 + 重放裁判（judge.py 与覆盖率判据都读它）
+      track.py        事件时间轴：按毫秒收事件、压掉原地不动的 MOVE
+      registry.py     规划器注册表，按名字现 import
+      conservative.py / radical.py / geometric.py
   config.json       落盘的配置（第一次跑按默认值建；不进版本库）
   charts/           采集到的谱面（save-chart on）
   plans/            规划结果 = 缓存（默认写）
@@ -136,7 +137,7 @@ agent 拆成模块之后，`../frida/index.ts` 只剩"找类、按顺序装、�
 
 ### 裁判与实机逐音符对齐（`judge.py --compare`）
 
-裁判（`../algorithms/judging.py`）的职责是**复现游戏会怎么判**。它准不准不该靠感觉：
+裁判（`../src/algorithms/judging.py`）的职责是**复现游戏会怎么判**。它准不准不该靠感觉：
 `judge.py --compare <日志>` 把裁判的每一条判定与实机日志里的**同一个音符**对上
 （身份是 `(线, 上/下, 同侧第几个)`，就是游戏自己的 `noteCode` 那套）。
 
@@ -309,7 +310,7 @@ LevelResultInfo::set_Percent(v7, v2->_percent);
 
 前两条把判定线整个绕屏幕中心翻过去；第三条**只取负、不减 0.5** —— 这恰好证明了
 `positionX` 是**以判定线为原点的沿线上偏移量**，不是屏幕绝对坐标。
-`../algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 正是这个模型。
+`../src/algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 正是这个模型。
 
 顺带证实了 `positionX` 的缩放：`JudgeLineControl::Start` 算出
 `moveScale = min(1, (屏宽/屏高) / (16/9))`，而 `LevelControl::SetInformation` 把每个音符的
@@ -354,7 +355,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 - 放行消息带 `seq`，对不上的（上一关残留、误发）不算数，重新注册接着等 —— 免得把
   下一关悄悄放走。不带 `seq` 的放行一律认，方便手工操作。
 
-主机侧（`../main.py`）在 `level-start` **那条消息里**把活干完再放行，一律 `try/finally`：
+主机侧（`../src/main.py`）在 `level-start` **那条消息里**把活干完再放行，一律 `try/finally`：
 规划失败、规划器抛异常、甚至采集失败（agent 会送来一条只带 `error` 的 `level-start`），
 都必须放行 —— 少了放行游戏就死在闸门上，比规划失败严重得多。
 
@@ -382,7 +383,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 就是"先对着原文规划，再把结果整体水平翻过去"（`PlanResult.mirrored`），镜像开关原样
 记进来源上下文，`.psap` 和 `meta.json` 里都看得见。
 
-> 这条推理有个硬判据：`../selftest.py` 会把规划结果翻过来、拿去对 **按 `Chart::Mirror`
+> 这条推理有个硬判据：`../src/selftest.py` 会把规划结果翻过来、拿去对 **按 `Chart::Mirror`
 > 规则镜像出来的那份谱面**，要求 393/393 全中。实测镜像前后的最大横向偏差 **逐位相同**
 > （0.0137 / 0.2490 / 0.0547 / 1.2800）—— 横向判据本身就是镜像不变的，这正是它该有的样子。
 > 把 `mirrored()` 改成空操作、翻错轴、或者把中线从 8 挪到 9，都会立刻漏掉两三百个音符。
@@ -393,7 +394,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 
 ## 垂直判定
 
-Phigros 的判定特色，也是 `../algorithms/geometry.py` 里一切的地基。
+Phigros 的判定特色，也是 `../src/algorithms/geometry.py` 里一切的地基。
 
 `JudgeControl::GetFingerPosition` 为每根手指、每条判定线只算两个量：判定线局部坐标下的
 **横向分量**与**法向分量**。而 `JudgeControl::CheckNote` 里只把横向分量拿去比
@@ -404,7 +405,7 @@ Phigros 的判定特色，也是 `../algorithms/geometry.py` 里一切的地基�
 
 - 把屏幕外的音符沿**垂直于判定线**的方向拉回屏幕是安全的 —— 横向分量不变。
 - 几何算法可以放心按判定区窄带的重心按下去，哪怕重心离判定线很远。
-- `../selftest.py` 校验的是沿判定线的横向偏差，而不是欧氏距离。
+- `../src/selftest.py` 校验的是沿判定线的横向偏差，而不是欧氏距离。
 
 三个容易记错的细节：
 
@@ -447,7 +448,7 @@ world_y = (raw_y − 0.5) × 10
 > **水平判定线毫无影响**（官谱里绝大多数事件角度就是 0°），所以它镜像了也照样能打。
 > 但只要判定线立起来（90°），横向分量就整体错掉；做可视化时更是整层都对不上。
 >
-> 这个坑值得记一笔：`../algorithms/chart.py` 最初就是从 phisap 照抄过来的，
+> 这个坑值得记一笔：`../src/algorithms/chart.py` 最初就是从 phisap 照抄过来的，
 > 结果渲染出来所有点都挤在画面上半部分。 **判定依据是 `(raw − 0.5) × 10`，不是 `5 − raw × 10`。**
 
 ## 规划器
@@ -472,7 +473,7 @@ world_y = (raw_y − 0.5) × 10
   一起拖住：主线程一停，游戏时钟的采样就断，触控跟着停，恢复时 `nowTime` 按音频
   往前跳一大截，整个时间轴就和谱面错开了。降到 8ms 后是 43 个/秒，
   **覆盖率与最大偏差逐位没变**。
-* **手指没动就别说话。** `../algorithms/track.py` 的 `EventTrack` 会丢掉同一指针、
+* **手指没动就别说话。** `../src/algorithms/track.py` 的 `EventTrack` 会丢掉同一指针、
   同一坐标的 MOVE。真实手指不动时本来就不产生事件，所以这更接近真实输入。
   `geometric` 原本 70% 的事件是这样的空报。
 
@@ -504,7 +505,7 @@ world_y = (raw_y − 0.5) × 10
 一帧有多长由游戏自己的帧率策略定：`GameInformation::CheckFrameRate` 读
 `Screen.currentResolution.refreshRateRatio`，刷新率 ≤ 89Hz 时 `targetFrameRate = 60`，
 更高则取 `2 × 刷新率`、上限 300，而 `QualitySettings.vSyncCount` 恒为 0。
-60fps 是它支持的最低档，`../algorithms/utils.py` 的 `MIN_DWELL_MS = 20` 就按这一档兜底，
+60fps 是它支持的最低档，`../src/algorithms/utils.py` 的 `MIN_DWELL_MS = 20` 就按这一档兜底，
 不用去猜设备。（实机帧间隔比 16.7ms 短，所以上面那些"不足一帧"的覆盖在真机上时中时不中：
 **同一个规划结果，不同一局的 miss 个数可以不一样** —— 这条正好可以拿来验证。）
 
@@ -554,7 +555,7 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 
 * 位置由 `storage.plan_path_for` 定：`<谱面文件名前缀>_<规划器>.psap`，
   一张谱面 + 一个规划器对应一个文件，天然一一对应；
-* 命中判据是 meta 里的 `cache_key` —— `algorithms/**/*.py` 加 `../planner.py` 的哈希。
+* 命中判据是 meta 里的 `cache_key` —— `../src/algorithms/**/*.py` 加 `../src/planner.py` 的哈希。
   改了算法、改了谱面解析、改了坐标换算，指纹就变，下次自动重算；
 * 镜像、延迟这些**运行时**设置一概不进缓存：`.psap` 存的是规范解（不镜像、不偏移），
   由 `touch.Player` 在执行时临时改。于是一张谱面的缓存在任何局面下都能用，
@@ -564,7 +565,7 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 
 ## 触控
 
-把 `.psap` 里的触点按时发到设备上。后端都在 `../backends` 包里，照 `algorithms/` 的套路来：
+把 `.psap` 里的触点按时发到设备上。后端都在 `../src/backends/` 包里，照 `../src/algorithms/` 的套路来：
 一张注册表按名字现 import，加一个后端 = 写一个模块 + 在 `registry._BUILTIN` 里加一行。
 
 | 后端 | 干什么 |
@@ -592,18 +593,20 @@ adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / \
 # 连上 127.0.0.1:<port>，先读掉一个哨兵字节再开始发
 ```
 
-两个路径是项目里的固定常量（`../backends/scrcpy.py` 顶部）：`adb` 用
-`C:\UserData\platform-tools\adb.exe`，server 用**项目上一级目录**里的 `scrcpy-server-v4.1`
+两个路径是项目里的固定常量（`../src/backends/scrcpy.py` 顶部）：`adb` 用
+`C:\UserData\platform-tools\adb.exe`，server 用**与 `scrcpy.py` 同目录**的 `scrcpy-server-v4.1`
 （从 scrcpy release 里拿出来、不用改扩展名）。自检：
 
 ```sh
+cd src
 python -m backends.scrcpy      # 只查 adb、server 文件和屏幕尺寸
 ```
 
-（`../backends` 里的模块是包内相对 import，所以用 `-m` 跑，直接 `python backends/scrcpy.py` 不行。）
+（`../src/backends/` 里的模块是包内相对 import，所以得在 `src/` 里用 `-m` 跑 —— 直接
+`python src/backends/scrcpy.py` 不行。）
 
 一条触摸消息 32 字节（大端，字段逐一对过 v4.1 的 `control_msg.h` 与
-`ControlMessageReader.java`，见 `../backends/scrcpy.py` 顶部）：动作、指针号、x、y、屏宽、屏高、
+`ControlMessageReader.java`，见 `../src/backends/scrcpy.py` 顶部）：动作、指针号、x、y、屏宽、屏高、
 压力（按下 `0xffff`、抬起 0）、`action_button`、`buttons`。多指索引由 server 自己算 ——
 客户端只管发 DOWN/UP/MOVE 和各自的指针号。
 
@@ -655,7 +658,7 @@ agent 每 100ms 把 `ProgressControl.nowTime` 回传一次，触控模块用这�
 > `origin` 就退化成那个样本自己的 `h − v`， **它带多少延迟我们就晚发多少**，要等 2 秒
 > 窗口重新填满才自愈。表现是偶发的 late good、每次音符还都不一样，而"最大迟到"那个
 > 指标量的是"相对我自己的排期"，排期本身错位它照样报 0 —— 完全看不见。
-> 现在只认"看着它停过"这一条证据，`../selftest.py` 里有一条传输打嗝的回归用例盯着。
+> 现在只认"看着它停过"这一条证据，`../src/selftest.py` 里有一条传输打嗝的回归用例盯着。
 
 剩下一个固定偏差：主机 → adb → 设备 → InputManager 这条注入链路的耗时。它由
 `--latency` 手工补（正数 = 提前发），只能上设备调，默认 0。
@@ -693,7 +696,7 @@ py = 屏高 × (1 − 虚拟y/9)
 
 ### 已经验过什么 / 还没验什么
 
-不连设备能验的都验了（`../selftest.py` 里那些）：时钟估计的六种情形、坐标换算的三种宽高比、
+不连设备能验的都验了（`../src/selftest.py` 里那些）：时钟估计的六种情形、坐标换算的三种宽高比、
 缓存的命中与失效、播放器按时发送 + 镜像翻转、闸门一局只放一次、控制台的命令解析、
 存活探测的三种结局。调度精度用 `--backend recording` 实测**最大迟到 0.5ms**
 （原先用 `Event.wait` 睡，Windows 上被 15.6ms 的系统滴答拖到 14ms —— 见
@@ -708,7 +711,7 @@ py = 屏高 × (1 − 虚拟y/9)
 
 命令表在 [README.md](../README.md#控制台)。这里讲两条设计：
 
-设置只有一份，就是 `../runtime/options.py` 里的 `Options`：控制台改它，规划与播放**每次都读它**。
+设置只有一份，就是 `../src/runtime/options.py` 里的 `Options`：控制台改它，规划与播放**每次都读它**。
 于是"改了什么时候生效"这个问题根本不存在 —— 延迟改了下一个事件就按新值发，规划器改了
 下一关就按新的算。反过来，如果让每个模块各存一份、改的时候挨个同步，就一定会有改漏的那一处。
 `inject off` 不是"换成干跑后端"，而是照常排期、照常记迟到，只是最后那一次 `backend.send()`
@@ -721,7 +724,7 @@ py = 屏高 × (1 − 虚拟y/9)
 
 三条规矩，都是为了同一件事：
 
-1. **所有输出都走 `../runtime/output.py` 的 `log()`**（`print` 的签名），而且 **默认 `flush=True`**。
+1. **所有输出都走 `../src/runtime/output.py` 的 `log()`**（`print` 的签名），而且 **默认 `flush=True`**。
    整行不会被别的线程插花；也因为写者只有一个，才谈得上下面第 2 条。flush 不能省：
    不 flush 的话输出攒在哪里、什么时候露面完全由 stdout 是什么决定（终端行缓冲、管道块缓冲），
    表现就是"敲了一条命令没反应，再敲一条，上一条的输出才出来"；
@@ -735,7 +738,7 @@ stdin 不是终端（管道 / 重定向）时**照样读**，并把命令自己�
 好让日志能对上；读到文件尾就说明白然后退出。这里踩过一次坑：原先"不是终端就一声不吭
 把自己关掉"，于是敲什么都没反应、连提示符都没有 —— 宁可多说一句，也不要安静地不干活。
 
-> **别让子进程继承 stdin。** 这是最难查的一类"输入被吞"：`../backends/scrcpy.py` 里的
+> **别让子进程继承 stdin。** 这是最难查的一类"输入被吞"：`../src/backends/scrcpy.py` 里的
 > `adb` 子进程原先用默认的 `stdin`，而 **`adb shell` 会把本地 stdin 转发给设备端的 shell**
 > —— 用户在控制台里敲的那一行被 adb 半路吃掉了，表现是"敲了没反应，再敲一条上一条才生效"，
 > 而且 **永远不报错**。修法是给每一次 `subprocess` 调用都写死 `stdin=subprocess.DEVNULL`
@@ -805,7 +808,7 @@ spawn 出来、还没 `resume` 的那个。"放不放它跑"不是收工该管�
 Premiere / AE / FCP 都直接认。给 `-o xxx.mp4` 会改成 H.264，那时**必须**同时给个底色，
 否则会明确报错而不是悄悄给你一坨黑的。
 
-抗锯齿有个坑写在 `../render.py` 顶部：OpenCV 的 `LINE_AA` 只有在**单通道**图上才给出正确的
+抗锯齿有个坑写在 `../src/render.py` 顶部：OpenCV 的 `LINE_AA` 只有在**单通道**图上才给出正确的
 覆盖率。直接往 RGBA 上画，透明像素会被当成黑色参与混合，边缘立刻出现一圈暗边。
 所以这里是先出覆盖率掩膜，再用 numpy 自己做直通 alpha 的合成 —— 边缘像素是
 `(255, 128, 0, 54)` 而不是 `(54, 27, 0, 54)`。
@@ -818,13 +821,13 @@ Premiere / AE / FCP 都直接认。给 `-o xxx.mp4` 会改成 H.264，那时**�
 > 这类播放器的表现 **不能**用来判断文件对不对。真要验证，用 `ffmpeg` 转一张 PNG 再看，
 > 或者干脆拖进 Premiere 叠到一段素材上（QuickTime Animation 的 alpha 是原生识别的，
 > 不用做任何 keying）。万一 Premiere 也读错，那说明得换封装 —— `qtrle` 只支持 `argb`
-> 这一种 32 位格式，没有字节序可调，只能改 `../render.py` 里的 `CONTAINERS`
+> 这一种 32 位格式，没有字节序可调，只能改 `../src/render.py` 里的 `CONTAINERS`
 > （PNG 序列 / ProRes 4444 / VP9 webm）。
 
 ## 自检
 
 ```sh
-python selftest.py
+python src/selftest.py
 ```
 
 不连设备也能跑，用的就是 `../charts` 里已采集的谱面。对每张谱 × 每个规划器查五件事：

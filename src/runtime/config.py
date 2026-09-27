@@ -27,8 +27,13 @@ from pathlib import Path
 from algorithms import DEFAULT_PLANNER
 from .output import log
 
-ROOT = Path(__file__).resolve().parent.parent
-"""项目根目录。"""
+ROOT = Path(__file__).resolve().parents[2]
+"""项目根目录 —— ``src/`` 的上一层。
+
+源码整体搬进 ``src/`` 之后，这个文件是 ``src/runtime/config.py``，所以项目根在它的**上两层**。
+数据（``charts/`` / ``plans/`` / ``logs/`` / ``target/``）与 ``config.json`` 都留在项目根，
+不在源码树里 —— 运行时用这个常量找它们，别再拿 ``Path(__file__).parent`` 往上去拼。
+"""
 
 CONFIG_PATH = ROOT / "config.json"
 """落盘配置的位置。"""
@@ -107,7 +112,7 @@ class Config:
         """读配置；**不存在就按默认值写一份**，坏了就备份成 `.bak` 再来一份。
 
         为什么缺文件时要写出来而不是静默用默认值：让人看得见"能改什么"。一个空目录里
-        跑一次 `python main.py` 就该多出一个可以照着改的 `config.json`。
+        跑一次 `python src/main.py` 就该多出一个可以照着改的 `config.json`。
         """
         path = CONFIG_PATH if path is None else path
         if not path.is_file():

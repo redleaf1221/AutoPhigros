@@ -12,7 +12,7 @@ import io
 import threading
 import time
 
-from . import ROOT
+from . import SOURCE_ROOT
 from .stubs import make_config
 
 
@@ -321,7 +321,7 @@ def check_console() -> list[str]:
 
     # 谁都不许继承我们的 stdin：`adb shell` 会把本地 stdin 转发给设备端，
     # 用户在控制台里敲的那一行就被它半路吃掉了 —— 这种错不报错，只表现为"偶尔有一行没反应"
-    for path in sorted(ROOT.glob("*.py")) + sorted((ROOT / "backends").glob("*.py")):
+    for path in sorted(SOURCE_ROOT.glob("*.py")) + sorted((SOURCE_ROOT / "backends").glob("*.py")):
         for number in _subprocess_calls_without_stdin(path.read_text(encoding="utf-8")):
             problems.append(f"{path.name}:{number} 的 subprocess 调用没有 stdin=DEVNULL")
 

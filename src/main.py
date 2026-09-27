@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """auto_phigros：**控制台就是主干**。
 
-    python main.py
+    python src/main.py
 
 没有命令行参数 —— 一切都在控制台里做，而且能记住：
 
@@ -68,11 +68,11 @@ def start_logging() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # **没有命令行参数**（一切都在控制台里，见模块开头）。但收到参数时不能默默起主干：
-        # `python main.py --help` 会把终端交给一个正在读 stdin 的控制台循环，看着就像卡死了
+        # `python src/main.py --help` 会把终端交给一个正在读 stdin 的控制台循环，看着就像卡死了
         # —— 我自己就这么踩过一次（进程挂在 `main.py --help` 上，等输入）。
         print(
             f"main.py 没有命令行参数（收到的是 {' '.join(sys.argv[1:])}）。\n"
-            f"直接 `python main.py`，跑起来之后在控制台里打 `help` 看有哪些命令。",
+            f"直接 `python src/main.py`，跑起来之后在控制台里打 `help` 看有哪些命令。",
             file=sys.stderr,
         )
         sys.exit(2)

@@ -5,11 +5,11 @@
 ``.mov``（QuickTime Animation），能直接拖进 Premiere / AE；不想要透明就 ``--background``
 换个底色（绿幕用 ``chroma``）。
 
-    python render.py plans/xxx.psap
-    python render.py plans/xxx.psap --size 1280x720 --fps 30
-    python render.py plans/xxx.psap --background chroma
-    python render.py plans/xxx.psap --no-paths --point-color "#00ff88" --point-radius 10
-    python render.py plans/xxx.psap --path-color blue --path-width 5 --path-window 800
+    python src/render.py plans/xxx.psap
+    python src/render.py plans/xxx.psap --size 1280x720 --fps 30
+    python src/render.py plans/xxx.psap --background chroma
+    python src/render.py plans/xxx.psap --no-paths --point-color "#00ff88" --point-radius 10
+    python src/render.py plans/xxx.psap --path-color blue --path-width 5 --path-window 800
 
 关于抗锯齿，有个坑值得写下来：OpenCV 的 ``LINE_AA`` **只有在单通道图上才给出正确的覆盖率**
 （白 255 叠在黑 0 上，结果就是覆盖率本身）。直接往 RGBA 上画是不行的 —— 透明像素会被当成
@@ -39,7 +39,8 @@ from algorithms.geometry import Screen
 from algorithms.utils import PlanResult, Touch
 from formats.storage import decode_plan
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+"""项目根目录 —— ``src/`` 的上一层。渲染产物落在它下面的 ``renders/``。"""
 RENDERS_DIR = ROOT / "renders"
 
 DEFAULT_SIZE = (1920, 1080)

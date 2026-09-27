@@ -1,6 +1,6 @@
 """自检入口：**只跑与代码有关的那几项**，不逐张谱做规划。
 
-分工是这样的（`python selftest.py` 与 `python judge.py` 各管一头）：
+分工是这样的（`python src/selftest.py` 与 `python src/judge.py` 各管一头）：
 
 * 这里 —— 捕捉**真正的 bug**：闸门放不放行、时钟会不会偏早、坐标换算、播放器排期、
   控制台回显、存活探测、收工、结算、判决对账、在位时长、规划缓存。都很快，
@@ -14,13 +14,14 @@
 from __future__ import annotations
 
 if __package__ in (None, ""):
-    # `python tests/cli.py` 这种跑法：脚本目录进的是 sys.path，项目根不在，于是
-    # `import algorithms` 立刻失败（相对 import 更是连父包都没有）。既然 `tests/__init__.py`
-    # 里承诺了"三种跑法都能跑"，这里就自己把根挂上、再以包的身份跑一遍。
+    # `python src/tests/cli.py` 这种跑法：进 sys.path 的是脚本目录 `src/tests/`，而顶层包在它
+    # 上一层的 `src/` 里，于是 `import algorithms` 立刻失败（相对 import 更是连父包都没有）。
+    # 既然 `tests/__init__.py` 里承诺了"哪种跑法都能跑"，这里就自己把源码根挂上、再以包的身份
+    # 跑一遍。
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from tests.cli import main as _main
 
     raise SystemExit(_main())

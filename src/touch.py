@@ -3,9 +3,9 @@
 
 `main.py`（frida 主干）每次开谱调它一次；它自己也能单独跑：
 
-    python touch.py plans/0002_..._conservative.psap
-    python touch.py plans/x.psap --mirror --latency 0.02
-    python touch.py plans/x.psap --backend recording     # 不连设备，只跑调度器
+    python src/touch.py plans/0002_..._conservative.psap
+    python src/touch.py plans/x.psap --mirror --latency 0.02
+    python src/touch.py plans/x.psap --backend recording     # 不连设备，只跑调度器
 
 本模块只管三件事：**对表**（`Clock`）、**排事件**（`Player`）、**命令行**。
 "事件怎么送出去"是 `backends/` 那包的事 —— 目前有 scrcpy（真发）与 recording（干跑）。
@@ -85,7 +85,7 @@ CLOCK_RESUME_WINDOW = 1.5
 """上面那个速率判据的窗口长度（秒）。"""
 
 LEAD_IN = 3.0
-"""单机跑时留的起跑线：`python touch.py` 之后你有 3 秒切回游戏窗口。"""
+"""单机跑时留的起跑线：`python src/touch.py` 之后你有 3 秒切回游戏窗口。"""
 
 LATE_WARN = 0.02
 """迟到超过这么多秒就记一笔。

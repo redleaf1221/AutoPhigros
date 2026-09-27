@@ -30,10 +30,10 @@ pip install -r requirements.txt
 
 * **frida-server**：与客户端同版本（`17.10.1` 或 `17.17.0` 都实测可用），
   push 到设备、以 root 跑起来。Phigros 是 arm64。
-* **adb**：scrcpy 后端要用它。路径是 `backends/scrcpy.py` 顶部的 `ADB` 常量
+* **adb**：scrcpy 后端要用它。路径是 `src/backends/scrcpy.py` 顶部的 `ADB` 常量
   （默认 `C:\UserData\platform-tools\adb.exe`）—— 不在这个位置就改那一行。
 * **scrcpy server**：从 [scrcpy](https://github.com/Genymobile/scrcpy) v4.1 的 release
-  里取 `scrcpy-server`，放到 `backends/scrcpy-server-v4.1`。
+  里取 `scrcpy-server`，放到 `src/backends/scrcpy-server-v4.1`。
   这个文件故意不进 git（见 `.gitignore`），得自己捞一份。
 
 ### 3. agent（Node）
@@ -51,34 +51,34 @@ npm run build          # esbuild frida/index.ts --bundle --outfile=./target/_.js
 conda activate auto_phigros
 
 # 主干：没有命令行参数 —— 一切都在控制台里（它就是主干，跑在主线程上）
-python main.py
+python src/main.py
 #   devices                列设备；只有一台时自动选中
 #   device <id>            选一台（记住）
 #   spawn / attach [pid]   注入（游戏关掉了用 spawn，还开着用 attach）
 #   其余设置见下面的"控制台"
 
 # 规划模块：吃一个谱面文件、吐一个规划结果文件（落盘的那份同时就是缓存）
-python planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
-python planner.py Chart.json --no-cache     # 既不吃也不写缓存
-python planner.py Chart.json --planner radical -o /tmp/out
+python src/planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
+python src/planner.py Chart.json --no-cache     # 既不吃也不写缓存
+python src/planner.py Chart.json --planner radical -o /tmp/out
 
 # 触控模块：把一个 .psap 发到设备上（自己跑 = 不接游戏，按本地时钟打）
-python touch.py plans/0002_..._conservative.psap
-python touch.py plans/x.psap --mirror --latency 0.02
-python touch.py plans/x.psap --backend recording   # 不连设备，只跑调度器看迟到量
+python src/touch.py plans/0002_..._conservative.psap
+python src/touch.py plans/x.psap --mirror --latency 0.02
+python src/touch.py plans/x.psap --backend recording   # 不连设备，只跑调度器看迟到量
 
 # 可视化：把规划结果渲染成能叠到录屏上的视频
-python render.py plans/0002_..._conservative.psap
-python render.py plans/x.psap --size 1280x720 --fps 30 --background chroma
-python render.py plans/x.psap --no-paths --point-color "#00ff88" --point-radius 12
+python src/render.py plans/0002_..._conservative.psap
+python src/render.py plans/x.psap --size 1280x720 --fps 30 --background chroma
+python src/render.py plans/x.psap --no-paths --point-color "#00ff88" --point-radius 12
 
 # 算法体检：按**游戏真实的判定规则**把规划重放一遍，报丢音、蹭键、判定分布与分数
 # （和 selftest 分工：那边抓代码 bug，这边揪算法问题；慢，而且谱面越多越慢）
-python judge.py
-python judge.py --planner geometric
-python judge.py --chart Dlyrotz
-python judge.py --plan plans/x.psap -v
-python judge.py --json out.json
+python src/judge.py
+python src/judge.py --planner geometric
+python src/judge.py --chart Dlyrotz
+python src/judge.py --plan plans/x.psap -v
+python src/judge.py --json out.json
 ```
 
 只有 `main.py` 没有参数，因为它是"一台常驻的面板"：选设备、开关设置都该在**跑起来之后**
@@ -97,16 +97,17 @@ python judge.py --json out.json
 真的把触摸送进设备之前，先按这个顺序把能离线验的都过一遍 —— 每一步都能独立看到结果，
 出问题也好定位到底是哪一段：
 
-1. `python -m backends.scrcpy` —— 只查 adb、server 文件和屏幕尺寸；
-2. `python touch.py <某个短谱的 .psap> --backend recording` —— 调度器；
-3. `python main.py`，然后在控制台里 `backend recording` + `spawn` —— **整条链**（闸门、
+1. `cd src && python -m backends.scrcpy` —— 只查 adb、server 文件和屏幕尺寸（包内相对
+   import，得在 `src/` 里用 `-m` 跑）；
+2. `python src/touch.py <某个短谱的 .psap> --backend recording` —— 调度器；
+3. `python src/main.py`，然后在控制台里 `backend recording` + `spawn` —— **整条链**（闸门、
    缓存、对表、排事件）都不碰设备地跑一遍，对着日志看 `[gate]`、`[plan]`、
    `[touch] 打完：发了 N 个事件，最大迟到 X ms` 合不合意；
 4. 开一次谱但**先别注入**（控制台里 `inject off`）—— 音符一个都不会被按到，判定流水于是
    会把整张谱**逐个报成 Miss / Bad**：这正好把音符表从头到尾走一遍，不用碰设备就能验两件事
    —— `[notes] 音符表就绪：N 个音符` 的 N 等于这张谱的音符数，以及 `[judge]` 那几行里
    **没有一句**"（音符表里没有它）"。对得上再 `inject on`；
-5. `python touch.py <同一个 .psap>` —— 真发。先用一首短谱看能不能点到，再调 `latency`；
+5. `python src/touch.py <同一个 .psap>` —— 真发。先用一首短谱看能不能点到，再调 `latency`；
 6. `spawn`（或 `attach`）—— 全自动。第一次要 `devices` 看列表、`device <id>` 选一台
    （USB 下那个 id 就是 adb 的序列号），之后就记住了。
 
@@ -160,7 +161,7 @@ auto> help
 ## 可视化
 
 ```sh
-python render.py plans/0002_..._conservative.psap
+python src/render.py plans/0002_..._conservative.psap
 ```
 
 把 `.psap` 里的手指运动画成视频：手指是点，运动轨迹是线。默认输出**带 alpha 的 `.mov`**，
@@ -182,8 +183,8 @@ python render.py plans/0002_..._conservative.psap
 ## 自检与体检
 
 ```sh
-python selftest.py     # 代码有没有 bug —— 5 秒，与 charts/ 里几张谱无关
-python judge.py        # 算法有没有问题 —— 逐张谱 × 每个规划器，慢
+python src/selftest.py     # 代码有没有 bug —— 5 秒，与 charts/ 里几张谱无关
+python src/judge.py        # 算法有没有问题 —— 逐张谱 × 每个规划器，慢
 ```
 
 分工是刻意的：`selftest.py` 只在"代码本身可能错"的地方报警（闸门放不放行、时钟会不会
@@ -281,43 +282,52 @@ python -c "import frida; d=frida.get_usb_device(); print([(p.pid,p.name) for p i
 
 ```
 auto_phigros/
-  frida/            frida agent 源码（esbuild 打包成 target/_.js）
-  main.py           薄入口：读/建 config.json → 起主干（控制台）→ 收工
-  planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
-  touch.py          触控模块：时钟、调度器、命令行，可单独运行
-  render.py         可视化：把 .psap 渲染成视频
-  judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
-  selftest.py       薄入口：代码自检（真正的东西在 tests/ 里）
-  runtime/          主干那一套
-    console.py        主干：命令表 + 读输入（跑在主线程上，Ctrl+C 落在这里）
-    controller.py     这一把的全部家当：设备、后端、时钟、注入、播放器、收工
-    agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
-    config.py         项目内固定常量 + 落盘的 config.json（默认值在代码里）
-    options.py        运行期旋钮（控制台改的就是它）
-    output.py         进程里唯一的写者（整行原子 + 补回提示符 + 抄一份到 logs/）
-  formats/
-    storage.py        .psap 编解码 + 落盘
-  tools/
-    device_log.py     把一次运行的日志读回来（设备实际判了什么，`judge --compare` 用它）
-  tests/            自检包：判据、替身与入口（详见 tests/__init__.py）
-  algorithms/       规划算法与契约（registry 按名字现 import）；judging.py 是判定规则唯一出处
-  backends/         触控后端（scrcpy / recording）
-  docs/             逆向报告与实现笔记
-  config.json       落盘的配置（第一次跑自动建；不进版本库）
+  src/                  **源码根**：所有 Python 都在这一层（PyCharm 里标成 Sources Root）
+    main.py             薄入口：读/建 config.json → 起主干（控制台）→ 收工
+    planner.py          规划模块（落盘即缓存），可被调用、也可单独运行
+    touch.py            触控模块：时钟、调度器、命令行，可单独运行
+    render.py           可视化：把 .psap 渲染成视频
+    judge.py            算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
+    selftest.py         薄入口：代码自检（真正的东西在 tests/ 里）
+    algorithms/         规划算法与契约（registry 按名字现 import）；judging.py 是判定规则唯一出处
+    backends/           触控后端（scrcpy / recording）
+    formats/            .psap 编解码 + 落盘（storage.py）
+    runtime/            主干那一套
+      console.py        主干：命令表 + 读输入（跑在主线程上，Ctrl+C 落在这里）
+      controller.py     这一把的全部家当：设备、后端、时钟、注入、播放器、收工
+      agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
+      config.py         项目内固定常量 + 落盘的 config.json（默认值在代码里）
+      options.py        运行期旋钮（控制台改的就是它）
+      output.py         进程里唯一的写者（整行原子 + 补回提示符 + 抄一份到 logs/）
+    tools/
+      device_log.py     把一次运行的日志读回来（设备实际判了什么，`judge --compare` 用它）
+    tests/              自检包：判据、替身与入口（详见 tests/__init__.py）
+  frida/                agent 源码（esbuild 打包成 target/_.js）
+  docs/                 逆向报告与实现笔记
+  config.json           落盘的配置（第一次跑自动建；不进版本库）
   charts/ plans/ renders/ logs/   采集到的谱面 / 规划结果=缓存 / 渲染出来的视频 / 运行日志
 ```
 
-**根目录只留"能直接 `python xxx.py` 跑的"**（`main` / `planner` / `touch` / `render` / `judge` /
-`selftest`）；其余按职责收进 `runtime/`（主干的家当）、`formats/`（文件格式）、`tools/`（开发辅助）。
-包内的兄弟模块一律用**相对 import**（`from .config import …`）：包被搬走或改名都不会断；
-`from config import …` 那种写法在包里其实要靠 `sys.path` 才成立 —— 这次搬家就断在这里，
-自检直接 `ModuleNotFoundError`，所以别再写回去。
+`src` 是**唯一的 Python 导入根**，三件事是配套的：
+
+* **跑法**一律 `python src/<模块>.py`（在项目根敲）。脚本自己的目录会进 `sys.path`，而它就是
+  导入根，于是 `from algorithms.chart import …`、`import planner` 这些顶层名字直接成立 ——
+  不用装包，也不用设 `PYTHONPATH`。PyCharm 里把 `src` 标成 Sources Root 之后，
+  Run Configuration 用 Script path = `src/xxx.py`（或 Module name）都能跑；仓库本身不依赖 `-m`。
+* **"根"有两个，别混**：**项目根**（`src/` 的上一层）放数据与产物 —— `config.json`、`charts/`、
+  `plans/`、`renders/`、`logs/`、`target/_.js`；**源码根**是 `src/`。在 `src/` 顶层的模块往上
+  一层（`parents[1]`），`src/runtime/` 里的往上两层（`parents[2]`）；别再拿 `Path(__file__).parent`
+  往上去拼 —— 搬进 `src/` 之后它会指到源码树里去。唯一的例外是缓存指纹：它要的就是**源码根**
+  （`planner.SOURCE_ROOT`），因为数据目录挪窝不算算法改过。
+* **包内的兄弟模块一律相对 import**（`from .config import …`）：包被搬走或改名都不会断；
+  `from config import …` 那种写法其实要靠 `sys.path` 才成立 —— 上次按职责细分目录时就断在这里，
+  自检直接 `ModuleNotFoundError`，别再写回去。
 
 每个模块的职责与设计取舍见 [impl.md](docs/impl.md#结构)。
 
 ## 还没做
 
 * 真后端只有 scrcpy 一个。要加别的（比如 frida 侧注入、minitouch），
-  在 `backends/registry.py` 的 `_BUILTIN` 里加一行、写一个模块即可。
+  在 `src/backends/registry.py` 的 `_BUILTIN` 里加一行、写一个模块即可。
 * `--latency` 只能手工调，还没有"打完一局看判定结果自动回填"的闭环 —— 现在有判定流水了，
   这个闭环的原料（每个音符判成什么、早晚多少）已经齐了。

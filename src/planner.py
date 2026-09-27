@@ -3,10 +3,10 @@
 
 ``main.py``（frida 主干）拿到谱面就调它；它自己也能单独跑：
 
-    python planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
-    python planner.py Chart.json --no-cache         # 不吃也不写缓存
-    python planner.py Chart.json --planner radical
-    python planner.py Chart.json -o /tmp/out
+    python src/planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
+    python src/planner.py Chart.json --no-cache         # 不吃也不写缓存
+    python src/planner.py Chart.json --planner radical
+    python src/planner.py Chart.json -o /tmp/out
 
 单独跑时会先找同目录下的 ``<名字>.meta.json``（采集时留下的那份），从里面恢复序号、
 来源上下文与内容哈希；找不到就退回用文件名当来源、现算哈希。
@@ -31,8 +31,12 @@ from algorithms.chart import Chart
 from algorithms.utils import PlanResult, Progress, SilentProgress
 from formats.storage import ChartRef, decode_plan, load_plan_meta, plan_path, plan_path_for, save_plan
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+"""项目根目录 —— ``src/`` 的上一层。规划缓存 ``plans/`` 在它下面。"""
 PLANS_DIR = ROOT / "plans"
+
+SOURCE_ROOT = Path(__file__).resolve().parent
+"""源码根（``src/``）。缓存指纹只认这儿：数据目录挪窝不算算法改过。"""
 
 
 class TqdmProgress:
@@ -86,7 +90,7 @@ def cache_key() -> str:
     改了坐标换算，算出来的东西都可能不一样，宁可重算一遍。
     """
     digest = hashlib.sha1()
-    for path in sorted((ROOT / "algorithms").rglob("*.py")) + [Path(__file__).resolve()]:
+    for path in sorted((SOURCE_ROOT / "algorithms").rglob("*.py")) + [Path(__file__).resolve()]:
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 

@@ -361,7 +361,7 @@ LevelControl::Start → _Start_d__46::MoveNext   0x1d27748
 前两条把判定线整体绕屏幕中心翻过去；第三条**只取负、不减 0.5** —— 这恰好证明了
 `positionX` 是**以判定线为原点的沿线上偏移量**，而不是屏幕绝对坐标。这一点与
 `JudgeControl::GetFingerPosition` 只算"判定线局部坐标下的横向分量"是同一件事（§6.3），
-也是 `../algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 的依据。
+也是 `../src/algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 的依据。
 
 **三条合起来，镜像就是整个局面绕中线左右翻一次。** 判定线上任一点的虚拟屏幕坐标
 从 `p = L + R(θ)·offset` 变成：

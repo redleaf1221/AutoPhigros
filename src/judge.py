@@ -3,17 +3,17 @@
 
 和 `selftest.py` 的分工：
 
-    python selftest.py     ← 代码有没有 bug（闸门、时钟、播放器、控制台、收工…），很快
-    python judge.py        ← 算法有没有问题（丢音、蹭键、分布、分数），慢，且越全越慢
+    python src/selftest.py     ← 代码有没有 bug（闸门、时钟、播放器、控制台、收工…），很快
+    python src/judge.py        ← 算法有没有问题（丢音、蹭键、分布、分数），慢，且越全越慢
 
 用法（conda 环境 auto_phigros）：
 
-    python judge.py                          # 所有谱面 × 所有规划器（吃 plans/ 里的缓存）
-    python judge.py --planner geometric      # 只体检一个规划器
-    python judge.py --chart Dlyrotz          # 名字里带 Dlyrotz 的都跑（子串匹配）
-    python judge.py --plan plans/xxx.psap    # 直接体检一份已有的规划（不再重算）
-    python judge.py --no-cache               # 不吃也不写缓存，全部现算
-    python judge.py --json out.json          # 另存一份机器可读的结果
+    python src/judge.py                          # 所有谱面 × 所有规划器（吃 plans/ 里的缓存）
+    python src/judge.py --planner geometric      # 只体检一个规划器
+    python src/judge.py --chart Dlyrotz          # 名字里带 Dlyrotz 的都跑（子串匹配）
+    python src/judge.py --plan plans/xxx.psap    # 直接体检一份已有的规划（不再重算）
+    python src/judge.py --no-cache               # 不吃也不写缓存，全部现算
+    python src/judge.py --json out.json          # 另存一份机器可读的结果
 
 报告的每一行都对应一件能被验证的事：判定窗口、容差、扫描窗、分数公式全部来自
 `algorithms/judging.py`（出处见那里的注释与 `Phigros4.0-音游内核逆向报告.md`）。
@@ -34,7 +34,8 @@ from formats.storage import ChartRef, decode_plan
 from tests.archive import check_mirror, check_storage
 from tests.coverage import check_coverage, check_flick, check_stream
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+"""项目根目录 —— ``src/`` 的上一层。谱面与规划缓存都在那儿，不在源码树里。"""
 CHARTS_DIR = ROOT / "charts"
 PLANS_DIR = ROOT / "plans"
 

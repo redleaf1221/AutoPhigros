@@ -1,12 +1,12 @@
 # human-like 规划器（草案）
 
-> 状态：**草案**，还没写代码。代码落在 `algorithms/human.py`（待建）。
+> 状态：**草案**，还没写代码。代码落在 `src/algorithms/human.py`（待建）。
 > 这份文档只回答"这个算法长什么样、凭什么它不会重蹈旧三个的覆辙、怎么算它做对了"。
 
 ## 0. 一句话
 
 **规划的对象不是"按哪些点"，而是"每根手指怎么动"；每次动作判掉了谁，由
-`algorithms/judging.py` —— 同一份、已经与实机逐音符对齐过的判定规则 —— 当场算出来，
+`src/algorithms/judging.py` —— 同一份、已经与实机逐音符对齐过的判定规则 —— 当场算出来，
 规划器照单认领。**
 
 ## 1. 为什么另起一个
@@ -158,7 +158,7 @@ Stroke(
 | `fingers_per_hand` | 2（共 4） | 实测官谱峰值同押 ≤ 4 | 可调到 6 / 8 做对照 |
 | `FINGER_SPEED` | 80 单位/秒 | 横穿屏宽 16 用 0.2s | **最需要校准的一个**，用录屏量 |
 | 速度剖面 | 最小抖动 | 人手加减速 | — |
-| `MIN_DWELL_MS` | 20（已存在） | 逐帧判定 | `algorithms/utils.py` |
+| `MIN_DWELL_MS` | 20（已存在） | 逐帧判定 | `src/algorithms/utils.py` |
 | `TAP_HOLD_MS` | 40 | 人类点按时长 | 抬起时刻 |
 | `STREAM_GAP` | 120ms | 连音判据 | 待测 |
 | 采样间隔 | 8ms | 与 `conservative` 一致 | 移动中才发 |
@@ -175,23 +175,23 @@ Stroke(
 
 ### 8.1 硬指标
 
-- `python judge.py --planner human`：17 张全部 `lost == 0`。这是**目标**；达不到就是真无解，
+- `python src/judge.py --planner human`：17 张全部 `lost == 0`。这是**目标**；达不到就是真无解，
   按 §7 报出来。
 - `--compare` 的老账不回归（radical / geometric 一个字都不许变）。
-- 风格断言进 `tests/human.py`，每条都要求"把实现改坏它就红"：
+- 风格断言进 `src/tests/human.py`，每条都要求"把实现改坏它就红"：
   手指数 ≤ 配置、相邻事件位移 ≤ `FINGER_SPEED × Δt`、每次按下的落点偏差、静止不发事件、
   左右手不交叉。
 
 ### 8.2 像不像人（看得见 + 量得出）
 
-- `python render.py plans/xxx.psap` 出片，人工看一眼：手指是在"走"还是在"闪"。
+- `python src/render.py plans/xxx.psap` 出片，人工看一眼：手指是在"走"还是在"闪"。
 - 量化：每根手指的横移总量/秒、起手次数/秒、同时按下的手指数分布、抬起-按下间隔分布。
   规划器在 `stats` 里打出来。
 
 ## 9. 实施步骤
 
 1. **手/指模型 + 运动学 + `Stroke` → frames**：先不判，只保证风格合法、能跑通、能出片。
-   `tests/human.py` 把风格约束钉住。
+   `src/tests/human.py` 把风格约束钉住。
 2. **层 2 初稿**：四类手势的分配与倒推排期。跑 `judge.py` 看它离满分多远（预计远，但合法）。
 3. **层 3 裁判在环**：接 `simulate`，实现四个修复算子与收敛判据。
 4. **参数校准 + 文档 + 真机验证**：`FINGER_SPEED` 用录屏量；补 `docs/impl.md` 的规划器一节。
