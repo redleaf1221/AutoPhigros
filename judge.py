@@ -24,14 +24,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 import planner
-from algorithms import catalog, create
+from algorithms import catalog
 from algorithms.chart import Chart
 from algorithms.judging import Report, Verdict, simulate
-from storage import ChartRef, decode_plan
+from formats.storage import ChartRef, decode_plan
 from tests.archive import check_mirror, check_storage
 from tests.coverage import check_coverage, check_flick, check_stream
 
@@ -156,6 +155,103 @@ def judge_plan(path: Path, *, verbose: bool) -> tuple[bool, Report | None]:
     return clean, report
 
 
+def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
+    """把裁判和**设备那一次运行**逐音符对上 —— 不一致的地方就是要修裁判的地方。
+
+    为什么要这么比：光看总数（设备 1152P/2G/1B/1M vs 裁判 1140P/14G/0B/2M）只能知道
+    "大概哪里不对"，说不出是哪几个音符、差在哪。而日志里每条判定都带着音符身份
+    （线 / 上下 / 第几个），裁判那边用的是同一把钥匙 —— 于是能一条条列出来。
+
+    这个模式**不改任何东西**，它只报事实：哪些音符两边判得不一样、各自判成了什么。
+    修裁判（或者修规划）是看完它之后的事。
+    """
+    from tools import device_log
+
+    run = device_log.read(log_path)
+    print(f"{log_path.name}：{len(run.judges)} 条判定，设备自己的账目是 {run.label}")
+    if not run.judges:
+        print("  这份日志里一条判定都没有 —— 没什么可比的")
+        return 1
+    if run.chart is None or run.planner is None:
+        print("  日志里没写清是哪张谱面 / 哪个规划器（要 `[chart …] 已保存 …` 与 `[plan …]`）")
+        return 1
+
+    charts = [path for path in charts_named(Path(run.chart).stem) if path.name == run.chart]
+    if not charts:
+        print(f"  charts/ 里没有 {run.chart} —— 采集时没开 save-chart？")
+        return 1
+    plan_path = PLANS_DIR / f"{Path(run.chart).stem}_{run.planner}.psap"
+    if not plan_path.is_file():
+        print(f"  plans/ 里没有 {plan_path.name} —— 先跑一次规划（或 --no-cache 现算）")
+        return 1
+
+    chart, _ = chart_for(charts[0])
+    result = decode_plan(plan_path.read_bytes())
+    report = report_plan(chart, result, chart_name=charts[0].name, plan_name=plan_path.stem)
+    mine = report.counts
+    score, percent = report.score()
+    mine_text = (
+        f"{mine[Verdict.PERFECT]}P  {mine[Verdict.GOOD]}G  "
+        f"{mine[Verdict.BAD]}B  {mine[Verdict.MISS]}M"
+    )
+    device_score = run.result.get("score")
+    device_text = (
+        f"{run.result['score']} 分 / {run.result['percent']}%"
+        if device_score is not None
+        else "（日志里没有 result 行）"
+    )
+    print(f"  设备（日志）：{run.label:<24} {device_text}  最大连击 {run.result.get('maxCombo', '?')}")
+    print(f"  裁判（本机）：{mine_text:<24} {score:.0f} 分 / {percent:.2f}%  最大连击 {report.max_combo}")
+
+    # 逐音符对。设备那边可能少几条（比如日志被截断），少的那边不算"不一致"但要报出来
+    pairs: list[tuple[str, object, object]] = []
+    compared = 0
+    only_mine = 0
+    for judgement in report.judgements:
+        device = run.judges.get(judgement.key)
+        if device is None:
+            only_mine += 1
+            continue
+        compared += 1
+        if device.kind != judgement.verdict.label:
+            pairs.append(("不同", judgement, device))
+    only_device = len(set(run.judges) - {judgement.key for judgement in report.judgements})
+
+    print(
+        f"  逐音符比出 {compared} 条：一致 {compared - len(pairs)}，"
+        f"不一致 {len(pairs)}"
+        + (f"，裁判多出 {only_mine} 条" if only_mine else "")
+        + (f"，设备多出 {only_device} 条" if only_device else "")
+    )
+    if not pairs:
+        return 0
+
+    # 先把"哪一类不一致"归堆：同类问题会成片出现，归堆之后一眼看出是不是一个模型错误
+    summary: dict[str, int] = {}
+    for _, judgement, device in pairs:
+        key = f"设备 {device.kind} / 裁判 {judgement.verdict.label}"
+        summary[key] = summary.get(key, 0) + 1
+    print("  ── 不一致的类别 ──")
+    for key, count in sorted(summary.items(), key=lambda item: -item[1]):
+        print(f"     {count:>4} 条：{key}")
+
+    print("  ── 逐条（按时间）──")
+    pairs.sort(key=lambda item: item[1].seconds)
+    for _, judgement, device in pairs[:limit]:
+        note = judgement.note
+        mine_note = (
+            f"{note.kind.name:<4} {judgement.seconds:8.3f}s "
+            f"（线 {judgement.line} {'上' if judgement.above else '下'} 第 {judgement.index}）"
+        )
+        graze = "（裁判记成蹭键）" if judgement.grazed else ""
+        print(f"     {mine_note}：设备 {device.kind:<7} 裁判 {judgement.verdict.label}{graze}")
+    if len(pairs) > limit:
+        print(f"     … 还有 {len(pairs) - limit} 条（-v 看全部）")
+    if verbose:
+        _ = verbose
+    return 1 if pairs else 0
+
+
 def serialise(report: Report, problems: list[str]) -> dict:
     table = report.counts
     score, percent = report.score()
@@ -178,7 +274,7 @@ def serialise(report: Report, problems: list[str]) -> dict:
                 "verdict": g.verdict.label,
                 "delta_ms": g.delta * 1000.0,
                 "pointer": g.pointer,
-                "target": g.target,
+                "stolen": g.stolen,
             }
             for g in report.grazes
         ],
@@ -205,12 +301,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"吃 {PLANS_DIR.name}/ 里的规划缓存（默认开；--no-cache 全部现算）",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="把每条覆盖问题都打出来")
+    parser.add_argument(
+        "--compare",
+        type=Path,
+        default=None,
+        metavar="日志",
+        help="拿一次运行的日志（logs/*.log）逐音符对裁判：不一致的地方就是要修的地方",
+    )
     parser.add_argument("--json", type=Path, default=None, help="把结果另存成 JSON")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.compare is not None:
+        if not args.compare.is_file():
+            print(f"没有这个文件：{args.compare}", file=sys.stderr)
+            return 2
+        return compare(args.compare, verbose=args.verbose)
+
     entries: list[dict] = []
     clean = True
 

@@ -4,9 +4,9 @@
 ELF64 ARM64 · 71,413,296 B · MD5 `4086181c2803dc92561c0e23488fe74c` · 216,700 个函数
 **工具**：IDA Pro（idb 已由 Il2CppInspector 处理，注入了完整 IL2CPP 类型系统与 demangle 符号）
 
-> 这份报告讲**游戏内部**：函数地址、字段偏移、判定公式、反编译伪代码。
+> 这份报告讲 **游戏内部**：函数地址、字段偏移、判定公式、反编译伪代码。
 > 工程实现（怎么用这些结论、踩过哪些坑）在 [`impl.md`](impl.md)，
-> 安装与用法在 [`README.md`](README.md)。
+> 安装与用法在 [`../README.md`](../README.md)。
 
 ---
 
@@ -361,7 +361,7 @@ LevelControl::Start → _Start_d__46::MoveNext   0x1d27748
 前两条把判定线整体绕屏幕中心翻过去；第三条**只取负、不减 0.5** —— 这恰好证明了
 `positionX` 是**以判定线为原点的沿线上偏移量**，而不是屏幕绝对坐标。这一点与
 `JudgeControl::GetFingerPosition` 只算"判定线局部坐标下的横向分量"是同一件事（§6.3），
-也是 `algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 的依据。
+也是 `../algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 的依据。
 
 **三条合起来，镜像就是整个局面绕中线左右翻一次。** 判定线上任一点的虚拟屏幕坐标
 从 `p = L + R(θ)·offset` 变成：
@@ -1057,9 +1057,57 @@ if (nowTime > (note->realTime + note->holdTime + 0.25)) {
 > `Δ = note.realTime − nowTime`，`Δ > 0` 表示音符还没到（早），`Δ < 0` 表示已经过了（晚）。
 > 传给 `ScoreControl` 的第二参数是 `−Δ`，符号即"早/晚"。
 
-### 6.8 暂停区域
+### 6.8 暂停区域与暂停菜单
 
 `JudgeControl::CheckPause` @ `0x1d20a38`：手指落在右上角（世界坐标 `x ∈ [−8.8, −8.0]`、`y ∈ [4.05, 4.85]`，窄屏另有换算）触发暂停，`pauseTime = 1.2`；长按则继续播放。
+
+**播放状态的唯一总闸：`ProgressControl::Play(bool)` @ `0x1d34270`。**
+
+```c
+void ProgressControl::Play(bool play) {
+  if (!play) {
+    if (!this->isPlaying) return;
+    ScreenOrientationManager.set_AllowRotation(true);
+    this->isPlaying = 0;  this->_volumeSet = false;
+    audioSource.set_Volume(0.0);  audioSource.Pause();      // ← 音乐就在这里停住
+    pauseBar.SetActive(true);  pauseCamera.enabled = true;   // 暂停遮罩 / 相机
+    this->Guide.Animator.speed = 0.0;
+    SEPlayer.Play(5);                                        // 音效
+    return;
+  }
+  /* 恢复：音量回来、audioSource 继续、pauseBar 关掉 */
+}
+```
+
+调用点（全部反编译确认）：
+
+| 调用者 | 时机 | 参数 |
+|---|---|---|
+| `JudgeControl::CheckPause` @ `0x1d20a38` | 右上角手势 | `false` |
+| `Pause::Update` @ `0x1d33920` 尾部 | 暂停动作（`SetActive(false)` + `SimpleDelay(0.5s)` 之后经 `Pause::__c__DisplayClass8_0::_Update_b__0`） | `false` |
+| `Pause::Update` 中 tag 为 `"Resume"` 的按钮 | 点"继续" | `true` |
+| `ProgressControl::Update` @ `0x1d3483c` | 开谱起播 | `true` |
+
+**暂停菜单本体：`Pause` 类**（`OnEnable` `0x1d343fc`、`Update` `0x1d33920`、`StartNextScene` 协程 `0x1d34210`）。`Update` 每帧对触点做 `Physics2D` 射线，按命中物体的 **tag** 分流：
+
+| tag | 行为 |
+|---|---|
+| `"Resume"` | 播继续动画 → `ProgressControl::Play(true)` → 菜单 `SetActive(false)` |
+| `"Retry"` | `SceneManager.LoadScene("Level")` —— 重开这一关 |
+| `"Back"` | `GameInformation.turnToScene = "Loading"`、`nextScene = "ChapterSelector"` → `LoadScene("TurnToScene")` —— 退出到选歌 |
+
+两条退出的路最后都会销毁主场景对象（`Pause::StartNextScene::MoveNext` @ `0x1d344f8` 里
+`GameInformation._main` 的 `Destroy`），并走到：
+
+**`LevelControl::OnDestroy()` @ `0x1d25118`** —— "这一局没了"的唯一信号：退出到选歌、
+重开这一关、结算之后清场，都会销毁关卡对象。
+
+> 主机的用法（见 `impl.md`「暂停与恢复」）：`Play(false)` → 按住游戏时钟 + 把按着的手指抬起
+> 来；`Play(true)` → 把抬掉的指针 **按回原位** + 放开时钟并 **重新对表**（暂停期间的 `nowTime`
+> 样本一律不采信：它要么冻着、要么缓慢爬升，而后者会让 `min(h−v)` 的对齐偏到 1~2 秒之前，
+> 恢复后每个事件都被当成迟到丢掉）；`OnDestroy()` → 停触控、清游戏时钟、明说一句。
+> **不要**用"多久没收到 `nowTime` 样本"去推断 —— 暂停时样本照样每 100ms 来一次（值不变），
+> 与退出的差别只有一次抖动那么宽。
 
 ---
 
@@ -1196,13 +1244,23 @@ bool get_Passed()           { return _IntScore_k__BackingField > 699999; }   // 
 
 ## 9. 尚未确认 / 存疑
 
-1. **`JudgeControl.minDeltaTime`（+0xac）与 `touchPos`（+0xb8）的初值来源。**
-   `touchPos` 在 `CheckNote` 里每帧被写入，但 `minDeltaTime` 找不到任何赋值点。推测二者是 Unity 预制体上的**序列化（Inspector）字段**，值在 AssetBundle 里，`.so` 中不可见。
+1. ~~**`JudgeControl.minDeltaTime`（+0xac）与 `touchPos`（+0xb8）的初值来源。**~~
+   **已解决。** 它不是"允许多早"的输入参数，而是**输出**：`CheckNote` @ `0x1d21104` 第 124 行
+   每次调用开头都写 `*(_QWORD *)&this->minDeltaTime = -3118710784LL;`，低 32 位
+   `0x461C4000` = **10000.0f**（高 32 位 `0xFFFFFFFF` 是相邻字段 `touchPos`/`badTime` 的哨兵），
+   于是第 186 行那条 `if (realTime - nowTime >= minDeltaTime + 0.01) goto skip;` 的守卫
+   **永远为假**（死代码）；而第 425 行 `this->minDeltaTime = fabsf(note->realTime - nowTime);`
+   才写出真值 —— 刚判掉的那个音符差多少，供命中特效/统计读。
+   **推论：硬编码那条 `+0.01` 守卫会让"早判"凭空少掉 220ms 的余量，别照它写。**
 2. **`JudgeLineControl.lastProductIndexAbove/Below` 的初值。**
    按 `for (i = last + 1; i <= now; ++i)` 的写法，若初值为 0 则下标 0 的音符永远不会被创建。合理推测预制体里序列化为 `-1`，但未经证实。
 3. **`GetFingerPosition` 的坐标换算细节**（是否用到 `theta` 做旋转逆变换、是否有额外的 DPI/宽高比补偿）未逐行核对。
 4. **Hold 的 `noteImages` / `holdHead` / `holdEnd` 三段精灵的长度计算**只确认到 `(holdTime / 3.8) × 0.2` 这一处参与 Y 缩放，完整几何未展开。
 5. `JudgeControl::CheckBlocks`（第九章 ARG 阻挡方块）对判定的具体影响未展开。
+6. **触摸处理的帧相位**（我们发出 → 游戏在处理它的那一帧读 `nowTime`）。
+   实测中位延迟 **+28.9ms**、分布 12~48ms（一局 AT 的 1149 条同档判定，见 `judging.PROCESS_DELAY`）。
+   固定部分可以当常数用，**帧相位本身离线不可知** —— 这是任何主机侧裁判都到不了的地方，
+   别把"差一帧"当成模型错误去追。
 
 ---
 

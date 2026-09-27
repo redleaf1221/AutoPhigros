@@ -44,11 +44,10 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol, Sequence
 
 import backends
-from algorithms.geometry import Screen
-from algorithms.utils import PlanResult, TouchEvent
+from algorithms.utils import PlanResult, Touch, TouchEvent
 from backends import Backend, catalog, create
-from options import Options
-from storage import decode_plan
+from runtime.options import Options
+from formats.storage import decode_plan
 
 POLL = 0.002
 """快到点时重新对表的间隔（秒）。2ms 一小步，既跟得上映射的微调又不至于空转烧 CPU。"""
@@ -72,6 +71,18 @@ CLOCK_STALL = 0.25
 认不出来，恢复之后会把事件**发早**（等于把暂停那段时间丢掉了）；正常播放时 `nowTime`
 是音频时钟，每个样本都在变，所以 250ms 足够把"停住"和"在走"分开。
 """
+
+CLOCK_RESUME_RATE = 0.4
+"""兜底放行的判据：在 :data:`CLOCK_RESUME_WINDOW` 那么长的窗口里值走了 0.4 秒以上。
+
+只用于"`Play(true)` 那个信号没送到"的兜底（用到会报警）。为什么看**速率**而不是"总共走了
+多少"：暂停期间 `nowTime` 可能缓慢爬升（每样本几毫秒），攒一分钟也能攒出 1 秒 —— 按总量判
+会在暂停中途误放行，把触控送进还开着暂停菜单的游戏（那可能替人按到按钮）。速率能把"爬升"
+和"真的在跑"分开：真在跑时 1.5 秒里会走满 1.5 秒，远超 0.4。
+"""
+
+CLOCK_RESUME_WINDOW = 1.5
+"""上面那个速率判据的窗口长度（秒）。"""
 
 LEAD_IN = 3.0
 """单机跑时留的起跑线：`python touch.py` 之后你有 3 秒切回游戏窗口。"""
@@ -130,22 +141,104 @@ class GameClock:
         """相邻两个样本之间最大的间隔。它是"采样断过"的直接证据。"""
         self._shift: tuple[float, float] | None = None
         """最近一次重锚 `(发生在哪个主机时刻, 估计值往后挪了多少秒)`；正数 = 会晚发。"""
+        self._held = False
+        """游戏说了"我停住了"（``ProgressControl::Play(false)``）—— 在此期间它的时间不是时间源。"""
+        self._held_value: float | None = None
+        """按住的那一刻游戏读到多少（暂停时显示这个值，比"没有样本"有信息量）。"""
+        self.auto_released = False
+        """没收到"恢复"信号、但时钟明显又在走了 —— 兜底放行过。要做成告警，不能悄悄发生。"""
+        self._probe_at: float | None = None
+        """兜底判据的窗口起点（主机时刻）；None = 还没开始看。"""
+        self._probe_value = 0.0
+        """兜底判据的窗口起点对应的游戏时间。"""
 
     def reset(self) -> None:
         """换一局：样本和统计都从头开始。
 
         统计也要清 —— 否则一局的账会把上一局的补齐（日志里"采样最大间隔 10300ms"
-        其实是上一局换关时的空档，看着像是本局出了问题）。
+        其实是上一局换关时的空档，看着像是本局出了问题）。`_value_host` 一起清成
+        "从没见过样本"，免得新一局拿着上一局的时间戳去判断"停住/还在"。按住的状态也清。
         """
         with self._lock:
             self._samples.clear()
             self.reanchors = 0
             self.max_gap = 0.0
+            self._value_host = 0.0
             self._shift = None
+            self._held = False
+            self._held_value = None
+            self._probe_at = None
+
+    def hold(self) -> None:
+        """游戏说"我停住了"（暂停）。
+
+        为什么不能只靠"值多久没变"：那种判据在暂停**期间**就要开始猜了，而这里有一个
+        明确的信号（``Play(false)``）。按住之后：
+
+        * ``host_for`` 一律返回 None —— 暂停期间一个事件都不该发出去（游戏既不判定，
+          我们的排期也没有意义；更要紧的是此时的手指可能正落在暂停菜单的按钮上）；
+        * ``now()`` 返回按住那一刻的值，供人看"停在哪一秒"；
+        * 期间来的样本**全部不采信** —— 它们要么是同一个数，要么（更坏）在缓慢爬升，
+          而"缓慢爬升"正是让 `min(h−v)` 漂到暂停之后、恢复后所有事件都被判迟到的元凶。
+        """
+        with self._lock:
+            if not self._held:
+                self._held_value = self._samples[-1][1] if self._samples else None
+            self._held = True
+            self._probe_at = None  # 兜底判据从这一刻重新起算
+
+    def release(self) -> None:
+        """游戏说"我继续了"（恢复）：把手放开，并且**从零重新对表**。
+
+        为什么要清样本而不是接着用：暂停期间的对齐已经不可信（见 :meth:`hold`），而
+        "恢复后所有事件都迟到太多、播放像死了一样"就是这么来的。清掉之后，恢复后的
+        头几个样本会把偏移重新算出来（≤100ms），代价是那一小段里可能有一两个事件偏晚。
+        """
+        with self._lock:
+            self._held = False
+            self._held_value = None
+            self._probe_at = None
+            self._samples.clear()
+            self._value_host = 0.0
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def _looks_running(self, moment: float, game_seconds: float) -> bool:
+        """按住期间的一眼：游戏是真的又在跑了，还是 `nowTime` 只是在缓慢爬升？
+
+        真的在跑 → 兜底放行（返回 True，并把按住状态清掉、样本清掉重新对表），并由
+        :meth:`take_auto_release` 让调用方报一声。判据是**速率**，见 :data:`CLOCK_RESUME_RATE`。
+        """
+        if self._probe_at is None:
+            self._probe_at, self._probe_value = moment, game_seconds
+            return False
+        if moment - self._probe_at > CLOCK_RESUME_WINDOW:
+            self._probe_at, self._probe_value = moment, game_seconds
+            return False
+        if game_seconds - self._probe_value < CLOCK_RESUME_RATE:
+            return False
+        self._held = False
+        self._held_value = None
+        self._probe_at = None
+        self._samples.clear()
+        self._value_host = 0.0
+        self.auto_released = True
+        return True
+
+    def take_auto_release(self) -> bool:
+        """取走"兜底放行过"这件事（读一次就清），供调用方报警。"""
+        with self._lock:
+            flag, self.auto_released = self.auto_released, False
+            return flag
 
     def feed(self, game_seconds: float, host_time: float | None = None) -> None:
         moment = self._now() if host_time is None else host_time
         with self._lock:
+            if self._held and not self._looks_running(moment, game_seconds):
+                # 按住期间不采信样本：它们要么是同一个数，要么在缓慢爬升，两种都不能用来对表
+                return
             if self._samples:
                 host_prev, game_prev = self._samples[-1]
                 self.max_gap = max(self.max_gap, moment - host_prev)
@@ -176,17 +269,20 @@ class GameClock:
 
     def host_for(self, game_seconds: float) -> float | None:
         with self._lock:
-            if not self._samples:
+            if self._held or not self._samples:
+                # 游戏说了它停着：这期间一个事件都不发（见 hold()）。
                 return None
             moment = self._now()
             if self._frozen(moment):
-                # 时钟停着（还没开音乐、或者暂停了）：已经到点却来不及发的立刻补上，
+                # 时钟停着（还没开音乐）：已经到点却来不及发的立刻补上，
                 # 还没到点的一律等着 —— 这时候按"主机时钟"硬推会发早。
                 return moment if game_seconds <= self._samples[-1][1] else None
             return _origin(self._samples) + game_seconds
 
     def now(self) -> float | None:
         with self._lock:
+            if self._held:
+                return self._held_value
             if not self._samples:
                 return None
             moment = self._now()
@@ -282,9 +378,30 @@ class Player:
         self._frames: list[tuple[float, tuple[TouchEvent, ...]]] = [
             (timestamp / 1000.0, events) for timestamp, events in self.plan.frames
         ]
+        self.first_seconds = self._frames[0][0] if self._frames else 0.0
+        """第一个事件在谱面第几秒 —— 等不到时钟的时候，报出它才知道在等什么。"""
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._done = threading.Event()
+        self._lock = threading.Lock()
+        self._down: dict[int, tuple[float, float]] = {}
+        """**我们真的按下去、还没抬起来**的指针 → 最后一次发出去的位置。
+
+        只记"发出去过的"（注入关着时不记）：抬起事件只能还给真的按下去过的那些指针，
+        否则就是凭空给设备塞不存在的手指。
+        """
+        self.released = 0
+        """收尾时补发了几个抬起事件（手指不该留在屏幕上）。"""
+        self.repressed = 0
+        """恢复时按回去了几个指针（暂停时被我们抬掉的）。"""
+        self._lifted: dict[int, tuple[float, float]] = {}
+        """暂停时被我们抬掉的那些指针 → 它们当时的位置（恢复时按回原位）。"""
+        self._resume = False
+        """游戏说恢复了、等播放器线程把抬掉的指针按回去。"""
+        self._wake = threading.Event()
+        """叫醒播放器线程：恢复要立刻按下去，收工要立刻停，都不能等下一次睡醒。"""
+        self._index = 0
+        """已经发到计划里的第几帧（恢复时要看一眼下一帧是不是本来就有 DOWN）。"""
 
     # -------------------------------------------------------- 生命周期
 
@@ -296,6 +413,7 @@ class Player:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()  # 立刻打断睡眠，别让它带着一排期睡满 COARSE_NAP 才停
 
     def join(self, timeout: float | None = None) -> bool:
         self._done.wait(timeout)
@@ -306,25 +424,116 @@ class Player:
     def finished(self) -> bool:
         return self._done.is_set()
 
+    def release_all(self) -> int:
+        """把**我们按着的**手指全抬起来，返回补发了几个事件。
+
+        什么时候要它：游戏暂停了、这一局不打了（结算/退出/重开）、收工了。手指是物理按在
+        屏幕上的 —— 排期停了不等于手抬了，而一根留在屏幕上的手指会继续被游戏读成"在位"
+        （暂停时更糟：暂停菜单是按**手指位置**做射线找按钮的，手指停在那儿可能替人把
+        "重开"按了）。
+
+        抬起来的**位置**会记在 :attr:`_lifted` 里，供 :meth:`resume` 按回原位。
+
+        注入关着的时候：那些手指本来就没按下去（`_down` 是空的），所以一发都不发 ——
+        用户的规矩是"收尾这一发要发"，但"发"的前提是"我们真的按过"。
+        """
+        with self._lock:
+            pending = list(self._down.items())
+            self._down.clear()
+            self._lifted = dict(pending)
+        if not pending:
+            return 0
+        events = tuple(
+            TouchEvent(pointer, Touch.UP, x, y) for pointer, (x, y) in pending
+        )
+        try:
+            self.backend.send(events)
+        except BaseException as error:  # noqa: BLE001 - 收尾失败也要如实记下来
+            self.error = self.error or error
+            return 0
+        with self._lock:
+            self.released += len(events)
+        return len(events)
+
+    def resume(self) -> None:
+        """游戏说"我继续了"：把暂停时抬掉的指针**按回原位**（在播放器线程里立刻发）。
+
+        为什么按回**原位**，而不是把计划里紧接着那个 `MOVE` 改写成 `DOWN`：flick 判的就是
+        "按下之后有没有那一下位移"。直接按在目标位置上，游戏看到的是一个不动的按下，
+        `isNewFlick` 永远不会点亮 —— 那一下 flick 就废了（实测踩过：恢复之后有些 flick
+        划不出来）。按回原位，计划里那一跳仍然是"从 A 到 B 的移动"。
+
+        这件事必须**立刻**做（不能等下一个事件到点）：hold 的主体只有约 67ms 的缺席容忍
+        （`_safeFrame = 2`），等一个 500ms 之后的事件再顺手按下去，hold 已经断了。所以这里
+        只是设个旗子并把播放器叫醒（它每次循环都会看一眼），发送本身在播放器线程里做 ——
+        后端（一条 scrcpy 连接）只能有一个线程写。
+        """
+        with self._lock:
+            self._resume = True
+        self._wake.set()
+
     # -------------------------------------------------------- 调度
+
+    def _repress(self) -> int:
+        """把暂停时抬掉的指针按回原位。返回补了几个按下（0 = 没什么要做的）。
+
+        在播放器线程里做（后端只能一个线程写）。有一个例外不补：计划里紧接着的那一帧本来
+        就有同一个指针的 `DOWN` —— 那就让计划自己按，同一个 pointer 连按两次是不合法的
+        输入序列。
+        """
+        with self._lock:
+            if not self._resume:
+                return 0
+            self._resume = False
+            pending = dict(self._lifted)
+            self._lifted.clear()
+            if not pending:
+                return 0
+            upcoming = (
+                {event.pointer for event in self._frames[self._index][1] if event.action is Touch.DOWN}
+                if self._index < len(self._frames)
+                else set()
+            )
+        events = tuple(
+            TouchEvent(pointer, Touch.DOWN, x, y)
+            for pointer, (x, y) in pending.items()
+            if pointer not in upcoming
+        )
+        if not events:
+            return 0
+        if self.options.inject:
+            self.backend.send(events)
+            self._remember(events)
+        else:
+            self.muted += len(events)
+        self.repressed += len(events)
+        return len(events)
 
     def _run(self) -> None:
         try:
             index = 0
             while index < len(self._frames):
+                self._index = index
+                if self._stop.is_set():
+                    return
+                # 恢复要**立刻**把手按回去，不能等下一个事件到点（hold 只有约 67ms 容忍）
+                self._repress()
                 if self._stop.is_set():
                     return
 
                 seconds, events = self._frames[index]
                 host = self.clock.host_for(seconds)
                 if host is None:
-                    time.sleep(POLL)
+                    self._wake.wait(POLL)
+                    self._wake.clear()
                     continue
 
                 remaining = host - self.options.latency - time.monotonic()
                 if remaining > 0:
                     nap = COARSE_NAP if remaining > COARSE_NAP else POLL
-                    time.sleep(min(remaining, nap))
+                    # 用 wait 而不是 sleep：恢复 / 收工要能立刻打断这一觉
+                    self._wake.wait(min(remaining, nap))
+                    self._wake.clear()
                     continue
 
                 if -remaining > LATE_SKIP:
@@ -337,6 +546,7 @@ class Player:
                 started = time.monotonic()
                 if self.options.inject:
                     self.backend.send(events)
+                    self._remember(events)
                 else:
                     # 注入关着：照样按排期走到这里、照样记迟到，只是不碰设备。
                     # 于是"关掉注入"仍然是一次完整的调度演练，而不是另一种后端。
@@ -356,7 +566,18 @@ class Player:
         except BaseException as error:  # noqa: BLE001 - 记下来交给主线程报
             self.error = error
         finally:
+            # 无论怎么结束（打完了 / 被打断 / 出错了），**都不留手指在屏幕上**
+            self.release_all()
             self._done.set()
+
+    def _remember(self, events: Sequence[TouchEvent]) -> None:
+        """记下"现在哪些手指是按着的"，收尾时要照着它抬。"""
+        with self._lock:
+            for event in events:
+                if event.action is Touch.DOWN or event.action is Touch.MOVE:
+                    self._down[event.pointer] = (event.x, event.y)
+                elif event.action is Touch.UP or event.action is Touch.CANCEL:
+                    self._down.pop(event.pointer, None)
 
 
 # ------------------------------------------------------------------ 命令行

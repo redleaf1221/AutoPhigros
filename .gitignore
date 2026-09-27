@@ -5,3 +5,7 @@ renders/
 target/
 node_modules/
 backends/scrcpy-server*
+config.json
+config.json.bak
+logs/
+.idea

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import io
-import sys
+import time
 from pathlib import Path
 
-from storage import ChartRef
-import planner
-from .stubs import Recorder, _trunk_args
+from formats.storage import ChartRef
+from .stubs import Recorder, make_config, make_controller
 
 
 def check_liveness() -> list[str]:
@@ -25,7 +24,8 @@ def check_liveness() -> list[str]:
     import threading
     import time as timing
 
-    import main as trunk
+    from runtime import agent as agent_module
+    from runtime import controller as controller_module
 
     problems: list[str] = []
 
@@ -47,7 +47,7 @@ def check_liveness() -> list[str]:
             self.posted.append(message)
 
     def build(behaviour, *, session: object | None = object()):
-        agent = trunk.Agent(Path("unused.js"))
+        agent = agent_module.Agent(Path("unused.js"))
         agent._script = FakeScript(behaviour)  # noqa: SLF001 - 自检就是要顶掉真会话
         agent._session = session  # noqa: SLF001
         return agent
@@ -87,7 +87,65 @@ def check_liveness() -> list[str]:
     agent.stop()
     expect(agent.probe(0.5) == "dead", "断开之后还不认成 dead")
 
-    # 6) 收工只收一次：探活与主线程可能同时收同一根棒
+    # 6) 我们自己正忙的时候，ping 超时**不算**"游戏冻住了"
+    #    （实机踩过：9MB 谱面在通道上传输那两秒被判成进程被冻结，白停一次触控）
+    class CountingPlayer:
+        def __init__(self) -> None:
+            self.stopped = 0
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def join(self, timeout: float | None = None) -> bool:
+            return True
+
+    def watch(agent) -> tuple[str, list[str], int]:
+        """跑一轮看门狗，拿回 (agent_state, 打出来的话, 播放器被停了几次)。
+
+        把 ping 超时临时压到 50ms：这里要的是"超时"这个结局，而不是真等 2 秒。
+        """
+        controller_ = make_controller()
+        controller_.agent = agent
+        controller_._report = lambda player: None  # type: ignore[method-assign]
+        player = CountingPlayer()
+        controller_.player = player
+        original = controller_module.PING_TIMEOUT
+        controller_module.PING_TIMEOUT = 0.05
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+                controller_._watch_once()  # noqa: SLF001
+        finally:
+            controller_module.PING_TIMEOUT = original
+            gate.set()  # 放掉那个还在等的假 ping，别留后台线程
+        return controller_.agent_state, buffer.getvalue().strip().splitlines(), player.stopped
+
+    # 真忙：卡在闸门上（`gate_open` 有值）
+    gate.clear()  # 前面第 4 条把它放行过了
+    agent = build(lambda: (gate.wait(5.0), "pong")[1])
+    agent.gate_open = 7
+    state, lines, stopped = watch(agent)
+    expect(state == "忙", f"卡在闸门上的 ping 超时应当算「忙」，实际 {state}")
+    expect(not lines, f"忙的时候不该打警告：{lines}")
+    expect(stopped == 0, "忙的时候不该把触控停掉（游戏好着呢）")
+
+    # 真忙：谱面正在通道上传输
+    gate.clear()
+    agent = build(lambda: (gate.wait(5.0), "pong")[1])
+    agent.busy_until = timing.monotonic() + 5.0
+    state, lines, stopped = watch(agent)
+    expect(state == "忙", f"传谱面时的 ping 超时应当算「忙」，实际 {state}")
+    expect(stopped == 0, "传谱面时不该把触控停掉")
+
+    # 忙的**理由**没了（闸门关了、传输窗口过了）就该照常报警 —— 别拿"忙"当万能挡箭牌
+    gate.clear()
+    agent = build(lambda: (gate.wait(5.0), "pong")[1])
+    state, lines, stopped = watch(agent)
+    expect(state == "hang", f"没在忙的时候超时应当报 hang，实际 {state}")
+    expect(any("冻结" in line for line in lines), f"该说清楚是冻住了：{lines}")
+    expect(stopped == 1, "真 hang 要停触控")
+
+    # 7) 收工只收一次：探活与主线程可能同时收同一根棒
     class FakePlayer:
         def __init__(self) -> None:
             self.stopped = 0
@@ -98,7 +156,7 @@ def check_liveness() -> list[str]:
         def join(self, timeout: float | None = None) -> bool:
             return True
 
-    controller = trunk.Controller(_trunk_args())
+    controller = make_controller()
     player = FakePlayer()
     reports: list[object] = []
     controller.player = player
@@ -110,7 +168,7 @@ def check_liveness() -> list[str]:
     expect(controller.player is None, "收工之后 player 该是空的")
 
     # 7) "打完收工"不能顺手把刚换上的新播放器摘掉
-    controller = trunk.Controller(_trunk_args())
+    controller = make_controller()
     installed = FakePlayer()
     controller.player = installed
     if controller._take_if(FakePlayer()):  # noqa: SLF001
@@ -151,11 +209,16 @@ def _check_shutdown() -> list[str]:
     import signal
 
     try:
-        import main as trunk
+        from runtime import agent as agent_module
+        from runtime import config
+        from runtime import controller as controller_module
+        import main as main_module
+        import planner
+        import touch
     except ImportError as error:  # noqa: BLE001 - frida 没装也不该让整份自检跑不起来
         return [f"导入 main.py 失败，跳过收工自检：{error}"]
 
-    from options import Options
+    from runtime.options import Options
 
     problems: list[str] = []
     events: list[str] = []
@@ -190,8 +253,8 @@ def _check_shutdown() -> list[str]:
             return True
 
     def build() -> tuple[object, object, FakeScript]:
-        controller = trunk.Controller(_trunk_args())
-        agent = trunk.Agent(Path("unused.js"))
+        controller = make_controller()
+        agent = agent_module.Agent(Path("unused.js"))
         script = FakeScript()
         agent._script = script  # noqa: SLF001 - 自检就是要顶掉真会话
         agent._session = FakeSession()  # noqa: SLF001
@@ -273,22 +336,22 @@ def _check_shutdown() -> list[str]:
     controller._stopping.set()  # noqa: SLF001 - 收工是在别处发起的（quit / Ctrl+C）
 
     planned: list[str] = []
-    original_plan = trunk.planner.plan
-    trunk.planner.plan = lambda *args, **kwargs: planned.append("plan")  # type: ignore[assignment]
+    original_plan = planner.plan
+    planner.plan = lambda *args, **kwargs: planned.append("plan")  # type: ignore[assignment]
     try:
         controller.handle_level_start(
-            trunk.LevelStart(
+            agent_module.LevelStart(
                 seq=1,
                 chart_seq=1,
                 mirror=False,
                 offset={},
-                chart=trunk.CapturedChart(
+                chart=agent_module.CapturedChart(
                     ref=ChartRef(seq=1, context={}, digest="x"), text="{}", received_at=0.0
                 ),
             )
         )
     finally:
-        trunk.planner.plan = original_plan  # type: ignore[assignment]
+        planner.plan = original_plan  # type: ignore[assignment]
     expect(not planned, "收工之后还在规划")
 
     built: list[int] = []
@@ -306,12 +369,12 @@ def _check_shutdown() -> list[str]:
         event_count = 0
 
     controller.backend = object()  # 只要不是 None，play() 就会往下走
-    original_player = trunk.touch.Player
-    trunk.touch.Player = QuietPlayer  # type: ignore[assignment]
+    original_player = touch.Player
+    touch.Player = QuietPlayer  # type: ignore[assignment]
     try:
         controller.play(QuietPlan(), mirror=False, seq=1)  # type: ignore[arg-type]
     finally:
-        trunk.touch.Player = original_player  # type: ignore[assignment]
+        touch.Player = original_player  # type: ignore[assignment]
     expect(not built, "收工之后还架了播放器（排期会灌进一个我们已经放手的进程）")
 
     # 5) 收工只动我们自己的东西：游戏本身一根手指都不碰 —— 即使它是我们 spawn 出来、
@@ -327,32 +390,20 @@ def _check_shutdown() -> list[str]:
             self.touched.append(f"kill({pid})")
 
     device = FakeDevice()
-    agent = trunk.Agent(Path("unused.js"), device)
+    agent = agent_module.Agent(Path("unused.js"), device)
     agent.pid = 4242  # 我们自己 spawn 出来的，还没 resume
     agent._script = FakeScript()  # noqa: SLF001
     agent._session = FakeSession()  # noqa: SLF001
     agent.stop()
     expect(not device.touched, f"收工不该动游戏本身，却动了：{device.touched}")
 
-    # 6) 两个入口（quit / Ctrl+C）在真的 main() 里落到同一件事上
-    class FakeConsole:
-        def start(self) -> None:
-            pass
-
+    # 6) 主干是控制台：`quit` 与 Ctrl+C 都要落到同一次收工上，而且只收一次
     class SpyController:
         """只实现 main() 真正会用到的接口，把"谁被调了"记下来。"""
 
-        def __init__(
-            self,
-            *,
-            quit_during_open: bool = False,
-            fail_open: bool = False,
-            interrupt: bool = False,
-        ) -> None:
+        def __init__(self) -> None:
+            self.config = make_config()
             self.options = Options()
-            self.quit_during_open = quit_during_open
-            self.fail_open = fail_open
-            self.interrupt = interrupt
             self.calls: list[str] = []
             self._stopping = False
 
@@ -360,22 +411,8 @@ def _check_shutdown() -> list[str]:
         def stopping(self) -> bool:
             return self._stopping
 
-        def open(self) -> bool:
-            self.calls.append("open")
-            if self.quit_during_open:
-                self.stop()  # 控制台的 quit 就是这个时机：设备刚找到、还没注入完
-            return not self.fail_open
-
-        def open_backend(self) -> None:
-            self.calls.append("open_backend")
-
-        def watch(self) -> None:
-            self.calls.append("watch")
-
-        def poll(self) -> None:
-            self.calls.append("poll")
-            if self.interrupt:
-                raise KeyboardInterrupt
+        def start(self) -> None:
+            self.calls.append("start")
 
         def stop(self) -> None:
             self.calls.append("stop")
@@ -385,39 +422,139 @@ def _check_shutdown() -> list[str]:
             self.calls.append("shutdown")
             self._stopping = True
 
-    def run_main(spy: SpyController) -> tuple[int, list[str]]:
-        original = (trunk.Controller, trunk.Console, sys.argv)
-        trunk.Controller = lambda args: spy  # type: ignore[assignment]
-        trunk.Console = lambda controller: FakeConsole()  # type: ignore[assignment]
-        sys.argv = ["main.py"]  # main() 自己会 parse_args，别把自检的参数喂给它
+    def run_main(spy: SpyController, behaviour: str) -> tuple[int, list[str]]:
+        """跑真的 `main()`：只顶掉 Controller 与 Console 这两个协作者。"""
+        class FakeConsole:
+            def __init__(self, controller) -> None:
+                self.controller = controller
+
+            def run(self) -> None:
+                if behaviour == "quit":
+                    self.controller.stop()  # 控制台的 quit 干的就是这个
+                elif behaviour == "ctrl-c":
+                    raise KeyboardInterrupt  # 主干在读输入，信号就落在这里
+                elif behaviour == "park":
+                    self.controller.stop() if False else None
+
+        original = (main_module.Controller, main_module.Console)
+        main_module.Controller = lambda config, options=None: spy  # type: ignore[assignment]
+        main_module.Console = FakeConsole  # type: ignore[assignment]
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                return trunk.main(), spy.calls
+                return main_module.main(spy.config), spy.calls
         finally:
-            trunk.Controller, trunk.Console, sys.argv = original  # type: ignore[assignment]
+            main_module.Controller, main_module.Console = original  # type: ignore[assignment]
 
-    code, calls = run_main(SpyController(quit_during_open=True))
-    expect(code == 0, f"启动阶段收到 quit，main() 返回了 {code}（那是人的决定，不是失败）")
-    expect(calls[-1:] == ["shutdown"], f"quit 之后收工必须是最后一步：{calls}")
-    expect(
-        not {"open_backend", "watch", "poll"} & set(calls),
-        f"启动阶段就收工了，不该再开后端 / 探活 / 进循环：{calls}",
-    )
+    for behaviour, label in (("quit", "quit"), ("ctrl-c", "Ctrl+C")):
+        spy = SpyController()
+        code, calls = run_main(spy, behaviour)
+        expect(code == 0, f"{label} 之后 main() 返回了 {code}")
+        expect(calls[:1] == ["start"], f"{label} 之前应当先把后台件支起来：{calls}")
+        expect(calls[-1:] == ["shutdown"], f"{label} 之后收工必须是最后一步：{calls}")
+        expect(
+            calls.count("shutdown") == 1,
+            f"{label} 的收工应当只做一次：{calls}",
+        )
 
-    code, calls = run_main(SpyController(interrupt=True))
-    expect(code == 0, f"Ctrl+C 之后 main() 返回了 {code}")
-    expect(calls[-1:] == ["shutdown"], f"Ctrl+C 之后收工必须是最后一步：{calls}")
-    expect(
-        "open_backend" in calls and "poll" in calls,
-        f"Ctrl+C 之前本该正常走到打歌循环里：{calls}",
-    )
+    # 控制台正常结束（比如输入到头、随后从别处收工）也要收工，而不是把进程挂在半路
+    spy = SpyController()
+    code, calls = run_main(spy, "park")
+    expect(code == 0 and calls[-1:] == ["shutdown"], f"控制台自然结束之后没有收工：{calls}")
 
-    # 找设备那一步打断了（10 秒超时）、或者注入失败：是"人让它停的"还是"真失败"，
-    # 退出码必须分得开 —— 脚本外面就是靠这个码判断该不该重试
-    code, _ = run_main(SpyController(quit_during_open=True, fail_open=True))
-    expect(code == 0, f"启动时收到 quit 而 open() 失败，main() 返回了 {code}，应当是 0")
-    code, _ = run_main(SpyController(fail_open=True))
-    expect(code == 2, f"没人让它停、open() 真失败，main() 返回了 {code}，应当是 2")
+    # 7) 一直等不到时钟、一个事件都没发：必须出声（那种局会一个音符都按不到）。
+    #    注意这里**只报不改状态** —— "这一局还在不在"由 agent 的暂停/退场 hook 说了算，
+    #    不许拿"多久没样本"去猜（暂停与退出在样本上只差一次抖动那么宽）。
+    class IdlePlayer:
+        def __init__(self) -> None:
+            self.stopped = 0
+            self.sent = 0
+            self.first_seconds = 1.519
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def join(self, timeout: float | None = None) -> bool:
+            return True
+
+    controller = make_controller()
+    controller._report = lambda player: None  # type: ignore[method-assign]
+    now = time.monotonic()
+    controller.clock.feed(0.00001, host_time=now)  # 起播前：钉着的值
+    player = IdlePlayer()
+    controller.player = player
+    controller._player_started = now - 5.0  # noqa: SLF001
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller._check_clock_wait()  # noqa: SLF001
+    expect("还没发出第一个事件" in buffer.getvalue(), f"等不到时钟却没吭声：{buffer.getvalue()!r}")
+    expect(player.stopped == 0, "等时钟不是收工，不该把播放器停掉")
+    expect(controller.player is player, "报一声就够了，不许顺手把状态改了")
+
+    # 8) 暂停（样本照来、值不变）不该放行后面的事件 —— 这一条在时钟自检里已覆盖，
+    #    这里只确认"停住"不会把播放器看跑掉
+    controller = make_controller()
+    controller._report = lambda player: None  # type: ignore[method-assign]
+    now = time.monotonic()
+    for offset in (0.0, 0.5, 1.0, 1.5):
+        controller.clock.feed(5.0, host_time=now - 1.6 + offset)
+    player = IdlePlayer()
+    controller.player = player
+    controller._player_started = now - 5.0  # noqa: SLF001
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        controller._check_clock_wait()  # noqa: SLF001
+    expect(player.stopped == 0, "暂停期间不该把播放器停掉（那是 hook 的活）")
+
+    # 9) 游戏自己报的暂停 / 退场：**信号驱动**，不是计时推断
+    #    暂停 = 把按着的手指抬起来（排期停了不等于手抬了），但**不停播放器**（时钟只是钉住，
+    #    恢复后接着从原地走）；退场 = 停播放器 + 清时钟 + 明说一句。
+    class CountingPlayer:
+        def __init__(self) -> None:
+            self.stopped = 0
+            self.lifted = 0
+            self.resumed = 0
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        def join(self, timeout: float | None = None) -> bool:
+            return True
+
+        def release_all(self) -> int:
+            self.lifted += 1
+            return 2
+
+        def resume(self) -> None:
+            self.resumed += 1
+
+    controller = make_controller()
+    controller._report = lambda player: None  # type: ignore[method-assign]
+    player = CountingPlayer()
+    controller.player = player
+    controller.clock.feed(7.8, host_time=time.monotonic())
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller.handle_play_state(False, 7.8)  # 暂停
+    expect(player.lifted == 1, "暂停时该把按着的手指抬起来")
+    expect(player.stopped == 0, "暂停不是退场：不该把播放器停掉")
+    expect(controller.clock.held, "暂停时该把时钟按住（暂停期间它的时间不是时间源）")
+    expect(controller.clock.host_for(9.0) is None, "按住期间一个事件都不该放行")
+    expect("暂停" in buffer.getvalue(), f"暂停没有明说：{buffer.getvalue()!r}")
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller.handle_play_state(True, 7.8)  # 恢复
+    expect(player.resumed == 1, "恢复时要把抬掉的手指按回原位")
+    expect(not controller.clock.held, "恢复时该放开时钟")
+    expect("重新对表" in buffer.getvalue(), f"恢复没有说明重新对表：{buffer.getvalue()!r}")
+
+    controller.clock.feed(7.8, host_time=time.monotonic())
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        controller.handle_level_gone(7.9)  # 退出 / 重开 / 结算清场
+    expect(player.stopped == 1, "这一局没了就该停掉播放器")
+    expect(controller.player is None, "停掉之后 player 该是空的")
+    expect(controller.clock.now() is None, "这一局没了就该把时钟清空（下一局重新对表）")
+    expect("不在了" in buffer.getvalue(), f"这一局没了却没有明说：{buffer.getvalue()!r}")
 
     return problems
 

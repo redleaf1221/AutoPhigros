@@ -91,6 +91,14 @@ class Note(NamedTuple):
     """按住时长，单位为秒；只有 HOLD 非零。"""
     offset: float
     """判定线上的横向偏移量。"""
+    above: bool = True
+    """在判定线上面（``notesAbove``）还是下面（``notesBelow``）。
+
+    这是**音符身份的一半**：游戏给音符的编号是
+    ``线号 × 1000000 + （上=0 / 下=100000） + 该侧的第几个 × 10``，
+    所以"第几个"要按**同一侧**数。日志里的 ``线 5 上 第 18 个`` 也是这个口径 ——
+    留着它在才能把裁判的判定和设备日志逐音符对上（``judge.py --compare``）。
+    """
 
 
 class Segment(NamedTuple):
@@ -236,13 +244,14 @@ def _parse_judge_line(raw: Any, version: int) -> JudgeLine:
         move.cut(start_time, end_time, begin, finish)
 
     notes = [
-        _parse_note(entry, beat)
-        for entry in chain(raw.get("notesAbove") or (), raw.get("notesBelow") or ())
+        _parse_note(entry, beat, above=above)
+        for above, entries in ((True, raw.get("notesAbove") or ()), (False, raw.get("notesBelow") or ()))
+        for entry in entries
     ]
     return JudgeLine(bpm, notes, move, rotate)
 
 
-def _parse_note(raw: Any, beat: float) -> Note:
+def _parse_note(raw: Any, beat: float, *, above: bool = True) -> Note:
     try:
         kind = NoteType(int(raw["type"]))
     except (KeyError, ValueError, TypeError) as error:
@@ -252,6 +261,7 @@ def _parse_note(raw: Any, beat: float) -> Note:
         seconds=float(raw["time"]) * beat,
         hold=float(raw.get("holdTime") or 0.0) * beat,
         offset=float(raw["positionX"]) * NOTE_X_SCALE,
+        above=above,
     )
 
 

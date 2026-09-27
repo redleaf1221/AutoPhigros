@@ -8,8 +8,8 @@
 | 想知道什么 | 看哪儿 |
 |---|---|
 | 怎么装、怎么用、控制台有哪些命令 | 就是这份 README |
-| 为什么这么设计、判定怎么算、踩过哪些坑 | [impl.md](impl.md) |
-| 游戏内部：函数地址、字段偏移、伪代码 | [Phigros4.0-音游内核逆向报告.md](Phigros4.0-音游内核逆向报告.md) |
+| 为什么这么设计、判定怎么算、踩过哪些坑 | [impl.md](docs/impl.md) |
+| 游戏内部：函数地址、字段偏移、伪代码 | [Phigros4.0-音游内核逆向报告.md](docs/Phigros4.0-音游内核逆向报告.md) |
 
 ## 装一遍
 
@@ -43,26 +43,19 @@ npm install
 npm run build          # esbuild frida/index.ts --bundle --outfile=./target/_.js
 ```
 
-没构建过 `target/_.js` 就 `python main.py` 会直接告诉你"先构建"。
+没构建过 `target/_.js` 就 `spawn` 会直接告诉你"先构建"。
 
 ## 入口
 
 ```sh
 conda activate auto_phigros
 
-# 主干：注入游戏；每次开谱游戏会停在闸门上，规划完自动放行，然后跟着游戏时钟打
+# 主干：没有命令行参数 —— 一切都在控制台里（它就是主干，跑在主线程上）
 python main.py
-python main.py --attach                     # 注入到已在运行的游戏
-python main.py --pid 30501                  # 直接指定 pid（名字对不上时用，见"环境要求"）
-python main.py --planner radical            # 换规划器
-python main.py --backend recording          # 换触控后端：不碰设备，整条链照样跑一遍
-python main.py --no-cache                   # 不吃也不写规划缓存
-python main.py --latency 0.02               # 注入链路的手工补偿（正数=提前发）
-python main.py --save-chart                 # 顺便把谱面原文存下来
-python main.py -H 192.168.1.10:27042        # 走远程 frida-server
-python main.py -D <device-id>               # 指定设备（USB 下就是 adb 序列号）
-# 跑起来之后终端就是控制台：help / status / planner / latency / inject / verbose /
-# respawn / reattach（详见下面的"控制台"）
+#   devices                列设备；只有一台时自动选中
+#   device <id>            选一台（记住）
+#   spawn / attach [pid]   注入（游戏关掉了用 spawn，还开着用 attach）
+#   其余设置见下面的"控制台"
 
 # 规划模块：吃一个谱面文件、吐一个规划结果文件（落盘的那份同时就是缓存）
 python planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
@@ -88,8 +81,13 @@ python judge.py --plan plans/x.psap -v
 python judge.py --json out.json
 ```
 
+只有 `main.py` 没有参数，因为它是"一台常驻的面板"：选设备、开关设置都该在**跑起来之后**
+做，而且该被记住。**记住的去处是 `config.json`**（第一次跑自动按默认值建一份，删了就能
+回到初始状态）—— planner / latency / auto-latency / backend / cache / save-chart / device / host
+都在里面。
+
 **落盘的规划结果就是缓存**：一张谱面 + 一个规划器对应一个 `.psap`，下次同样的组合
-直接读回来（算法源码动过自动失效）。`--no-cache` 表示既不吃也不写。
+直接读回来（算法源码动过自动失效）。`cache off` 表示既不吃也不写。
 
 `planner.py` 单独跑时会先找同目录下的 `<名字>.meta.json`（采集时留下的那份），
 从里面恢复序号、来源上下文与内容哈希，所以单独规划出来的结果和主干规划的落在同一个命名下。
@@ -101,38 +99,63 @@ python judge.py --json out.json
 
 1. `python -m backends.scrcpy` —— 只查 adb、server 文件和屏幕尺寸；
 2. `python touch.py <某个短谱的 .psap> --backend recording` —— 调度器；
-3. `python main.py --backend recording` —— **整条链**（闸门、缓存、对表、排事件）都不碰设备地跑一遍，
-   对着日志看 `[gate]`、`[plan]`、`[touch] 打完：发了 N 个事件，最大迟到 X ms` 合不合意；
-4. 开一次谱但**先别注入**（控制台里 `inject off`，或直接 `--backend recording`）——
-   音符一个都不会被按到，判定流水于是会把整张谱**逐个报成 Miss / Bad**：这正好把音符表
-   从头到尾走一遍，不用碰设备就能验两件事 —— `[notes] 音符表就绪：N 个音符` 的 N 等于
-   这张谱的音符数，以及 `[judge]` 那几行里**没有一句**"（音符表里没有它）"。
-   对得上再开 `inject on`；
-5. `python touch.py <同一个 .psap>` —— 真发。先用一首短谱看能不能点到，再调 `--latency`；
-6. `python main.py` —— 全自动。这时 `-D` 要填 adb 认的序列号（USB 下与 frida 的设备 id 是同一个）。
+3. `python main.py`，然后在控制台里 `backend recording` + `spawn` —— **整条链**（闸门、
+   缓存、对表、排事件）都不碰设备地跑一遍，对着日志看 `[gate]`、`[plan]`、
+   `[touch] 打完：发了 N 个事件，最大迟到 X ms` 合不合意；
+4. 开一次谱但**先别注入**（控制台里 `inject off`）—— 音符一个都不会被按到，判定流水于是
+   会把整张谱**逐个报成 Miss / Bad**：这正好把音符表从头到尾走一遍，不用碰设备就能验两件事
+   —— `[notes] 音符表就绪：N 个音符` 的 N 等于这张谱的音符数，以及 `[judge]` 那几行里
+   **没有一句**"（音符表里没有它）"。对得上再 `inject on`；
+5. `python touch.py <同一个 .psap>` —— 真发。先用一首短谱看能不能点到，再调 `latency`；
+6. `spawn`（或 `attach`）—— 全自动。第一次要 `devices` 看列表、`device <id>` 选一台
+   （USB 下那个 id 就是 adb 的序列号），之后就记住了。
 
 ## 控制台
 
-主干跑起来之后，那个终端就是控制台 —— 一边打歌一边改设置，不用重启：
+主干跑起来之后，那个终端就是控制台 —— **主线程就在读它**（所以 Ctrl+C 天然是"收工"）。
+一边打歌一边改设置，不用重启；会"记住"的那些当场落盘进 `config.json`：
 
 ```
 auto> help
 命令：
-  status               现在什么情况：agent、后端、时钟、这一局
-  planner [名字]       看可用规划器 / 换一个（下一关生效）
-  latency [值]         看 / 改注入补偿：0.02、20ms、+5ms（立即生效）
-  inject on|off        是否真的把触控发给设备
-  verbose on|off       是否把每一个 Perfect 也打出来
-  respawn              重新启动游戏并注入（游戏被关掉后用）
-  reattach             注入到已经在跑的游戏
-  help                 列出这些命令
-  quit                 收工：断开注入并退出（等同 Ctrl+C）
+  devices                  列出设备（USB、本机、远程 server）
+  device <id>              选中一台设备（记住）
+  spawn                    在选中的设备上启动游戏并注入
+  attach [pid]             附加到已经在跑的游戏（pid 可选）
+  status                   现在什么情况：设备、agent、后端、时钟、这一局
+  planner [名字]             看可用规划器 / 换一个（下一关生效，记住）
+  latency [值]              看 / 改注入补偿：0.02、20ms、+5ms（记住；手动给数会关掉自校准）
+  latency auto on|off      每局完整打完，按这一局 Perfect 的中位数自动校准补偿（记住）
+  backend [名字]             看 / 换触控后端（换了当场重开，记住）
+  cache on|off             把 plans/ 里的规划当缓存用（记住）
+  save-chart on|off        顺便把谱面原文存到 charts/（记住）
+  log on|off               把输出抄一份到 logs/<时间>.log（记住）
+  host add <地址>            加 / 看远程 frida-server（记住）
+  inject on|off            是否真的把触控发给设备（仅本次会话）
+  verbose on|off           是否把每一个 Perfect 也打出来（仅本次会话）
+  help                     列出这些命令
+  quit                     收工：断开注入并退出（等同 Ctrl+C）
 ```
 
-改了就是立刻生效：`latency` 下一个事件起、`planner` 下一关起、`inject` / `verbose` 当场起。
-`respawn` / `reattach` 怎么用、以及"agent 还活着吗"是怎么判断的（`ok` / `dead` / `hang`），
-写在 [impl.md](impl.md#运行时控制台与存活探测)；`quit` 为何与 Ctrl+C 等价、它到底拆了些什么，
-见那节的[收工小节](impl.md#收工quit-与-ctrlc-必须是同一件事)。
+`respawn` / `reattach` 是 `spawn` / `attach` 的老名字，照样能用。改了就是立刻生效：
+`latency` 下一个事件起、`planner` 下一关起、`inject` / `verbose` 当场起、`backend` 当场重开。
+
+**`inject` 与 `verbose` 故意不落盘**：一个持久化的 `inject off` 会让人下一次以为在打歌、
+其实一根手指都没发出去。
+
+**延迟会自己校准**（默认开）：每局**完整打完**之后，拿这一局 Perfect 的早晚量**中位数**
+加进 `latency` 并落盘 —— 我们发出触摸、游戏在下一帧才处理，这 20~30ms 的差该由补偿吃掉。
+只收 Perfect 是为了躲开被蹭掉、卡顿补判那些离群值；单次最多挪 100ms，超过就跳过并说明
+理由（那多半不是送达延迟）。`latency <值>` 手动给数会**自动关掉**它。
+
+**日志默认开着**：一次运行一份 `logs/<时间>.log`，路径在启动第一行就念出来（`[main] 日志：…`），
+`status` 里也看得到。抄的是**到达屏幕的一切**（包括 `scrcpy.py` 那种直接 `print` 的），
+只按"行的语义"落盘 —— 一行里只有最后一个 `\r` 之后的内容算数，所以控制台擦提示符的那些
+回车不会跑进文件。事后要比"这次和上次差在哪"，就在 `logs/` 里按文件名排。
+
+"agent 还活着吗"是怎么判断的（`ok` / `dead` / `hang`），写在
+[impl.md](docs/impl.md#运行时控制台与存活探测)；`quit` 为何与 Ctrl+C 等价、它到底拆了些什么，
+见那节的[收工小节](docs/impl.md#收工quit-与-ctrlc-必须是同一件事)。
 
 ## 可视化
 
@@ -169,7 +192,7 @@ python judge.py        # 算法有没有问题 —— 逐张谱 × 每个规划�
 就该由另一条线来报。
 
 `judge.py` 是那条线：把规划按游戏真实的判定规则（窗口、容差、扫描窗、hold 结算提前量，
-全部出自 [impl.md](impl.md#自检) 里那份逆向报告）重放一遍，另外还跑原有的那五项判据
+全部出自 [impl.md](docs/impl.md#自检) 里那份逆向报告）重放一遍，另外还跑原有的那五项判据
 （**事件流自洽**、**覆盖完整**、**存得回去**、**镜像也对**、**滑键起手**），并报
 
 * **丢音** —— 哪些音符一次判定都没碰到；
@@ -178,9 +201,9 @@ python judge.py        # 算法有没有问题 —— 逐张谱 × 每个规划�
 * **判定分布与分数** —— `900000 × acc + 100000 × maxCombo / N`，拿实机那局对过账（1156
   音符 / 1152 Perfect / 2 Good / 连击 613 → 950926 分，与游戏报的一分不差）。
 
-`selftest.py` 里另有十二组"整条链上下游"的检查：闸门、时钟、坐标换算、缓存、播放器、
-控制台、附加目标、存活探测、收工、结算、判定对账、在位时长。每组的判据、以及它们各自
-做过哪些变异测试，写在 [impl.md](impl.md#自检)。`charts/` 空着时缓存自检会跳过。
+`selftest.py` 里另有十三组"整条链上下游"的检查：闸门、时钟、坐标换算、缓存、播放器、
+控制台、附加目标、配置、存活探测、收工、结算、判定对账、在位时长。每组的判据、以及它们
+各自做过哪些变异测试，写在 [impl.md](docs/impl.md#自检)。`charts/` 空着时缓存自检会跳过。
 
 ## 输出
 
@@ -240,12 +263,12 @@ enumerate_applications()   → ('com.PigeonGames.Phigros', 30501)  ← 包名在
 device.attach('com.PigeonGames.Phigros')  → ProcessNotFoundError: unable to find process ...
 ```
 
-所以 `--attach` 的解析顺序是：**先问应用列表（包管理器给的 identifier → pid），再问进程列表
+所以 `attach` 的解析顺序是：**先问应用列表（包管理器给的 identifier → pid），再问进程列表
 （精确名 → `包名:子进程` 前缀），最后才交给 frida 按名字找**。两条路都走不通时，它会把
-frida 当前看得见的应用与"名字像它的"进程列出来，并提示用 `--pid`：
+frida 当前看得见的应用与"名字像它的"进程列出来，并提示直接给 pid：
 
-```sh
-python main.py --attach --pid 30501
+```
+auto> attach 30501
 ```
 
 要自己看一眼现场，跑：
@@ -259,23 +282,38 @@ python -c "import frida; d=frida.get_usb_device(); print([(p.pid,p.name) for p i
 ```
 auto_phigros/
   frida/            frida agent 源码（esbuild 打包成 target/_.js）
-  main.py           主干：注入 + 采集 + 闸门上规划 + 放行 + 驱动触控 + 存活探测
-  console.py        运行时控制台
-  options.py        运行时设置（控制台改的就是它）
-  output.py         进程里唯一的写者（整行原子 + 补回提示符）
+  main.py           薄入口：读/建 config.json → 起主干（控制台）→ 收工
   planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
   touch.py          触控模块：时钟、调度器、命令行，可单独运行
   render.py         可视化：把 .psap 渲染成视频
   judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
-  storage.py        .psap 编解码 + 落盘
   selftest.py       薄入口：代码自检（真正的东西在 tests/ 里）
+  runtime/          主干那一套
+    console.py        主干：命令表 + 读输入（跑在主线程上，Ctrl+C 落在这里）
+    controller.py     这一把的全部家当：设备、后端、时钟、注入、播放器、收工
+    agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
+    config.py         项目内固定常量 + 落盘的 config.json（默认值在代码里）
+    options.py        运行期旋钮（控制台改的就是它）
+    output.py         进程里唯一的写者（整行原子 + 补回提示符 + 抄一份到 logs/）
+  formats/
+    storage.py        .psap 编解码 + 落盘
+  tools/
+    device_log.py     把一次运行的日志读回来（设备实际判了什么，`judge --compare` 用它）
   tests/            自检包：判据、替身与入口（详见 tests/__init__.py）
   algorithms/       规划算法与契约（registry 按名字现 import）；judging.py 是判定规则唯一出处
   backends/         触控后端（scrcpy / recording）
-  charts/ plans/ renders/   采集到的谱面 / 规划结果=缓存 / 渲染出来的视频
+  docs/             逆向报告与实现笔记
+  config.json       落盘的配置（第一次跑自动建；不进版本库）
+  charts/ plans/ renders/ logs/   采集到的谱面 / 规划结果=缓存 / 渲染出来的视频 / 运行日志
 ```
 
-每个模块的职责与设计取舍见 [impl.md](impl.md#结构)。
+**根目录只留"能直接 `python xxx.py` 跑的"**（`main` / `planner` / `touch` / `render` / `judge` /
+`selftest`）；其余按职责收进 `runtime/`（主干的家当）、`formats/`（文件格式）、`tools/`（开发辅助）。
+包内的兄弟模块一律用**相对 import**（`from .config import …`）：包被搬走或改名都不会断；
+`from config import …` 那种写法在包里其实要靠 `sys.path` 才成立 —— 这次搬家就断在这里，
+自检直接 `ModuleNotFoundError`，所以别再写回去。
+
+每个模块的职责与设计取舍见 [impl.md](docs/impl.md#结构)。
 
 ## 还没做
 

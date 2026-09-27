@@ -1,7 +1,7 @@
 # auto_phigros 实现说明
 
 这份文件讲**为什么这么做**：每个 hook 为什么选在那儿、判定到底怎么算、踩过哪些坑。
-怎么装、怎么用看 [README.md](README.md)；游戏内部（函数地址、字段偏移、伪代码）
+怎么装、怎么用看 [README.md](../README.md)；游戏内部（函数地址、字段偏移、伪代码）
 看 [Phigros4.0-音游内核逆向报告.md](Phigros4.0-音游内核逆向报告.md)。
 
 结构、Hook 点的选择、开谱闸门与谱面镜像、垂直判定与判定线坐标、规划器（事件汇率 /
@@ -23,36 +23,49 @@ auto_phigros/
     hooks/notes.ts  hook 5    音符表：noteCode -> 音符（SetInformation）
     hooks/clock.ts  hook 6    游戏时钟（ProgressControl::Update）
     hooks/score.ts  hook 7/8  判定流水（Perfect/Good/Bad/Miss）、结算（GetLevelResultInfo）
-  main.py           主干：注入 + 采集 + 闸门上规划 + 放行 + 驱动触控 + 存活探测
-  console.py        运行时控制台：在终端上改设置、看状态、重连
-  options.py        运行时设置（控制台改的就是它）
-  output.py         进程里唯一的写者：整行原子输出 + 把控制台的提示符补回来
+    hooks/level.ts  hook 9/10 播放状态（Play：暂停/恢复）、这一局没了（LevelControl::OnDestroy）
+  main.py           薄入口：读/建 config.json → 起主干（控制台）→ 收工
+  runtime/          主干那一套（不可独立运行；包内用相对 import）
+    console.py        主干：命令表 + 读输入（跑在主线程上）
+    controller.py     设备 / 后端 / 时钟 / 注入 / 播放器 / 收工
+    agent.py          一次注入的全都：会话、闸门、消息分发、判决对账、结算
+    config.py         固定常量 + 落盘的 config.json（ROOT = 上一级目录）
+    options.py        运行时设置（控制台改的就是它）
+    output.py         进程里唯一的写者：整行原子输出 + 补回提示符 + 抄一份到 logs/
+  formats/
+    storage.py        .psap 编解码 + 落盘
+  tools/
+    device_log.py     运行日志的读回（judge --compare 拿它当"设备标准答案"）
   planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
+  judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
   touch.py          触控模块：时钟、调度器、命令行，可单独运行
   backends/         触控后端，按名字现 import
     __init__.py     对外只暴露 catalog() / create() / register()
     utils.py        契约：Backend 协议 + 虚拟屏 → 设备像素
     registry.py     后端注册表
     scrcpy.py       scrcpy 控制协议（目前唯一的真后端）
-    recording.py    干跑：不连设备，只记录（自检与 --backend recording 用）
+    recording.py    干跑：不连设备，只记录（自检与 backend recording 用）
   render.py         可视化模块，把 .psap 渲染成视频
-  storage.py        .psap 编解码 + 落盘
-  selftest.py       不连设备也能跑的自检
+  selftest.py       薄入口：代码自检（判据与替身在 tests/ 里）
+  tests/            自检包：coverage / archive / runtime / console / liveness / accounting /
+                    attach / settings / referee / stubs / cli
   algorithms/
     __init__.py     对外只暴露 catalog() / create() / register()
     utils.py        契约：TouchEvent、PlanResult（含 mirrored()）、Progress、Planner
     chart.py        官谱模型与解析
     geometry.py     虚拟屏幕、音符摆位、判定区（垂直判定见下）
+    judging.py      判定规则的唯一出处 + 重放裁判（judge.py 与覆盖率判据都读它）
     track.py        事件时间轴：按毫秒收事件、压掉原地不动的 MOVE
     registry.py     规划器注册表，按名字现 import
     conservative.py / radical.py / geometric.py
-  charts/           采集到的谱面（--save-chart）
+  config.json       落盘的配置（第一次跑按默认值建；不进版本库）
+  charts/           采集到的谱面（save-chart on）
   plans/            规划结果 = 缓存（默认写）
   renders/          渲染出来的视频
   target/_.js       构建产物
 ```
 
-agent 拆成模块之后，`frida/index.ts` 只剩"找类、按顺序装、缺什么报什么"这一件事，
+agent 拆成模块之后，`../frida/index.ts` 只剩"找类、按顺序装、缺什么报什么"这一件事，
 每个 hook 的来龙去脉（为什么选这个点、反编译依据、踩过的坑）都跟着它自己那个文件走 ——
 不必在一个一千行的文件里上下来回找。
 
@@ -66,7 +79,7 @@ agent 拆成模块之后，`frida/index.ts` 只剩"找类、按顺序装、缺�
 
 `UnityEngine.JsonUtility::FromJson(System.String, System.Type)`
 
-选它的三条理由（详见 [`frida/hooks/chart.ts`](frida/hooks/chart.ts) 顶部注释）：
+选它的三条理由（详见 [`../frida/hooks/chart.ts`](../frida/hooks/chart.ts) 顶部注释）：
 
 1. `LevelControl::_Start_d__46::MoveNext`（`0x1d27748`）里只有一句
    `_4__this->chart = JsonUtility::FromJson<Chart>(textAsset.text);`
@@ -89,6 +102,105 @@ agent 拆成模块之后，`frida/index.ts` 只剩"找类、按顺序装、缺�
 | `ProgressControl::Update()` | `0x1d3483c` | 定期回传 `nowTime`，触控播放按它对表 |
 | `ScoreControl::Perfect/Good/Bad/Miss` | `0x1d30a84` / `0x1d30c3c` / `0x1d30e20` / `0x1d30ff0` | 每一次判决：判了哪个音符、判成什么、早/晚多少 |
 | `ScoreControl::GetLevelResultInfo()` | `0x1d3505c` | 回传终局账目：分数、四个判定计数、最大连击 |
+| `ProgressControl::Play(Boolean)` | `0x1d34270` | 游戏自己在说"音乐停了 / 走了"（暂停菜单的每条路都汇到它这里） |
+| `LevelControl::OnDestroy()` | `0x1d25118` | 这一局没了：退出到选歌 / 重开 / 结算清场都会走它 |
+
+### 暂停、退场：让游戏自己说，别拿计时去猜
+
+`ProgressControl::Play(bool)`（`0x1d34270`）是**播放状态的唯一总闸**，反编译出来的调用点：
+
+| 谁调它 | 什么时候 | 参数 |
+|---|---|---|
+| `JudgeControl::CheckPause` `0x1d20a38` | 右上角暂停手势（`pauseTime = 1.2`，见 §6.8） | `false` |
+| `Pause::Update` `0x1d33920` 尾部 | 暂停动作（`SetActive(false)` + `SimpleDelay(0.5s)` 之后） | `false` |
+| `Pause::Update` 里 tag 为 `"Resume"` 的按钮 | 点"继续" | `true` |
+| `ProgressControl::Update` | 开谱起播 | `true` |
+
+`play == false` 的实现体里干的是：`isPlaying = 0`、音量归零、`audioSource.Pause()`、打开
+`pauseBar` / `pauseCamera`、把 Guide 的 `Animator.speed` 设 0 —— **游戏自己的时钟就是在这一刻
+停住的**。所以"暂停/恢复"根本不用主机去推断（原先靠"250ms 值不变"认，现在有信号了）。
+
+`Pause::Update` 里剩下的分支（同一帧里对触点做 `Physics2D` 射线、读命中物体的 tag）：
+
+* `"Retry"` → `SceneManager.LoadScene("Level")` —— 重开这一关；
+* `"Back"` → `GameInformation.turnToScene = "Loading"`、`nextScene = "ChapterSelector"`，
+  再 `LoadScene("TurnToScene")` —— 退出到选歌；
+* 两者之后都会（经 `Pause::StartNextScene` 的协程）把 `GameInformation._main` 销毁。
+
+而 `LevelControl::OnDestroy()` 是**这一局没了的唯一信号**：退出、重开、结算清场最终都会
+销毁关卡对象。主机收到就停手（停触控、清时钟、明说一句）。
+
+> 为什么不看"多久没收到进度样本"：暂停与退出在样本上的差别只差一次抖动那么宽，而且**暂停时
+> 样本照样每 100ms 来一次**（`ProgressControl` 还在跑，只有 `nowTime` 钉住不动）。这条推断
+> 实现过、也撤了 —— 猜出来的东西不能当判据。
+
+### 裁判与实机逐音符对齐（`judge.py --compare`）
+
+裁判（`../algorithms/judging.py`）的职责是**复现游戏会怎么判**。它准不准不该靠感觉：
+`judge.py --compare <日志>` 把裁判的每一条判定与实机日志里的**同一个音符**对上
+（身份是 `(线, 上/下, 同侧第几个)`，就是游戏自己的 `noteCode` 那套）。
+
+当前基线（`../logs/2026-09-27_19-49-47.log`，AT 谱 + geometric，1156 音符）：
+
+```
+设备（日志）：1152P  2G  1B  1M   951099 分 / 99.77%   最大连击 615
+裁判（本机）：1152P  2G  1B  1M   951099 分 / 99.77%   最大连击 615
+逐音符比出 1156 条：一致 1156，不一致 0
+```
+
+**这是验收线**：以后任何改动都要让它保持 0（或把新的不一致解释清楚再落地）。
+
+规则全部逐行对着反编译核过，出处都写在代码注释里：
+
+| 规则 | 出处 | 我原先错在哪 |
+|---|---|---|
+| 候选窗 `realTime ∈ (nowTime − 0.18, nowTime + 0.22)` | `CheckNote` 第 67-123 行 | 两个常量在 bisect 里**写反**了 —— 于是"未来音符被偷"这类事件裁判看不见 |
+| `touchPos >= 1.9` 严格跳过 | 第 189 行 | 用了 `>` |
+| `badTime = 0.22 + (touchPos − 0.9) × 0.08 × (−0.5)`，只收紧**早**那侧 | 第 199-212 行 | 没建模 |
+| 判档 `\|Δ\| < 0.08 / < 0.18 / 否则 Bad`，**无上界** | `ClickControl::Judge` 第 917-920 行 | 在 0.22 切了一刀（把判档与"能不能判到"混成一条） |
+| 挑选度量 `\|noteX − lateral\| + \|normal\|/2.2`，平局**先遇到的胜出** | `CheckNote` 第 344/383/407-408 行 | 分别错在"到音符判定点"与"按线号扫" |
+| `minDeltaTime` 每帧被写成 10000.0f → 那条早判守卫是死代码 | 第 124/186/425 行 | 把它当成了"允许多早"的输入参数（报告 §9 曾列为未解之谜） |
+| Hold 头判 `\|Δ\| ≥ 0.18` **不判档**，清标记继续等 | `HoldControl::Judge` 第 88-137 行 | 当成 Tap 判 Bad |
+| Hold 身体宽限 `_safeFrame = 2`（忍 3 帧，第 4 帧判 Miss），**只在头判之后跑** | 第 241-295 行 | 没建模 → 看不见"头判被蹭掉、手指没留住"的早判 Miss |
+| Hold 收尾在 `realTime + holdTime − 0.22`，报的是**头判**的 Δ | 第 180/303-337 行 | 这条一开始就猜对了 |
+
+两个**不是规则、是物理**的量，也写成了常量并注明来源：
+
+* `PROCESS_DELAY = 0.029`：我们发出 → 游戏在处理它的那一帧读 `nowTime`，实测 1149 条同档判定
+  的中位差 +28.9ms、分布 12~48ms（一帧量化）。固定部分可建模，**帧相位不可知** —— 这是
+  主机侧裁判理论上到不了的地方。
+* `METRIC_EPSILON = 0.005`：度量来自游戏的**活** transform，我这边是插值出来的线位置，
+  差在千分之几以内应当算"平局"、交给扫描顺序（实机 147.500/152.328 那两处就是这么定的）。
+
+
+这条路上踩过两个坑，都是实机报回来的，记在这儿免得再踩：
+
+**坑 1：把计划里紧接着的 `MOVE` 改写成 `DOWN` 来"重新按住"。** 那是把 flick 的**位移**吃掉
+了：游戏判 flick 靠的是"按下之后有没有那一下跳动"，按在目标位置上不动，`isNewFlick` 永远
+不亮。表现是"恢复之后有些 flick 划不出来"。
+
+**坑 2：暂停期间不按住时钟。** 暂停时 `nowTime` 要么完全冻住、要么缓慢爬升；后一种情况下
+`min(h−v)`（2 秒窗口）会被窗口里最老的那个样本拖住，对齐能偏到 1~2 秒之前，于是恢复后每个
+事件都被算成"迟到太多"（`LATE_SKIP = 0.15s`）直接丢掉 —— 表现是"恢复之后像没在打"。而且它
+**不稳定**：完全冻住的暂停反而自愈（值停过 → 重锚），取决于暂停期间时钟怎么动。自检里量过：
+爬升速率 0.02 / 0.1 / 0.5 时老做法分别偏 −1862ms / −1710ms / −950ms。
+
+所以现在是**信号驱动**的两步：
+
+| 事件 | 动作 | 为什么 |
+|---|---|---|
+| `Play(false)` | `clock.hold()` + `player.release_all()` | 暂停期间游戏的时间不是时间源，一个事件都不该发；手指留在屏幕上更糟 —— 暂停菜单是按**手指位置**射线找按钮的，停在那儿可能替人把"重开"按了 |
+| `Play(true)` | `player.resume()` + `clock.release()` | 按回**原位**（保住 flick 的位移），并把对齐**清零重来**（暂停期间的样本一律不采信） |
+
+`resume()` 只设旗子并叫醒播放器线程（睡眠用 `Event.wait` 而不是 `sleep`）—— hold 的主体
+只有约 67ms 的缺席容忍（`_safeFrame = 2`），等下一个事件到点再顺手按下去就断了。发送本身在
+播放器线程里做：后端（一条 scrcpy 连接）只能有一个线程写。一个例外：计划里紧接着那一帧本来
+就有同一个指针的 `DOWN` 时不补按 —— 同一个 pointer 连按两次是不合法的输入序列。
+
+兜底：万一 `Play(true)` 那个信号没送到，`GameClock` 会在按住期间看一眼**速率**（1.5 秒窗口里
+值走了 0.4 秒以上 = 游戏真在跑），自己放行并**报警**（`take_auto_release`）。看速率而不是
+"总共走了多少"是刻意的：缓慢爬升攒一分钟也能攒出 1 秒，按总量判会在暂停中途误放行。
+
 
 ### 判定流水：漏音要能指名道姓
 
@@ -197,7 +309,7 @@ LevelResultInfo::set_Percent(v7, v2->_percent);
 
 前两条把判定线整个绕屏幕中心翻过去；第三条**只取负、不减 0.5** —— 这恰好证明了
 `positionX` 是**以判定线为原点的沿线上偏移量**，不是屏幕绝对坐标。
-`algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 正是这个模型。
+`../algorithms/chart.py` 里 `point_at = 判定线位置 + 朝向 × positionX × 0.9` 正是这个模型。
 
 顺带证实了 `positionX` 的缩放：`JudgeLineControl::Start` 算出
 `moveScale = min(1, (屏宽/屏高) / (16/9))`，而 `LevelControl::SetInformation` 把每个音符的
@@ -227,7 +339,7 @@ LevelResultInfo::set_Percent(v7, v2->_percent);
 
 `LevelControl::Start` 是 Unity 协程，跑在主线程；hook 的实现体也在主线程。于是
 "停住不返回"就等于把整个游戏停住。停住用的是 Frida 官方的阻塞式收信
-（[`messages.md`](../frida_docs/messages.md)，"Blocking receives in the target process"）：
+（[`messages.md`](../../frida_docs/messages.md)，"Blocking receives in the target process"）：
 
 ```ts
 const op = recv("release", () => {});
@@ -242,7 +354,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 - 放行消息带 `seq`，对不上的（上一关残留、误发）不算数，重新注册接着等 —— 免得把
   下一关悄悄放走。不带 `seq` 的放行一律认，方便手工操作。
 
-主机侧（`main.py`）在 `level-start` **那条消息里**把活干完再放行，一律 `try/finally`：
+主机侧（`../main.py`）在 `level-start` **那条消息里**把活干完再放行，一律 `try/finally`：
 规划失败、规划器抛异常、甚至采集失败（agent 会送来一条只带 `error` 的 `level-start`），
 都必须放行 —— 少了放行游戏就死在闸门上，比规划失败严重得多。
 
@@ -270,8 +382,8 @@ op.wait();          // 主线程挂起，等主机 script.post()
 就是"先对着原文规划，再把结果整体水平翻过去"（`PlanResult.mirrored`），镜像开关原样
 记进来源上下文，`.psap` 和 `meta.json` 里都看得见。
 
-> 这条推理有个硬判据：`selftest.py` 会把规划结果翻过来、拿去对**按 `Chart::Mirror`
-> 规则镜像出来的那份谱面**，要求 393/393 全中。实测镜像前后的最大横向偏差**逐位相同**
+> 这条推理有个硬判据：`../selftest.py` 会把规划结果翻过来、拿去对 **按 `Chart::Mirror`
+> 规则镜像出来的那份谱面**，要求 393/393 全中。实测镜像前后的最大横向偏差 **逐位相同**
 > （0.0137 / 0.2490 / 0.0547 / 1.2800）—— 横向判据本身就是镜像不变的，这正是它该有的样子。
 > 把 `mirrored()` 改成空操作、翻错轴、或者把中线从 8 挪到 9，都会立刻漏掉两三百个音符。
 
@@ -281,7 +393,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 
 ## 垂直判定
 
-Phigros 的判定特色，也是 `algorithms/geometry.py` 里一切的地基。
+Phigros 的判定特色，也是 `../algorithms/geometry.py` 里一切的地基。
 
 `JudgeControl::GetFingerPosition` 为每根手指、每条判定线只算两个量：判定线局部坐标下的
 **横向分量**与**法向分量**。而 `JudgeControl::CheckNote` 里只把横向分量拿去比
@@ -292,7 +404,7 @@ Phigros 的判定特色，也是 `algorithms/geometry.py` 里一切的地基。
 
 - 把屏幕外的音符沿**垂直于判定线**的方向拉回屏幕是安全的 —— 横向分量不变。
 - 几何算法可以放心按判定区窄带的重心按下去，哪怕重心离判定线很远。
-- `selftest.py` 校验的是沿判定线的横向偏差，而不是欧氏距离。
+- `../selftest.py` 校验的是沿判定线的横向偏差，而不是欧氏距离。
 
 三个容易记错的细节：
 
@@ -331,12 +443,12 @@ world_y = (raw_y − 0.5) × 10
 `start2 = 1` 是上边缘；判定线一般落在屏幕下三分之一，音符从上方落下。
 
 > 社区实现（[phisap](https://github.com/kvarenzn/phisap)）这里用的是 `h × (1 − start2)`
-> 和 `−radians(deg)`，等于把 y 与角度一起做了垂直镜像。因为**垂直判定**，这个镜像对
+> 和 `−radians(deg)`，等于把 y 与角度一起做了垂直镜像。因为 **垂直判定**，这个镜像对
 > **水平判定线毫无影响**（官谱里绝大多数事件角度就是 0°），所以它镜像了也照样能打。
 > 但只要判定线立起来（90°），横向分量就整体错掉；做可视化时更是整层都对不上。
 >
-> 这个坑值得记一笔：`algorithms/chart.py` 最初就是从 phisap 照抄过来的，
-> 结果渲染出来所有点都挤在画面上半部分。**判定依据是 `(raw − 0.5) × 10`，不是 `5 − raw × 10`。**
+> 这个坑值得记一笔：`../algorithms/chart.py` 最初就是从 phisap 照抄过来的，
+> 结果渲染出来所有点都挤在画面上半部分。 **判定依据是 `(raw − 0.5) × 10`，不是 `5 − raw × 10`。**
 
 ## 规划器
 
@@ -360,7 +472,7 @@ world_y = (raw_y − 0.5) × 10
   一起拖住：主线程一停，游戏时钟的采样就断，触控跟着停，恢复时 `nowTime` 按音频
   往前跳一大截，整个时间轴就和谱面错开了。降到 8ms 后是 43 个/秒，
   **覆盖率与最大偏差逐位没变**。
-* **手指没动就别说话。** `algorithms/track.py` 的 `EventTrack` 会丢掉同一指针、
+* **手指没动就别说话。** `../algorithms/track.py` 的 `EventTrack` 会丢掉同一指针、
   同一坐标的 MOVE。真实手指不动时本来就不产生事件，所以这更接近真实输入。
   `geometric` 原本 70% 的事件是这样的空报。
 
@@ -392,7 +504,7 @@ world_y = (raw_y − 0.5) × 10
 一帧有多长由游戏自己的帧率策略定：`GameInformation::CheckFrameRate` 读
 `Screen.currentResolution.refreshRateRatio`，刷新率 ≤ 89Hz 时 `targetFrameRate = 60`，
 更高则取 `2 × 刷新率`、上限 300，而 `QualitySettings.vSyncCount` 恒为 0。
-60fps 是它支持的最低档，`algorithms/utils.py` 的 `MIN_DWELL_MS = 20` 就按这一档兜底，
+60fps 是它支持的最低档，`../algorithms/utils.py` 的 `MIN_DWELL_MS = 20` 就按这一档兜底，
 不用去猜设备。（实机帧间隔比 16.7ms 短，所以上面那些"不足一帧"的覆盖在真机上时中时不中：
 **同一个规划结果，不同一局的 miss 个数可以不一样** —— 这条正好可以拿来验证。）
 
@@ -442,7 +554,7 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 
 * 位置由 `storage.plan_path_for` 定：`<谱面文件名前缀>_<规划器>.psap`，
   一张谱面 + 一个规划器对应一个文件，天然一一对应；
-* 命中判据是 meta 里的 `cache_key` —— `algorithms/**/*.py` 加 `planner.py` 的哈希。
+* 命中判据是 meta 里的 `cache_key` —— `algorithms/**/*.py` 加 `../planner.py` 的哈希。
   改了算法、改了谱面解析、改了坐标换算，指纹就变，下次自动重算；
 * 镜像、延迟这些**运行时**设置一概不进缓存：`.psap` 存的是规范解（不镜像、不偏移），
   由 `touch.Player` 在执行时临时改。于是一张谱面的缓存在任何局面下都能用，
@@ -452,7 +564,7 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 
 ## 触控
 
-把 `.psap` 里的触点按时发到设备上。后端都在 `backends/` 包里，照 `algorithms/` 的套路来：
+把 `.psap` 里的触点按时发到设备上。后端都在 `../backends` 包里，照 `algorithms/` 的套路来：
 一张注册表按名字现 import，加一个后端 = 写一个模块 + 在 `registry._BUILTIN` 里加一行。
 
 | 后端 | 干什么 |
@@ -460,8 +572,8 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 | `scrcpy`（默认） | 走 scrcpy 的控制通道真发，目前唯一能真打的后端 |
 | `recording` | 干跑：不连设备，只把"什么时候发了什么"记下来；没有设备时唯一能验调度器的办法 |
 
-两边都能选：`main.py --backend <名字>`（整条链：闸门 → 规划 → 放行 → 对表 → 排事件）
-与 `touch.py --backend <名字>`（单机放一个 `.psap`）。
+两边都能选：控制台里 `backend <名字>`（整条链：闸门 → 规划 → 放行 → 对表 → 排事件，换了
+当场重开）与 `touch.py --backend <名字>`（单机放一个 `.psap`）。
 
 ### 为什么借 scrcpy
 
@@ -480,7 +592,7 @@ adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / \
 # 连上 127.0.0.1:<port>，先读掉一个哨兵字节再开始发
 ```
 
-两个路径是项目里的固定常量（`backends/scrcpy.py` 顶部）：`adb` 用
+两个路径是项目里的固定常量（`../backends/scrcpy.py` 顶部）：`adb` 用
 `C:\UserData\platform-tools\adb.exe`，server 用**项目上一级目录**里的 `scrcpy-server-v4.1`
 （从 scrcpy release 里拿出来、不用改扩展名）。自检：
 
@@ -488,10 +600,10 @@ adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / \
 python -m backends.scrcpy      # 只查 adb、server 文件和屏幕尺寸
 ```
 
-（`backends/` 里的模块是包内相对 import，所以用 `-m` 跑，直接 `python backends/scrcpy.py` 不行。）
+（`../backends` 里的模块是包内相对 import，所以用 `-m` 跑，直接 `python backends/scrcpy.py` 不行。）
 
 一条触摸消息 32 字节（大端，字段逐一对过 v4.1 的 `control_msg.h` 与
-`ControlMessageReader.java`，见 `backends/scrcpy.py` 顶部）：动作、指针号、x、y、屏宽、屏高、
+`ControlMessageReader.java`，见 `../backends/scrcpy.py` 顶部）：动作、指针号、x、y、屏宽、屏高、
 压力（按下 `0xffff`、抬起 0）、`action_button`、`buttons`。多指索引由 server 自己算 ——
 客户端只管发 DOWN/UP/MOVE 和各自的指针号。
 
@@ -537,13 +649,13 @@ agent 每 100ms 把 `ProgressControl.nowTime` 回传一次，触控模块用这�
 发的会补上，没到点的一律等；确认停过就把旧的对齐作废重新对表，不然暂停吃掉的那段时间
 会被算进去（恢复后会把事件发**早**）。
 
-> 这里踩过一个坑，值得留着：最早的判据是"上次**值变化**距今超过阈值就当成停过"。
-> 于是**传输打嗝**（采样断了几百毫秒、之后一口气补上一串样本）也会命中 —— 补上来的
+> 这里踩过一个坑，值得留着：最早的判据是"上次 **值变化**距今超过阈值就当成停过"。
+> 于是 **传输打嗝**（采样断了几百毫秒、之后一口气补上一串样本）也会命中 —— 补上来的
 > 头一笔本来就带旧值（400ms 只走了 5ms），看数据和暂停一模一样。窗口一被清掉，
-> `origin` 就退化成那个样本自己的 `h − v`，**它带多少延迟我们就晚发多少**，要等 2 秒
+> `origin` 就退化成那个样本自己的 `h − v`， **它带多少延迟我们就晚发多少**，要等 2 秒
 > 窗口重新填满才自愈。表现是偶发的 late good、每次音符还都不一样，而"最大迟到"那个
 > 指标量的是"相对我自己的排期"，排期本身错位它照样报 0 —— 完全看不见。
-> 现在只认"看着它停过"这一条证据，`selftest.py` 里有一条传输打嗝的回归用例盯着。
+> 现在只认"看着它停过"这一条证据，`../selftest.py` 里有一条传输打嗝的回归用例盯着。
 
 剩下一个固定偏差：主机 → adb → 设备 → InputManager 这条注入链路的耗时。它由
 `--latency` 手工补（正数 = 提前发），只能上设备调，默认 0。
@@ -581,7 +693,7 @@ py = 屏高 × (1 − 虚拟y/9)
 
 ### 已经验过什么 / 还没验什么
 
-不连设备能验的都验了（`selftest.py` 里那些）：时钟估计的六种情形、坐标换算的三种宽高比、
+不连设备能验的都验了（`../selftest.py` 里那些）：时钟估计的六种情形、坐标换算的三种宽高比、
 缓存的命中与失效、播放器按时发送 + 镜像翻转、闸门一局只放一次、控制台的命令解析、
 存活探测的三种结局。调度精度用 `--backend recording` 实测**最大迟到 0.5ms**
 （原先用 `Event.wait` 睡，Windows 上被 15.6ms 的系统滴答拖到 14ms —— 见
@@ -594,9 +706,9 @@ py = 屏高 × (1 − 虚拟y/9)
 
 ## 运行时控制台与存活探测
 
-命令表在 [README.md](README.md#控制台)。这里讲两条设计：
+命令表在 [README.md](../README.md#控制台)。这里讲两条设计：
 
-设置只有一份，就是 `options.py` 里的 `Options`：控制台改它，规划与播放**每次都读它**。
+设置只有一份，就是 `../runtime/options.py` 里的 `Options`：控制台改它，规划与播放**每次都读它**。
 于是"改了什么时候生效"这个问题根本不存在 —— 延迟改了下一个事件就按新值发，规划器改了
 下一关就按新的算。反过来，如果让每个模块各存一份、改的时候挨个同步，就一定会有改漏的那一处。
 `inject off` 不是"换成干跑后端"，而是照常排期、照常记迟到，只是最后那一次 `backend.send()`
@@ -609,7 +721,7 @@ py = 屏高 × (1 − 虚拟y/9)
 
 三条规矩，都是为了同一件事：
 
-1. **所有输出都走 `output.py` 的 `log()`**（`print` 的签名），而且**默认 `flush=True`**。
+1. **所有输出都走 `../runtime/output.py` 的 `log()`**（`print` 的签名），而且 **默认 `flush=True`**。
    整行不会被别的线程插花；也因为写者只有一个，才谈得上下面第 2 条。flush 不能省：
    不 flush 的话输出攒在哪里、什么时候露面完全由 stdout 是什么决定（终端行缓冲、管道块缓冲），
    表现就是"敲了一条命令没反应，再敲一条，上一条的输出才出来"；
@@ -623,10 +735,10 @@ stdin 不是终端（管道 / 重定向）时**照样读**，并把命令自己�
 好让日志能对上；读到文件尾就说明白然后退出。这里踩过一次坑：原先"不是终端就一声不吭
 把自己关掉"，于是敲什么都没反应、连提示符都没有 —— 宁可多说一句，也不要安静地不干活。
 
-> **别让子进程继承 stdin。** 这是最难查的一类"输入被吞"：`backends/scrcpy.py` 里的
+> **别让子进程继承 stdin。** 这是最难查的一类"输入被吞"：`../backends/scrcpy.py` 里的
 > `adb` 子进程原先用默认的 `stdin`，而 **`adb shell` 会把本地 stdin 转发给设备端的 shell**
 > —— 用户在控制台里敲的那一行被 adb 半路吃掉了，表现是"敲了没反应，再敲一条上一条才生效"，
-> 而且**永远不报错**。修法是给每一次 `subprocess` 调用都写死 `stdin=subprocess.DEVNULL`
+> 而且 **永远不报错**。修法是给每一次 `subprocess` 调用都写死 `stdin=subprocess.DEVNULL`
 > （scrcpy 那条 `adb shell` 整局都活着，等于一个一直在等着抢输入的家伙）。自检里有一条
 > 源码级检查盯着这件事：找出所有"括号里没有 `stdin=`"的 subprocess 调用。
 
@@ -645,8 +757,8 @@ stdin 不是终端（管道 / 重定向）时**照样读**，并把命令自己�
 那是人的决定：
 
 ```
-auto> respawn           # 游戏被关掉了：重新启动它再注入
-auto> reattach          # 游戏还开着、只是我们的会话没了：附加上去
+auto> spawn             # 游戏被关掉了：重新启动它再注入（旧名字 respawn 照样能用）
+auto> attach            # 游戏还开着、只是我们的会话没了：附加上去（旧名字 reattach）
 ```
 
 两者都保留触控后端（它挂在设备上，不挂在游戏进程上）与设置，只换 frida 会话、清空游戏时钟、
@@ -685,7 +797,7 @@ spawn 出来、还没 `resume` 的那个。"放不放它跑"不是收工该管�
 
 ## 可视化：为什么是 qtrle
 
-参数表在 [README.md](README.md#可视化)。
+参数表在 [README.md](../README.md#可视化)。
 
 **为什么是 qtrle / `.mov`**：H.264 没有 alpha 通道，所以透明只能用 QuickTime Animation
 （`.mov`，qtrle）或 VP9（`.webm`）。qtrle 是逐行行程编码，对"大片透明 + 几个点"
@@ -693,7 +805,7 @@ spawn 出来、还没 `resume` 的那个。"放不放它跑"不是收工该管�
 Premiere / AE / FCP 都直接认。给 `-o xxx.mp4` 会改成 H.264，那时**必须**同时给个底色，
 否则会明确报错而不是悄悄给你一坨黑的。
 
-抗锯齿有个坑写在 `render.py` 顶部：OpenCV 的 `LINE_AA` 只有在**单通道**图上才给出正确的
+抗锯齿有个坑写在 `../render.py` 顶部：OpenCV 的 `LINE_AA` 只有在**单通道**图上才给出正确的
 覆盖率。直接往 RGBA 上画，透明像素会被当成黑色参与混合，边缘立刻出现一圈暗边。
 所以这里是先出覆盖率掩膜，再用 numpy 自己做直通 alpha 的合成 —— 边缘像素是
 `(255, 128, 0, 54)` 而不是 `(54, 27, 0, 54)`。
@@ -703,10 +815,10 @@ Premiere / AE / FCP 都直接认。给 `-o xxx.mp4` 会改成 H.264，那时**�
 > `(A=255,R=254,G=47,B=47)` 就被解释成 `(B=255,G=254,R=47)`，正好是青色。
 > Premiere / AE / FCP 按规范读，不受影响；VLC、Windows 自带播放器之类对这一块的支持一向含糊。
 >
-> 这类播放器的表现**不能**用来判断文件对不对。真要验证，用 `ffmpeg` 转一张 PNG 再看，
+> 这类播放器的表现 **不能**用来判断文件对不对。真要验证，用 `ffmpeg` 转一张 PNG 再看，
 > 或者干脆拖进 Premiere 叠到一段素材上（QuickTime Animation 的 alpha 是原生识别的，
 > 不用做任何 keying）。万一 Premiere 也读错，那说明得换封装 —— `qtrle` 只支持 `argb`
-> 这一种 32 位格式，没有字节序可调，只能改 `render.py` 里的 `CONTAINERS`
+> 这一种 32 位格式，没有字节序可调，只能改 `../render.py` 里的 `CONTAINERS`
 > （PNG 序列 / ProRes 4444 / VP9 webm）。
 
 ## 自检
@@ -715,7 +827,7 @@ Premiere / AE / FCP 都直接认。给 `-o xxx.mp4` 会改成 H.264，那时**�
 python selftest.py
 ```
 
-不连设备也能跑，用的就是 `charts/` 里已采集的谱面。对每张谱 × 每个规划器查五件事：
+不连设备也能跑，用的就是 `../charts` 里已采集的谱面。对每张谱 × 每个规划器查五件事：
 
 1. **事件流自洽** —— 每个指针的 DOWN / UP 严格配对，事件按时间有序，没有未抬起的指针。
 2. **覆盖完整** —— 分两类判，因为游戏判这两类的方式根本不同（依据见下）：
@@ -734,16 +846,22 @@ python selftest.py
 
 | 自检 | 查什么 |
 |---|---|
-| 闸门 | 用假消息喂 `main.Agent`：一局恰好放行一次、`seq` 对得上、作业抛异常也放行、没收到谱面也放行；喂给规划器的永远是 FromJson 原文，**镜像不进缓存的身份**、而是交给播放器 |
+| 闸门 | 用假消息喂 `agent.Agent`：一局恰好放行一次、`seq` 对得上、作业抛异常也放行、没收到谱面也放行；喂给规划器的永远是 FromJson 原文，**镜像不进缓存的身份**、而是交给播放器；播放状态（`play-state`）与"这一局没了"（`level-gone`）原样转给主机 |
 | 时钟 | 六种情形下 `GameClock` 的估计：稳定推进、延迟抖动、起播前的等待、中途暂停、时钟倒走、传输打嗝补样本。判据只有一条 —— **宁可偏晚，绝不能偏早** |
 | 坐标换算 | 16:9 / 20:9（左右留黑边）/ 4:3 三种宽高比，以及 y 轴翻转 |
-| 缓存 | 第一次不算命中、第二次命中且事件流一致、算法指纹变了就失效、`cache=False` 既不读也不写 |
-| 播放器 | 用记录后端跑一遍：每批事件比"游戏时钟走到那一刻"早 `latency` 秒发出（±30ms），`--mirror` 时坐标 `x → 16 − x` |
-| 控制台 | 命令解析与那几个运行时旋钮：`latency` 的三种写法（`0.02` / `20ms` / `+5ms`）、`inject` / `verbose` / `planner` 生效、换到不存在的规划器时设置不动、打错/打空/打注释都不炸；回显三条规矩 —— 每条命令都得有回话（包括 `status_lines()` 给空的时候）、管道模式下命令要回显、别的线程打印完提示符必须画回来、`log()` 必须当场 flush；再加一条**源码级检查**：任何 `subprocess` 调用都不许继承 stdin |
+| 缓存 | 第一次不算命中、第二次命中且事件流一致、算法指纹变了就失效、`cache=False` 既不读也不写；命中时 `stats` / `warnings` 也必须跟着回来（`.psap` 是二进制、这些在 `.meta.json` 里 —— 不补的话"音符数核对"会拿 `None` 去比，喊假警报） |
+| 播放器 | 用记录后端跑一遍：每批事件比"游戏时钟走到那一刻"早 `latency` 秒发出（±30ms），`--mirror` 时坐标 `x → 16 − x`；外加**收尾那一发"把按着的手指全抬起来"**：计划自己留了没抬的、两根都还按着的、以及注入关着（一根都没按过，不许凭空发） |
+| 控制台 | 命令解析与那几个运行时旋钮：`latency` 的三种写法（`0.02` / `20ms` / `+5ms`）、`inject` / `verbose` / `planner` 生效、换到不存在的规划器时设置不动、`devices` / `device` / `spawn` / `attach [pid]` / `backend` / `cache` / `save-chart` / `host` 各走各的（含"没有会话时换后端不该去重开"）、会落盘的真的落盘而 `inject` / `verbose` 绝不落盘、打错/打空/打注释都不炸；回显三条规矩 —— 每条命令都得有回话（包括 `status_lines()` 给空的时候）、管道模式下命令要回显、别的线程打印完提示符必须画回来、`log()` 必须当场 flush；**空读不退出**：管道读到 EOF 要停靠（不退出、说清楚怎么收工）、终端上一次空读要接着读；再加一条**源码级检查**：任何 `subprocess` 调用都不许继承 stdin |
+| 附加目标 | 先问应用列表（包管理器给的 identifier → pid）、再问进程列表（精确名 → `包名:子进程` 前缀）、最后才按名字找；实机那种"进程名是应用标签 `Phigros`、包名不在进程列表里"必须附加得上；给了 pid 就跳过查找；两边都读不到时不瞎猜；失败清单里必须有 pid / 包名 / `--pid` 提示 |
+| 配置 | `../config.json` 不存在时按默认值建一份、往返一致、坏文件先备份成 `.bak` 再重建、不认识的字段忽略而认识的照收；`inject` / `verbose` **不许**出现在落盘字段里 |
+| 日志 | 抄的是**到达屏幕的一切**（直接 `print` 的也要在里面，`scrcpy.py` 就属于这种）、一行里只留最后一个 `\r` 之后的内容（控制台擦提示符的回车不进文件）、`stop_file_log()` 之后不再写、`log_path()` 跟着开关走 |
 | 存活探测 | 三种结局都认得出来：答了 `pong` = `ok`、没有会话 = `dead`、`ping` 抛异常 = `dead`（并记下原因）、`ping` 卡住 = `hang` 且按超时返回；另外钉住"收工只收一次" |
-| 收工 | `stop()` 当场拆完且顺序是"停播放器 → unload → detach"、拆除期间 SIGINT 真的是屏蔽的（在替身的 `join` 里当场采一次，不是只看源码）、闸门开着时先放行再断、拆除只做一次且后到的那个等它做完、收工之后不规划也不架播放器、收工不碰游戏本身；最后两条跑**真的** `main()`（只顶掉 `Controller` / `Console`），要求 `quit` 与 Ctrl+C 都以 0 收尾、都落到 `shutdown()`、且启动阶段收工后不再开后端 / 探活 |
+| 收工 | `stop()` 当场拆完且顺序是"停播放器 → unload → detach"、拆除期间 SIGINT 真的是屏蔽的（在替身的 `join` 里当场采一次，不是只看源码）、闸门开着时先放行再断、拆除只做一次且后到的那个等它做完、收工之后不规划也不架播放器、收工不碰游戏本身；再跑**真的** `main()`（只顶掉 `Controller` / `Console`），要求 `quit` 与 Ctrl+C 都以 0 收尾、都落到 `shutdown()`、且收工只做一次 |
+| 暂停 / 退场 | 游戏自己报的信号要按对的方式处置：暂停 → 按住时钟 + 抬起按着的手指（但不停播放器）；恢复 → 把抬掉的指针**按回原位**（保住 flick 的位移，不许把计划里的 `MOVE` 改写成 `DOWN`）+ 放开时钟并**重新对表**；这一局没了 → 停播放器 + 清时钟 + 明说一句。时钟那半还量了四种爬升速率（0 / 0.02 / 0.1 / 0.5），要求恢复后的排期偏差在 30ms 以内 —— 老做法在这里偏 1~2 秒，等于"恢复之后一个事件都发不出去"。这一组同时钉住"**不许拿计时去猜**关卡跑没跑" |
 | 结算 | 喂假的 `result` 消息：满分局 / 有失误局 / 全连局各一行字都要对，且**读不到的字段必须写成 `?` 而不是 0** |
-| 判定对账 | 拿合成的 `judge` 消息喂 `Agent`：`delta` 与 `nowTime − realTime` 对得上时不许吭声、对不上必须报（含"整张表 `realTime` 抄成 0"那种）、同类只报一次、正常的 Miss 不许被冤枉、查不到音符时不许乱报 |
+| 延迟自校准 | 拿这一局 Perfect 的**中位数**调手工补偿：样本不足不给结论、Good/Bad 的离群值不参与、单次挪动有上限（越过就跳过并说明）、开关关着时绝不动设置也不落盘 |
+| 存活探测 | 三种结局都认得出来（`ok` / `hang` / `dead`），外加一条**豁免**：我们自己正忙（卡在闸门 / 谱面在通道上传输）时 ping 必然排不上队，那不算"游戏冻住了"；"忙"的理由没了就照常报警 —— 别拿它当万能挡箭牌 |
+| 判定对账 | 拿合成的 `judge` 消息喂 `Agent`：`delta` 与 `nowTime − realTime` 对得上时不许吭声、对不上必须**每一条**都当场报（带序号、带是哪个音符）、正常的 Miss 不许被冤枉（含"早于 realTime 触发"那种：下界 `MISS_EARLY = 0.22`）、Hold 的两头（头判 / 收尾 −0.22s）都认、查不到音符时不许乱报 |
 | 在位时长 | 覆盖率判据**自己**的回归用例：拿两根合成时间轴喂 `check_coverage`，要求"停 100ms"不报、"只停 5ms"必报。防的是有人把判据"简化"回"那一瞬间在不在点上" |
 | 滑键起手 | 按 `CheckFlick` 的规则把整局走一遍（窗口 ±0.14s、时刻最早优先、横向 2.1），要求**每个 flick 都被点亮**。悲观假设（只认手指位置的跳变），所以它报问题一定有问题。把 `flick_repeats` 掰回 1，Dlyrotz HD 上立刻报 7 个点不亮 |
 
@@ -834,7 +952,7 @@ f64 屏宽 | f64 屏高 | u32 帧数
 
 ## 消息协议
 
-`frida/protocol.ts` 与 `main.py` 一一对应，改一侧要同时改另一侧：
+`../frida/protocol.ts` 与 `main.py` 一一对应，改一侧要同时改另一侧：
 
 | event | 载荷 | 说明 |
 |---|---|---|
@@ -867,7 +985,7 @@ script.exports_sync.revert()    # 还原全部 hook（名单就是 frida/index.t
 
 ## 依赖的取舍
 
-Python 侧就 [requirements.txt](requirements.txt) 里那五行（conda 环境 `auto_phigros`，
+Python 侧就 [requirements.txt](../requirements.txt) 里那五行（conda 环境 `auto_phigros`，
 Python 3.14），frida 的版本是唯一有讲究的一个。
 
 **刻意没用**的：`rich`（进度条用 tqdm 替了）、`z3-solver`（phisap 只在"指定目标分数"
@@ -878,5 +996,5 @@ Python 3.14），frida 的版本是唯一有讲究的一个。
 
 Node 侧：`frida-il2cpp-bridge@0.14.0`、`esbuild`、`@types/frida-gum` 都在
 `node_modules`；本地 `tsc` 只用于类型检查，不参与构建（打包是 esbuild 干的，
-`tsconfig.json` 因此配的是 `module: esnext` + `moduleResolution: bundler`）。
+`../tsconfig.json` 因此配的是 `module: esnext` + `moduleResolution: bundler`）。
 

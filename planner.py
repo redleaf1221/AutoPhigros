@@ -29,7 +29,7 @@ from tqdm import tqdm
 from algorithms import DEFAULT_PLANNER, catalog, create
 from algorithms.chart import Chart
 from algorithms.utils import PlanResult, Progress, SilentProgress
-from storage import ChartRef, decode_plan, load_plan_meta, plan_path, plan_path_for, save_plan
+from formats.storage import ChartRef, decode_plan, load_plan_meta, plan_path, plan_path_for, save_plan
 
 ROOT = Path(__file__).resolve().parent
 PLANS_DIR = ROOT / "plans"
@@ -94,16 +94,29 @@ def cache_key() -> str:
 def load_cached(
     ref: ChartRef, planner_name: str, directory: Path = PLANS_DIR
 ) -> PlanResult | None:
-    """命中就返回规划结果，否则 None。"""
+    """命中就返回规划结果，否则 None。
+
+    **统计与警告要从 meta 里补回来**：``.psap`` 是二进制，里面只有事件流（那是规划的本体）；
+    ``stats`` / ``warnings`` 存在旁边的 ``.meta.json``。不补的话，缓存命中时
+    ``stats["notes"]`` 就是 None —— 主机会拿它跟游戏报的音符数核对，于是打出
+    "游戏 372，JSON None -> 不一致！"这种假警报（真踩过）。
+    """
     meta = load_plan_meta(ref, planner_name, directory)
     if meta is None or meta.get("planner") != planner_name:
         return None
     if meta.get("cache_key") != cache_key():
         return None
     try:
-        return decode_plan(plan_path_for(ref, planner_name, directory).read_bytes())
+        result = decode_plan(plan_path_for(ref, planner_name, directory).read_bytes())
     except (OSError, ValueError):
         return None
+    stats = meta.get("stats")
+    if isinstance(stats, dict):
+        result.stats.update(stats)
+    warnings = meta.get("warnings")
+    if isinstance(warnings, list):
+        result.warnings = [str(item) for item in warnings]
+    return result
 
 
 def describe(name: str) -> str:

@@ -24,6 +24,7 @@ import { findClass } from "./bridge";
 import { installFromJsonHook, installNoteCountHook } from "./hooks/chart";
 import { installProgressHook } from "./hooks/clock";
 import { installLevelContextHook, installLevelStartHook } from "./hooks/gate";
+import { installLevelGoneHook, installPlayStateHook } from "./hooks/level";
 import { installNoteTableHook } from "./hooks/notes";
 import { installJudgeHooks, installResultHook } from "./hooks/score";
 import {
@@ -33,9 +34,11 @@ import {
     JUDGE_METHODS,
     judgeParameterCount,
     LEVEL_CONTROL_TYPE,
+    LEVEL_DESTROY_METHOD,
     LEVEL_RESULT_METHOD,
     LEVEL_START_METHOD,
     NOTE_TABLE_METHOD,
+    PLAY_METHOD,
     PROGRESS_CONTROL_TYPE,
     SCORE_CONTROL_TYPE,
     SONGS_ITEM_TYPE
@@ -53,7 +56,9 @@ const INSTALLED_HOOKS: ReadonlyArray<{ type: string; method: string; parameters:
     { type: SONGS_ITEM_TYPE, method: "GetLevelStartInfo", parameters: 1 },
     { type: LEVEL_CONTROL_TYPE, method: LEVEL_START_METHOD, parameters: 0 },
     { type: LEVEL_CONTROL_TYPE, method: NOTE_TABLE_METHOD, parameters: 0 },
+    { type: LEVEL_CONTROL_TYPE, method: LEVEL_DESTROY_METHOD, parameters: 0 },
     { type: PROGRESS_CONTROL_TYPE, method: "Update", parameters: 0 },
+    { type: PROGRESS_CONTROL_TYPE, method: PLAY_METHOD, parameters: 1 },
     ...JUDGE_METHODS.map(kind => ({
         type: SCORE_CONTROL_TYPE,
         method: kind as string,
@@ -86,6 +91,7 @@ function install(): void {
     }
     installLevelStartHook(LevelControl);
     installNoteTableHook(LevelControl);
+    installLevelGoneHook(LevelControl);
 
     state.classes.gameInformation = findClass(GAME_INFORMATION_TYPE);
     if (state.classes.gameInformation === null) {
@@ -100,6 +106,7 @@ function install(): void {
         send({ event: "warn", reason: `找不到 ${PROGRESS_CONTROL_TYPE}，游戏时钟跟不上` });
     } else {
         installProgressHook(ProgressControl);
+        installPlayStateHook(ProgressControl);
     }
 
     const ScoreControl = findClass(SCORE_CONTROL_TYPE);

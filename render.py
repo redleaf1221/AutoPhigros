@@ -37,7 +37,7 @@ from tqdm import tqdm
 
 from algorithms.geometry import Screen
 from algorithms.utils import PlanResult, Touch
-from storage import decode_plan
+from formats.storage import decode_plan
 
 ROOT = Path(__file__).resolve().parent
 RENDERS_DIR = ROOT / "renders"

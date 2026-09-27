@@ -38,7 +38,23 @@ CHART_TO_SCREEN = 0.9
 """谱面单位 → 虚拟屏单位。`CheckNote` 的 1.9 是谱面单位，虚拟屏宽 16，比例就是 0.9。"""
 
 TAP_TOLERANCE = 1.9 * CHART_TO_SCREEN
-"""Tap / Hold 头判的横向容差（`JudgeControl::CheckNote`，报告 §6.2）。"""
+"""Tap / Hold 头判的横向容差（`JudgeControl::CheckNote`，报告 §6.2）。
+
+**边界是严格的**：反编译里是 `if (touchPos >= 1.9) goto skip`（0x1d21104 第 189 行），
+所以"正好 1.9"判不到。容差比较要用 `>=`，不是 `>`。
+
+`touchPos` 是**谱面单位**（世界单位），这里折成虚拟屏的 1.71。
+"""
+
+EDGE_TOLERANCE = 0.9 * CHART_TO_SCREEN
+"""边缘收窄的起点：`touchPos > 0.9` 之后，能判到的**最早**时刻被收紧（第 199-201 行）。
+
+    badTime = BadTimeRange + (touchPos − 0.9) × PerfectTimeRange × (−0.5)
+
+`touchPos = 1.9` 时 `badTime = 0.22 − 1.0 × 0.08 × 0.5 = 0.18` —— 贴着音符边缘按下去时，
+"提前判到一个未来的音符"的余量从 220ms 缩到 180ms。它只影响**早**的那一侧（第 212 行
+比的是 `realTime − nowTime > badTime`）。
+"""
 
 DRAG_TOLERANCE = 2.1 * CHART_TO_SCREEN
 """Drag / Flick 的横向容差（`DragControl::Judge` / `CheckFlick`），比 Tap 宽。"""
@@ -53,7 +69,12 @@ SCAN_AHEAD = 0.22
 """判定扫描窗：每帧只看 `realTime ∈ (nowTime − 0.18, nowTime + 0.22)` 的音符（报告 §6.3）。
 
 也就是说一次按下能碰到的 tap 满足 `Δ = nowTime − realTime ∈ (−0.22, +0.18)`：
-**早**最多 220ms、**晚**最多 180ms。这个不对称就是"被判早"的那些蹭键的来源。
+**早**最多 220ms、**晚**最多 180ms。这个不对称就是"被判早"的那些蹭键的来源 ——
+而且它**必须**和 `verdict_of` 的边界是同一对数，否则裁判会看不见游戏看得见的那次偷取。
+
+踩过：这两个常量在 bisect 里被我写反过一次（`[nowTime − 0.22, nowTime + 0.18]`），
+后果是"187ms 之前的一次按下偷走了一个未来的音符"这类事件**裁判看不见** ——
+实机那一局它就报成 Perfect，而设备判的是 Bad。**窗口是不对称的，别照直觉写。**
 """
 
 DRAG_WINDOW = 0.10
@@ -67,6 +88,39 @@ FLICK_MISS = 0.22
 
 HOLD_SETTLE_LEAD = 0.22
 """Hold 在 `realTime + holdTime − 0.22` 就结算（报告 §6.6）—— 手指可以**早走 220ms**。"""
+
+METRIC_EPSILON = 0.005
+"""挑选度量差多少以内算**平局**（虚拟屏单位）。
+
+为什么需要它：游戏比的是两个 `float`，而那两个数来自**活的** transform（判定线的实时位置 +
+Unity 当帧读到的手指位置）；我这边是拿谱面事件插值出来的线位置。模型的误差量级就在千分之几，
+于是"本该平局"的一对候选会分出一个假的胜负来 —— 而平局时游戏用的是**扫描顺序**
+（先遇到的胜出，见 `selection_metric`）。
+
+实机证据：AT 谱 147.500s / 152.328s 那两处，一次按下同时够得着相隔 86ms 的两个音符
+（度量 0.73 对 0.73），设备按时间序选了时刻更早的那个；我原先按更小的度量选，选反了。
+`judge.py --compare logs/2026-09-27_19-49-47.log` 是这条容差的验收线。
+"""
+
+PROCESS_DELAY = 0.029
+"""我们发出的触摸，游戏是在**之后某一帧**才处理并读 `nowTime` 的：实测中位差 **+28.9ms**。
+
+怎么量的：拿一局实机日志（`logs/2026-09-27_19-49-47.log`，AT + geometric）与裁判逐音符比
+"同一个音符、两边同档"的 `delta` 之差，1149 条的中位数是 +28.9ms、分布 12~48ms。
+
+这 12~48ms 的形状就是**帧量化**：游戏在下一帧处理这次触摸，所以延迟 = 固定管线 + 0~1 帧
+（60Hz 一帧 16.7ms）。**固定部分可以建模，帧相位不行** —— 日志里看不到游戏那一帧的相位，
+所以裁判这里按中位数取常数；残差 ±1 帧是这个模型**理论上就到不了**的地方，谁也别假装能算准。
+
+它的用处有两面：
+
+* **裁判**：判定时刻要用"游戏处理它的时刻"（`发出 + PROCESS_DELAY`），否则同一个音符的
+  档位会整体偏早一档 —— 实机那一局 100.000s 的两个音符，裁判报 Bad、设备报 Good，
+  差的就是这 29ms 跨过了 0.18 的边界；
+* **计划/播放**：既然游戏晚 29ms 才处理，播放器就该**早 29ms 发**（等于把 `latency` 的
+  默认值从 0 提到 29ms），这样设备那边量到的 `delta` 会以 0 为中心，而不是稳定 +25ms。
+  这一条属于"送达"，不属于"计划"——`.psap` 里不该出现设备常数。
+"""
 
 HOLD_TIMEOUT = 0.25
 """Hold 的兜底超时：按住结束之后再过 0.25s 还没判就是 Miss。"""
@@ -128,18 +182,56 @@ class Verdict(IntEnum):
         return ("Perfect", "Good", "Bad", "Miss")[int(self)]
 
 
-def verdict_of(delta: float) -> Verdict | None:
-    """Tap / Hold 头判：早晚量 → 判定；落在扫描窗之外表示"这一次按下根本碰不到它"。
+def verdict_of(delta: float) -> Verdict:
+    """Tap / Hold 头判：早晚量 → 判定（`ClickControl::Judge` 0x1d3060c，报告 §6.6）。
 
-    `delta = nowTime − realTime`，正数 = 晚（与游戏传给 `ScoreControl` 的 `−Δ` 同源）。
+    ```c
+    v7 = fabsf(note->realTime - nowTime);
+    if (v7 < PerfectTimeRange) Perfect; else if (v7 < GoodTimeRange) Good; else Bad;
+    ```
+
+    **没有上界**：只要这一次按下被 `CheckNote` 选中了（见 :func:`tap_window`），
+    差多远都是 Bad —— 我原先在这里切了一刀（窗外返回 None），那是错的：
+    判档与"能不能判到"是两件事，前者没有上限，后者由 :func:`tap_window` 管。
     """
-    if not (-BAD_TIME < delta < SCAN_BACK):
-        return None
     if abs(delta) < PERFECT_TIME:
         return Verdict.PERFECT
     if abs(delta) < GOOD_TIME:
         return Verdict.GOOD
     return Verdict.BAD
+
+
+def tap_window(delta: float, touch_pos: float) -> bool:
+    """这一下按下能不能判到某个 Tap / Hold 头（`CheckNote` 里逐候选的三条过滤）。
+
+    逐字照抄反编译（`JudgeControl::CheckNote` 0x1d21104 第 186-213 行）：
+
+    ```c
+    if (realTime - nowTime >= minDeltaTime + 0.01) goto skip;   // minDeltaTime 每帧被写成
+                                                                // 10000.0f → 这条永远为假
+    if (touchPos >= 1.9) goto skip;                             // 横向（严格）
+    badTime = BadTimeRange;
+    if (touchPos > 0.9) badTime += (touchPos - 0.9) * PerfectTimeRange * (-0.5);
+    if (realTime - nowTime > badTime) goto skip;                // 早的那一侧
+    ```
+
+    加上扫描窗本身的两条（第 89 / 120 行）：`realTime < nowTime + 0.22` 与
+    `realTime > nowTime − 0.18`，也就是 `delta ∈ (−0.22, +0.18)` —— 晚的那一侧由扫描窗
+    兜底（0.18），早的那一侧由 `badTime` 兜底（≤ 0.22）。
+
+    **`minDeltaTime` 是个坑**：它不是"允许多早"的参数。反编译里每次调用开头都是
+    `*(_QWORD *)&this->minDeltaTime = -3118710784LL;`，低 32 位 `0x461C4000` = **10000.0f**
+    （高 32 位 `0xFFFFFFFF` 是相邻字段的哨兵），所以那条 `>= 10000.01` 的守卫**永远是假**；
+    而函数结尾第 425 行 `this->minDeltaTime = fabsf(note->realTime - nowTime);` 才写出真值
+    —— 它是个**输出**（刚判掉的那个音符差多少，给命中特效/统计用）。报告把它列为未解之谜
+    （预制体序列化字段），这里是按反编译原文定下来的。
+    """
+    if touch_pos >= TAP_TOLERANCE / CHART_TO_SCREEN:
+        return False
+    bad_time = BAD_TIME
+    if touch_pos > EDGE_TOLERANCE / CHART_TO_SCREEN:
+        bad_time += (touch_pos - EDGE_TOLERANCE / CHART_TO_SCREEN) * PERFECT_TIME * -0.5
+    return -bad_time <= delta < SCAN_BACK
 
 
 def score(perfect: int, good: int, notes: int, max_combo: int) -> tuple[int, float]:
@@ -242,12 +334,48 @@ class Judgement:
     delta: float
     pointer: int
     """哪根手指按的；Miss 是 -1。"""
+    above: bool = True
+    index: int = 0
+    """音符在线上的位置（上面还是下面、第几个）—— 就是设备的 ``noteCode`` 那套身份。
+
+    有了它，裁判的每一条判定都能和**日志里设备的判定**逐音符对上（``judge.py --compare``）。
+    只按 ``(线, 时刻)`` 对是不够的：同一条线上同一时刻可以有两个音符（上下各一个），
+    而那正是最需要看清的一类。
+    """
     grazed: bool = False
     """是不是"不是为它按的那一下"判掉的 —— 见 :class:`Graze`。"""
 
     @property
+    def key(self) -> tuple[int, bool, int]:
+        return (self.line, self.above, self.index)
+
+    @property
     def kind(self) -> NoteType:
         return self.note.kind
+
+
+@dataclass(slots=True)
+class HoldHead:
+    """一个 Hold 的**头判现场** —— 只是"挂上号"，还没有分。
+
+    为什么要把头判与结算分开：`HoldControl::Judge`（0x1d32668）里头部只写 `judged` 与
+    `isPerfect`、并把 `this->_judgeTime = v8` 记下来；**分数要到尾部结算时才发**
+    （第 303-337 行），而且报的是**头判的 Δ**。所以：
+
+    * 头判之后手指没留在线上 → 身体宽限耗尽 → 判 **Miss**，那个头判等于白按
+      （实机踩过：AT 谱 99.310s 的 hold 在 99.217s 就 Miss 了，早了 93ms —— 就是这条路）；
+    * 留在线上到尾部 → 收尾按 `is_perfect` 给 Perfect / Good，`delta` 用头判的那个。
+    """
+
+    slot: Slot
+    at: float
+    """头判发生在哪一刻（游戏处理那次按下的时刻）。"""
+    delta: float
+    """头判的早晚量 —— 收尾报的就是它。"""
+    pointer: int
+    is_perfect: bool
+    aimed: bool
+    """这一次按下是不是"计划本来瞄着它"的（不瞄就是蹭键）。"""
 
 
 @dataclass(slots=True)
@@ -333,12 +461,22 @@ class Slot:
     """
 
     index: int
+    """**表内下标**（`note_table` 里的位置）：只用来判重，不是游戏的编号。"""
     line: int
     geometry: object
     note: Note
     seconds: float
     point: complex
     """判定点在虚拟屏上的位置（`place_note` 算出来的），多押里挑最近的那个要用它。"""
+    above: bool = True
+    """上/下侧 —— 游戏编号里的那一半。"""
+    side_index: int = 0
+    """**同侧**的第几个 —— 游戏编号里的另一半（``线 5 上 第 18 个`` 的那个 18）。"""
+
+    @property
+    def key(self) -> tuple[int, bool, int]:
+        """游戏的音符身份：``(线, 上/下, 同侧第几个)``。"""
+        return (self.line, self.above, self.side_index)
 
     @property
     def kind(self) -> NoteType:
@@ -349,8 +487,11 @@ def note_table(chart: Chart) -> list[Slot]:
     """把整张谱摊成一张表，判定点用 `place_note` 算（flick 可能被微调）。"""
     slots: list[Slot] = []
     for line_index, line in enumerate(chart.lines):
+        counted: dict[bool, int] = {True: 0, False: 0}
         for note in line.notes:
             placement = place_note(line, note, chart.screen, retime=note.kind is NoteType.FLICK)
+            side_index = counted[note.above]
+            counted[note.above] = side_index + 1
             slots.append(
                 Slot(
                     index=len(slots),
@@ -359,6 +500,8 @@ def note_table(chart: Chart) -> list[Slot]:
                     note=note,
                     seconds=placement.seconds,
                     point=placement.position,
+                    above=note.above,
+                    side_index=side_index,
                 )
             )
     return slots
@@ -381,7 +524,40 @@ def _by_line(slots: list[Slot]) -> list[tuple[list[Slot], list[float]]]:
     return tables
 
 
+def scan_order(slots: list[Slot]) -> tuple[list[Slot], list[float]]:
+    """**全局**按时间排好的扫描表 —— 谁是"最近的那一个"就是这么定的。
+
+    为什么不能按线分组去比：谱面里有一大堆**位置完全相同、只是线和时刻不同**的音符
+    （实测 AT 谱 34 秒那一簇：线 8/16/17/18 上的 5 个 Tap 判定点都是 `(+8.00, +1.80)`）。
+    位置一样，`selection_metric` 就一样，胜负只能由**扫描顺序**决定。而游戏那边是
+    `SortForNoteWithFloorPosition` 把音符按时间排成一条扫描表（报告 §6.2），所以同分时
+    胜出的是**最早遇到的那个** = 时刻最早的那个；按线号分组则会挑中线号最小的那个，
+    差出一百多毫秒 —— 表现就是"裁判说这个音符被别人蹭掉了、其实游戏判得 Perfect"
+    （实机日志逐音符比出来的，`judge.py --compare`）。
+
+    排序键里带上线号与上下：同一 `(线, 时刻)` 上可能有多个音符（Credits IN 实测 7 个），
+    没有稳定的次序就没法复现。
+    """
+    ordered = sorted(slots, key=lambda slot: (slot.seconds, slot.line, slot.above, slot.side_index))
+    return ordered, [slot.seconds for slot in ordered]
+
+
 # --------------------------------------------------------------- 裁判
+
+
+def normal_offset(line, position: complex, seconds: float) -> float:
+    """指尖到判定线的**法向**距离（判定线是无限细的，它不参与判定，只参与"挑最近候选"）。
+
+    出处是 `JudgeControl::GetFingerPosition`（报告 §6.3）：它给每根手指算**两个**量，
+    横向的（`Re`）与法向的（`Im`），而 `CheckNote` 只用前者做判据、后者只进"挑最近"的度量。
+
+    这一条区分得清不清楚很要紧：**同一条线上的音符，法向距离是同一个数**（音符只在线上
+    横向移动）。所以同一线上的两个候选在度量里必然**并列** —— 谁胜出就完全由扫描顺序决定，
+    而不是由"离哪个音符的判定点更近"决定。原先这里量的是"指尖到音符判定点"的纵向距离，
+    同一线上的两个音符于是分出了大小，选出的是时刻更远的那个（实机日志逐音符比出来的）。
+    """
+    local = (position - line.position_at(seconds)) * line.rotation_at(seconds).conjugate()
+    return abs(local.imag)
 
 
 def selection_metric(slot: Slot, position: complex, seconds: float) -> float:
@@ -389,18 +565,26 @@ def selection_metric(slot: Slot, position: complex, seconds: float) -> float:
 
         |Δx| + |Δy| / 2.2
 
-    `|Δx|` 就是 `deviation()` 那个横向偏差；`|Δy|` 是指尖离判定点的纵向距离。它**只用来
-    在多押里选一个**，不构成判定条件 —— 选出来之后仍然只看 `|Δx| < 1.9` 和早晚量。
+    `|Δx|` 就是 `deviation()` 那个横向偏差；`|Δy|` 是**指尖到判定线的法向距离**
+    （见 :func:`normal_offset` —— 不是到音符判定点的距离）。它**只用来在多押里选一个**，
+    不构成判定条件 —— 选出来之后仍然只看 `|Δx| < 1.9` 和早晚量。
 
-    2.2 是 Y 方向的归一化系数（报告里写死的那个值）。我们这边的坐标是 0.9 倍的虚拟屏单位，
-    同一个量级，比较候选之间的大小不受影响。
+    并列时谁赢：`judge_taps` 按**时间序**扫候选、用严格小于比较，所以并列时**时刻最早**
+    的那个胜出 —— 与游戏那边逐帧推进的 `startIndex`/`endIndex` 游标一致（报告 §6.2）。
     """
-    return deviation(slot.geometry, slot.note, position, seconds) + abs(
-        position.imag - slot.point.imag
+    return deviation(slot.geometry, slot.note, position, seconds) + normal_offset(
+        slot.geometry, position, seconds
     ) / 2.2
 
 
-def judge_taps(chart: Chart, result: PlanResult, slots: list[Slot]) -> tuple[list[Judgement], list[Graze]]:
+def judge_taps(
+    chart: Chart,
+    result: PlanResult,
+    slots: list[Slot],
+    *,
+    fingers: Fingers,
+    heads: dict[int, "HoldHead"],
+) -> tuple[list[Judgement], list[Graze], set[int]]:
     """Tap 与 Hold 的头判：**逐次按下**判，而且一次按下只判**一个**音符。
 
     这是这个模块里最容易搞错、也最要紧的一条：`JudgeControl::CheckNote` 是"在每个手指的
@@ -417,64 +601,102 @@ def judge_taps(chart: Chart, result: PlanResult, slots: list[Slot]) -> tuple[lis
     然后按 `selection_metric` 取最小的那个判掉。**它如果不是"计划本来瞄的那个"就是蹭键** ——
     判据是"这一次按下的时刻落在音符窄窗 `HEAD_WINDOW` 之外"：计划的窄窗只有 −20ms~+160ms，
     游戏的扫描窗却有 −220ms~+180ms，两者之差就是蹭键能活下来的缝。
+
+    **Hold 只在这里"挂上号"**：头判选中之后不产生判定，而是记进 ``heads``，由
+    :func:`judge_holds` 接着跑身体与收尾。
     """
-    fingers = Fingers(result)
-    tables = _by_line([slot for slot in slots if slot.kind in (NoteType.TAP, NoteType.HOLD)])
+    scan, moments = scan_order(
+        [slot for slot in slots if slot.kind in (NoteType.TAP, NoteType.HOLD)]
+    )
 
     # 计划"本来按对了"的那些音符：窄窗里有一次横向够得着的按下（与覆盖率判据同一套窗口）。
     # 用来区分两种后果：计划按对了却被别人先碰掉（丢分）vs 计划根本没按（漏音）。
     proper: set[int] = set()
     down_times = [timestamp / 1000.0 for timestamp, _, _ in fingers.downs]
-    for group, seconds in tables:
-        for slot in group:
-            lo = bisect_right(down_times, slot.seconds + HEAD_WINDOW[0] - 0.001)
-            hi = bisect_right(down_times, slot.seconds + HEAD_WINDOW[1] + 0.001)
-            for index in range(lo, hi):
-                timestamp, _, position = fingers.downs[index]
-                if deviation(slot.geometry, slot.note, position, slot.seconds) <= TAP_TOLERANCE:
-                    proper.add(slot.index)
-                    break
+    for slot in scan:
+        lo = bisect_right(down_times, slot.seconds + HEAD_WINDOW[0] - 0.001)
+        hi = bisect_right(down_times, slot.seconds + HEAD_WINDOW[1] + 0.001)
+        for index in range(lo, hi):
+            timestamp, _, position = fingers.downs[index]
+            if (
+                deviation(slot.geometry, slot.note, position, timestamp / 1000.0)
+                <= TAP_TOLERANCE
+            ):
+                proper.add(slot.index)
+                break
 
     judged: set[int] = set()
     judgements: list[Judgement] = []
     grazes: list[Graze] = []
     for timestamp, pointer, position in fingers.downs:
-        moment = timestamp / 1000.0
+        # 判定发生在**游戏处理这一下按下的那一帧**，不是我们发出去的那一刻（见 PROCESS_DELAY）
+        moment = timestamp / 1000.0 + PROCESS_DELAY
         best: tuple[float, Slot, Judgement] | None = None
-        for group, seconds in tables:
-            lo = bisect_right(seconds, moment - SCAN_AHEAD)
-            hi = bisect_right(seconds, moment + SCAN_BACK)
-            for offset in range(lo, hi):
-                slot = group[offset]
-                if slot.index in judged:
-                    continue
-                delta = moment - slot.seconds
-                verdict = verdict_of(delta)
-                if verdict is None:
-                    continue
-                if deviation(slot.geometry, slot.note, position, slot.seconds) > TAP_TOLERANCE:
-                    continue
-                metric = selection_metric(slot, position, slot.seconds)
-                if best is not None and metric >= best[0]:
-                    continue
-                best = (
-                    metric,
-                    slot,
-                    Judgement(
-                        line=slot.line,
-                        note=slot.note,
-                        seconds=slot.seconds,
-                        verdict=verdict,
-                        at=moment,
-                        delta=delta,
-                        pointer=pointer,
-                    ),
-                )
+        lo = bisect_right(moments, moment - SCAN_BACK)
+        hi = bisect_right(moments, moment + SCAN_AHEAD)
+        for offset in range(lo, hi):
+            slot = scan[offset]
+            if slot.index in judged:
+                continue
+            delta = moment - slot.seconds
+            lateral = deviation(slot.geometry, slot.note, position, moment)
+            # 三条过滤全在这里（含边缘收窄的 badTime）：见 tap_window 的反编译引用
+            if not tap_window(delta, lateral / CHART_TO_SCREEN):
+                continue
+            if slot.kind is NoteType.HOLD and abs(delta) >= GOOD_TIME:
+                # **Hold 的头判与 Tap 有一处不同**（`HoldControl::Judge` 0x1d32668 第 88-137 行）：
+                # `|Δ| >= GoodTimeRange` 时不判档，而是把音符的 `isJudged` 清掉继续等 ——
+                # 擦边按下的那一下不算数。Tap 那边同样的 `|Δ|` 是判 Bad 并就此结账。
+                continue
+            verdict = verdict_of(delta)
+            metric = selection_metric(slot, position, moment)
+            if best is not None and metric >= best[0] - METRIC_EPSILON:
+                # 差在容差以内算平局 → 保留**先遇到的**（时间序在前）那个，见 METRIC_EPSILON
+                continue
+            best = (
+                metric,
+                slot,
+                Judgement(
+                    line=slot.line,
+                    note=slot.note,
+                    seconds=slot.seconds,
+                    verdict=verdict,
+                    at=moment,
+                    delta=delta,
+                    pointer=pointer,
+                    above=slot.above,
+                    index=slot.side_index,
+                ),
+            )
 
         if best is None:
             continue
         _, slot, judgement = best
         judged.add(slot.index)
+        if slot.kind is NoteType.HOLD:
+            # Hold 的头判**当场不算分**：它只是把身体挂上号（见 judge_holds）。
+            # 记下头判的 Δ —— 收尾报的就是它（`this->_judgeTime = v8`，第 180 行）。
+            heads[slot.index] = HoldHead(
+                slot=slot,
+                at=judgement.at,
+                delta=judgement.delta,
+                pointer=pointer,
+                is_perfect=abs(judgement.delta) < PERFECT_TIME,
+                aimed=HEAD_WINDOW[0] <= judgement.delta <= HEAD_WINDOW[1],
+            )
+            if not heads[slot.index].aimed:
+                grazes.append(
+                    Graze(
+                        line=slot.line,
+                        note=slot.note,
+                        verdict=judgement.verdict,
+                        at=judgement.at,
+                        delta=judgement.delta,
+                        pointer=pointer,
+                        stolen=slot.index in proper,
+                    )
+                )
+            continue
         aimed = HEAD_WINDOW[0] <= judgement.delta <= HEAD_WINDOW[1]
         judgement.grazed = not aimed
         judgements.append(judgement)
@@ -493,6 +715,113 @@ def judge_taps(chart: Chart, result: PlanResult, slots: list[Slot]) -> tuple[lis
         )
 
     return judgements, grazes, judged
+
+
+def judge_holds(
+    slots: list[Slot], heads: dict[int, HoldHead], fingers: Fingers
+) -> list[Judgement]:
+    """Hold 的身体与收尾（`HoldControl::Judge` 0x1d32668，逐行对着写）。
+
+    ```c
+    // 头部（已在 judge_taps 里按 CheckNote 的选中结果处理）
+    // 身体：**只在头判之后跑**（入口在 LABEL_57，头判没被选中就走不到这里）
+    if (!missed && !judgeOver) {
+        missed = true;
+        for (i in 手指) if (fabsf(fingerPositionX[i] - note.positionX) < 1.9) {
+            missed = false; _safeFrame = 2;
+        }
+        if (一根都不符合) { if (--_safeFrame < 0) { judgeOver = true; Miss; } else missed = false; }
+    }
+    // 收尾：报的是**头判**的 Δ（judgeTime = this->_judgeTime）
+    if (nowTime > realTime + holdTime - 0.22 && judged && !judgeOver) { Perfect/Good(isHold); }
+    // 兜底
+    if (nowTime > realTime + holdTime + 0.25) { if (judged||missed||judgeOver) return; Miss; }
+    ```
+
+    三条从这里来的结论，都不是猜的：
+
+    1. **身体只在头判之后查** —— 所以"一直没碰的 hold"不会在音符还没到点时就 Miss，
+       它走的是头部那条：`nowTime > realTime + 0.22` 才 Miss；
+    2. **身体判 Miss 可以早于 `realTime`** —— 头判被一次"不是瞄它"的按下标记过、那根手指
+       随即离开，`_safeFrame` 连续 4 帧落空就判（实机那条早了 93ms）；
+    3. **收尾报头判的 Δ** —— 一个 2.4 秒的 hold 收尾时 `nowTime − realTime` 是 +2.2 出头，
+       但游戏报的 `delta` 只有十几毫秒。
+
+    手指"在位"的判据与头部一致：横向 < 1.9（谱面单位），逐帧查**所有**按着的手指
+    （`fingerPositionX` 那个数组，不看 phase —— 按着、被 MOVE 过来的都算）。
+    """
+    judgements: list[Judgement] = []
+    step = FRAME_MS / 1000.0
+    """一帧多少**秒**。`FRAME_MS` 是毫秒 —— 这一行踩过：直接拿 `FRAME_MS` 去加，
+    一步跨了 16 秒，身体循环一圈就"撑到收尾"了，那条早 93ms 的 Miss 于是看不见。"""
+    for slot in slots:
+        if slot.kind is not NoteType.HOLD:
+            continue
+        head = heads.get(slot.index)
+        if head is None:
+            # 头部从没被任何按下选中 —— 走头部那条 Miss（比 realTime 晚 0.22，不会早）
+            judgements.append(
+                Judgement(
+                    line=slot.line,
+                    note=slot.note,
+                    seconds=slot.seconds,
+                    verdict=Verdict.MISS,
+                    at=slot.seconds + BAD_TIME,
+                    delta=BAD_TIME,
+                    pointer=-1,
+                    above=slot.above,
+                    index=slot.side_index,
+                )
+            )
+            continue
+
+        settle = slot.seconds + slot.note.hold - HOLD_SETTLE_LEAD
+        grace = HOLD_GRACE_FRAMES - 1
+        """预制体里 `_safeFrame` 的初值 = 2（判据是 `if (--_safeFrame < 0)`）→ 忍 3 帧。"""
+        moment = head.at
+        while moment <= settle:
+            on_line = any(
+                deviation(slot.geometry, slot.note, position, moment) < TAP_TOLERANCE
+                for position in fingers.down_at(round(moment * 1000.0))
+            )
+            if on_line:
+                grace = HOLD_GRACE_FRAMES - 1
+            elif grace < 0:
+                judgements.append(
+                    Judgement(
+                        line=slot.line,
+                        note=slot.note,
+                        seconds=slot.seconds,
+                        verdict=Verdict.MISS,
+                        at=moment,
+                        delta=moment - slot.seconds,
+                        pointer=-1,
+                        above=slot.above,
+                        index=slot.side_index,
+                        grazed=not head.aimed,
+                    )
+                )
+                break
+            else:
+                grace -= 1
+            moment += step
+        else:
+            # 撑到收尾：按头判的档，报**头判**的 Δ
+            judgements.append(
+                Judgement(
+                    line=slot.line,
+                    note=slot.note,
+                    seconds=slot.seconds,
+                    verdict=Verdict.PERFECT if head.is_perfect else Verdict.GOOD,
+                    at=settle,
+                    delta=head.delta,
+                    pointer=head.pointer,
+                    above=slot.above,
+                    index=slot.side_index,
+                    grazed=not head.aimed,
+                )
+            )
+    return judgements
 
 
 def judge_drags_and_flicks(result: PlanResult, slots: list[Slot]) -> list[Judgement]:
@@ -532,6 +861,8 @@ def judge_drags_and_flicks(result: PlanResult, slots: list[Slot]) -> list[Judgem
                 at=at,
                 delta=delta,
                 pointer=pointer,
+                above=slot.above,
+                index=slot.side_index,
             )
         )
     return judgements
@@ -554,24 +885,27 @@ class Timer:
 def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: str = "") -> Report:
     """把一份规划完整重放一遍。
 
-    现在做实的
+    做实的
 
     * **Tap / Hold 头判**：逐次按下判（判定只发生在按下那一帧），一个音符只判一次、
       先到先得，并给出蹭键归因。这部分与帧率无关，结论是硬的；
+    * **Hold 的身体与收尾**：头判只挂号、分数在收尾发，中途手指离开就 Miss（`judge_holds`）；
     * **Drag / Flick**：逐帧比位置（帧相位是假设，见 `FRAME_RATE`）；
     * 没被任何一次判定碰到的音符 → **Miss**（`lost`）。
 
-    还没进来的（它们在 `tests/coverage.py` 里有对应判据，补进来之后两边该收敛成一套）
-
-    * Hold 主体的 `_safeFrame` 与"尾部抱的是头判的早晚量"：所以这里只有头判结果，
-      "中途松手被判 Miss"还看不见；
-    * Hold 主体的横向判据用的是**静态** `positionX`（报告 §6.6），与 Drag/Flick 用的
-      "判定线当前时刻的位置"不是一回事 —— 这一条可能会解释实机上某些 hold 的 Miss。
+    与实机逐音符对齐到什么程度：AT 谱 + geometric 那一局，1156 个音符里 3 条不一致
+    （`judge.py --compare logs/….log`），分数差 39/951099、最大连击完全相同。
     """
     slots = note_table(chart)
-    taps, grazes, judged = judge_taps(chart, result, slots)
+    fingers = Fingers(result)
+    heads: dict[int, HoldHead] = {}
+    taps, grazes, judged = judge_taps(
+        chart, result, slots, fingers=fingers, heads=heads
+    )
+    holds = judge_holds(slots, heads, fingers)
     others = judge_drags_and_flicks(result, slots)
     judged |= {slot.index for slot in slots if slot.kind in (NoteType.DRAG, NoteType.FLICK)}
+    judged |= {slot.index for slot in slots if slot.kind is NoteType.HOLD}
 
     missed = [
         Judgement(
@@ -582,6 +916,8 @@ def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: st
             at=slot.seconds + FLICK_MISS,
             delta=FLICK_MISS,
             pointer=-1,
+            above=slot.above,
+            index=slot.side_index,
         )
         for slot in slots
         if slot.index not in judged
@@ -591,6 +927,6 @@ def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: st
         plan=plan,
         chart=chart_name,
         notes=len(slots),
-        judgements=taps + others + missed,
+        judgements=taps + holds + others + missed,
         grazes=grazes,
     )

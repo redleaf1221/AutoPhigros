@@ -9,7 +9,7 @@ from pathlib import Path
 
 from algorithms.chart import Chart
 from algorithms.utils import PlanResult
-from storage import ChartRef, decode_plan, encode_plan, plan_path, save_chart
+from formats.storage import ChartRef, decode_plan, encode_plan, plan_path, save_chart
 import planner
 from .coverage import check_coverage
 

@@ -13,15 +13,29 @@
 
 from __future__ import annotations
 
+if __package__ in (None, ""):
+    # `python tests/cli.py` 这种跑法：脚本目录进的是 sys.path，项目根不在，于是
+    # `import algorithms` 立刻失败（相对 import 更是连父包都没有）。既然 `tests/__init__.py`
+    # 里承诺了"三种跑法都能跑"，这里就自己把根挂上、再以包的身份跑一遍。
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tests.cli import main as _main
+
+    raise SystemExit(_main())
+
 from algorithms import catalog
 
 from . import ROOT
-from .accounting import check_judge, check_result
+from .accounting import check_calibration, check_judge, check_result
 from .attach import check_attach
 from .console import check_console
 from .coverage import TOLERANCE, check_dwell
 from .liveness import check_liveness, check_shutdown
-from .runtime import check_cache, check_clock, check_gate, check_pixels, check_player
+from .referee import check_referee
+from .runtime import check_cache, check_clock, check_gate, check_log_file, check_pixels, check_player
+from .settings import check_config
 
 
 def _charts() -> list:
@@ -58,8 +72,12 @@ def main() -> int:
         ("存活探测自检", check_liveness()),
         ("收工自检", check_shutdown()),
         ("结算自检", check_result()),
+        ("延迟自校准自检", check_calibration()),
         ("判定对账自检", check_judge()),
+        ("裁判自检", check_referee()),
         ("在位时长自检", check_dwell()),
+        ("配置自检", check_config()),
+        ("日志自检", check_log_file()),
     ):
         print(f"{label}：" + ("通过" if not problems else "有问题"))
         for problem in problems:

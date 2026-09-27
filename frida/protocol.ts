@@ -102,6 +102,32 @@ export const NOTE_TABLE_METHOD = "SetInformation";
 export const LEVEL_RESULT_METHOD = "GetLevelResultInfo";
 
 /**
+ * 播放状态的总闸：``ProgressControl::Play(bool)``（``0x1d34270``）。
+ *
+ * 暂停菜单的每一条路都汇到它这里（反编译依据）：
+ *
+ * * ``Pause::Update`` 里 tag 为 ``"Resume"`` 的按钮 → ``Play(true)``；
+ * * 暂停动作（``Pause::Update`` 尾部 ``SetActive(false)`` + 0.5s 延时）→ ``Play(false)``；
+ * * 右上角手势 ``JudgeControl::CheckPause``（``0x1d20a38``）→ ``Play(false)``；
+ * * 开谱起播 ``ProgressControl::Update`` → ``Play(true)``。
+ *
+ * ``play == false`` 的实现体里做的是：``isPlaying = 0``、音量归零、``audioSource.Pause()``、
+ * 打开 ``pauseBar`` / ``pauseCamera``、把 Guide 的 Animator 速度设 0 —— 也就是说
+ * **游戏自己的时钟就是在这一刻停住的**。所以"暂停/恢复"这件事根本不需要主机去猜
+ * （不用看"多久没样本"），hook 直说。
+ */
+export const PLAY_METHOD = "Play";
+
+/**
+ * 这一局没了的唯一信号：``LevelControl::OnDestroy()``（``0x1d25118``）。
+ *
+ * 退出到选歌、重开这一关、结算之后清场，都会走到这里 —— 关卡对象被销毁。比"多久没收到
+ * 进度样本"可靠得多：那两者在样本上的差别只差一次抖动那么宽，而暂停时样本**照样每 100ms
+ * 来一次**（只是值不变）。
+ */
+export const LEVEL_DESTROY_METHOD = "OnDestroy";
+
+/**
  * 谱面镜像开关：``LevelStartInfo`` 上的属性 ``mirror``，取它的 getter。
  *
  * 为什么不用背后的字段：那是个自动属性，字段全名是 **``<mirror>k__BackingField``**，
@@ -244,6 +270,24 @@ export interface NoteIndexEvent {
     at: number;
 }
 
+/** ``ProgressControl::Play(bool)`` 的每一次调用：游戏自己在说"我停住了 / 我继续了"。 */
+export interface PlayStateEvent {
+    event: "play-state";
+    /** true = 起播或恢复，false = 暂停。 */
+    playing: boolean;
+    /** 调用这一刻游戏的 ``nowTime``（秒）—— 暂停时它就是"停在哪一秒"。 */
+    time: number | null;
+    at: number;
+}
+
+/** ``LevelControl::OnDestroy()``：这一局没了（退出到选歌 / 重开 / 结算清场）。 */
+export interface LevelGoneEvent {
+    event: "level-gone";
+    /** 调用这一刻游戏的 ``nowTime``，读不到就是 null。 */
+    time: number | null;
+    at: number;
+}
+
 /**
  * 一次判决。
  *
@@ -297,6 +341,8 @@ export type AgentEvent =
     | ReleasedEvent
     | NoteIndexEvent
     | ProgressEvent
+    | PlayStateEvent
+    | LevelGoneEvent
     | JudgeEvent
     | ResultEvent
     | WarnEvent;
