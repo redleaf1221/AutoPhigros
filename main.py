@@ -60,6 +60,7 @@ agent 在 ``ScoreControl::Perfect/Good/Bad/Miss`` 上都挂了号，每次判决
 
     python main.py                              # 启动游戏并注入（默认）
     python main.py --attach                     # 注入到已在运行的游戏
+    python main.py --pid 30501                  # 直接指定 pid（进程名对不上包名时用）
     python main.py --planner radical            # 换规划器
     python main.py --backend recording          # 换触控后端：不碰设备，只跑一遍调度器
     python main.py --save-chart                 # 顺便把谱面原文存下来
@@ -215,14 +216,21 @@ class Agent:
         options: Options | None = None,
         *,
         attach: bool = False,
+        target: int | str | None = None,
     ) -> None:
         """``device`` / ``options`` 可以不给 —— 只有在"只喂消息、不真的连设备"的场合
-        （``selftest.py`` 的闸门与结算自检）才这么用；真跑的时候 :meth:`start` 一定要有设备。
+        （``tests/`` 里的闸门与结算自检）才这么用；真跑的时候 :meth:`start` 一定要有设备。
+
+        ``target`` 是附加的目标：**pid 优先**（由 :meth:`Controller._resolve_target` 枚举出来），
+        给不出来才是名字。这不是洁癖：实测这台设备上 Phigros 的**进程名是 ``Phigros``**，
+        不是包名，按包名找永远找不到。
         """
         self.agent_path = agent_path
         self.device = device
         self.options = options if options is not None else Options()
         self.attach = attach
+        self.target: int | str = PACKAGE if target is None else target
+        """附加到谁：pid 或名字。"""
 
         self.ready = threading.Event()
         self.on_level_start: Callable[[LevelStart], None] | None = None
@@ -256,6 +264,12 @@ class Agent:
         self._ping: threading.Thread | None = None
         """正在等回答的那次探活。它没回来之前不再发第二次。"""
 
+    def target_text(self) -> str:
+        """日志里的目标写法：pid 就写 pid，名字就写名字。"""
+        return (
+            f"{PACKAGE} (pid={self.target})" if isinstance(self.target, int) else str(self.target)
+        )
+
     # ------------------------------------------------------------ 生命周期
 
     def start(self) -> None:
@@ -273,8 +287,8 @@ class Agent:
         assert self.device is not None, "没有设备就没法注入"
 
         if self.attach:
-            self._session = self.device.attach(PACKAGE)
-            log(f"[main] 已附加到 {PACKAGE}")
+            self._session = self.device.attach(self.target)
+            log(f"[main] 已附加到 {self.target_text()}")
         else:
             self.pid = self.device.spawn([PACKAGE])
             # 收工可能就落在这几百毫秒到几秒里（spawn 要等进程真起来）：那就不注入了
@@ -809,11 +823,16 @@ class Controller:
             log("[main] 未发现 USB 设备。检查 adb devices / frida-server，或用 -H 指定地址", file=sys.stderr)
             return False
         except frida.InvalidArgumentError as error:
-            log(
-                f"[main] 找不到这个设备：{error}（-D 要填 frida-ls-devices 里的那个 id；"
-                f"USB 下就是 adb 的序列号）",
-                file=sys.stderr,
-            )
+            # frida 17 在"一台设备都没有"时报的也是 InvalidArgumentError("device not found")，
+            # 与"-D 给的 id 不存在"是两回事，别把后者的话术套到前者头上
+            if "device not found" in str(error):
+                log("[main] 没找到设备：检查 adb devices 与 frida-server（或用 -H 指定地址）", file=sys.stderr)
+            else:
+                log(
+                    f"[main] 找不到这个设备：{error}（-D 要填 frida-ls-devices 里的那个 id；"
+                    f"USB 下就是 adb 的序列号）",
+                    file=sys.stderr,
+                )
             return False
         except frida.TransportError as error:
             log(f"[main] 与 frida-server 的通信中断：{error}", file=sys.stderr)
@@ -829,6 +848,10 @@ class Controller:
             self.start_agent(attach=self.args.attach)
         except FileNotFoundError as error:
             log(f"[main] {error}", file=sys.stderr)
+            return False
+        except frida.ProcessNotFoundError as error:
+            log(f"[main] 附加不上：{error}", file=sys.stderr)
+            self._report_candidates()
             return False
         except frida.TransportError as error:
             log(f"[main] 与 frida-server 的通信中断：{error}", file=sys.stderr)
@@ -850,10 +873,88 @@ class Controller:
             return frida.get_device(self.args.device_id)
         return frida.get_usb_device(timeout=10)
 
+    def _resolve_target(self) -> int | str:
+        """附加到谁：**先问应用列表，再问进程列表，最后才让 frida 自己按名字找**。
+
+        这个顺序是被实机教出来的。这台设备上 Phigros 的进程名是 ``Phigros``（应用标签），
+        不是包名 —— ``enumerate_processes()`` 里根本没有 ``com.PigeonGames.Phigros`` 那一条，
+        于是 ``device.attach(PACKAGE)`` 报 ``ProcessNotFoundError: unable to find process with
+        name 'com.PigeonGames.Phigros'``，而游戏明明开着。``enumerate_applications()`` 是从
+        包管理器拿的（identifier → pid），root 看不到别的进程时它照样有 —— 所以它排第一。
+
+        进程名那一层也留着，一是有些设备上它确实是包名，二是 ``--attach`` 也可能想附加一个
+        不是"应用"的进程（Unity 还可能跑在 ``包名:xxx`` 的子进程里，所以有前缀匹配）。
+        """
+        if self.args.pid is not None:
+            return int(self.args.pid)
+        device = self._device
+        assert device is not None
+
+        try:
+            for app in device.enumerate_applications():
+                if app.identifier == PACKAGE and app.pid:
+                    log(f"[main] 应用列表里找到 {app.name or PACKAGE}（pid={app.pid}）")
+                    return int(app.pid)
+        except Exception as error:  # noqa: BLE001 - 拿不到应用列表不该挡住后面两条路
+            log(f"[main] 读应用列表失败：{type(error).__name__}: {error}", file=sys.stderr)
+
+        processes: list[Any] = []
+        try:
+            processes = list(device.enumerate_processes())
+        except Exception as error:  # noqa: BLE001
+            log(f"[main] 读进程列表失败：{type(error).__name__}: {error}", file=sys.stderr)
+
+        for matcher in (lambda p: p.name == PACKAGE, lambda p: p.name.startswith(PACKAGE)):
+            for process in processes:
+                if matcher(process):
+                    log(f"[main] 进程列表里找到 {process.name}（pid={process.pid}）")
+                    return int(process.pid)
+
+        log(f"[main] 应用与进程列表里都没有 {PACKAGE}，交给 frida 按名字找", file=sys.stderr)
+        return PACKAGE
+
+    def _report_candidates(self) -> None:
+        """附加失败时把 frida 现在**看得见**的东西列出来。
+
+        报错只写 "unable to find process with name X" 是不够的：看不清是"枚举被挡"、
+        "名字对不上"还是"进程真没了"。列一次之后，下一次它就自己说明白了。
+        """
+        device = self._device
+        if device is None:
+            return
+        try:
+            running = [(app.identifier, app.pid, app.name) for app in device.enumerate_applications() if app.pid]
+        except Exception as error:  # noqa: BLE001
+            log(f"[main] 读应用列表也失败了：{error}", file=sys.stderr)
+            running = []
+        if running:
+            log(f"[main] frida 现在看得见的应用（{len(running)} 个）：", file=sys.stderr)
+            for identifier, pid, name in running[:20]:
+                log(f"       {pid:>6}  {identifier}  ({name})", file=sys.stderr)
+            if len(running) > 20:
+                log(f"       …还有 {len(running) - 20} 个", file=sys.stderr)
+        try:
+            processes = list(device.enumerate_processes())
+        except Exception as error:  # noqa: BLE001
+            log(f"[main] 读进程列表也失败了：{error}", file=sys.stderr)
+            return
+        likely = [p for p in processes if "higi" in p.name or "igeon" in p.name]
+        log(
+            f"[main] 进程列表里名字像它的：{[f'{p.name} ({p.pid})' for p in likely] or '一个都没有'}"
+            f"（共 {len(processes)} 个进程）",
+            file=sys.stderr,
+        )
+        log(
+            "[main] 名字对不上时用 --pid 直接指定，例如：main.py --attach --pid "
+            f"{running[0][1] if running else 0}",
+            file=sys.stderr,
+        )
+
     def start_agent(self, *, attach: bool) -> None:
         """（重新）注入一次。设备已经找好了，这里只管会话。"""
         assert self._device is not None
-        agent = Agent(AGENT, self._device, self.options, attach=attach)
+        target = self._resolve_target() if attach else None
+        agent = Agent(AGENT, self._device, self.options, attach=attach, target=target)
         self.agent = agent
         agent.start()
         self._await_ready(agent)
@@ -1166,6 +1267,12 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--spawn", action="store_true", help="启动游戏并注入（默认）")
     mode.add_argument("--attach", action="store_true", help="注入到已在运行的游戏")
+    mode.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="附加到这个 pid（等同 --attach，但跳过名字查找；名字对不上时用它）",
+    )
     parser.add_argument("-H", "--host", default=None, help="远程 frida-server，如 192.168.1.10:27042")
     parser.add_argument(
         "-D",
@@ -1202,7 +1309,10 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="注入链路的手工补偿（秒），正数=提前发；跟着游戏时钟走剩下不用管（默认 0，控制台可改）",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --pid 就是"附加，而且别再按名字找"：归一化成 --attach，下游只认一个开关
+    args.attach = args.attach or args.pid is not None
+    return args
 
 
 def main() -> int:

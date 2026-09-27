@@ -45,7 +45,7 @@ npm run build          # esbuild frida/index.ts --bundle --outfile=./target/_.js
 
 没构建过 `target/_.js` 就 `python main.py` 会直接告诉你"先构建"。
 
-## 四个入口
+## 入口
 
 ```sh
 conda activate auto_phigros
@@ -53,6 +53,7 @@ conda activate auto_phigros
 # 主干：注入游戏；每次开谱游戏会停在闸门上，规划完自动放行，然后跟着游戏时钟打
 python main.py
 python main.py --attach                     # 注入到已在运行的游戏
+python main.py --pid 30501                  # 直接指定 pid（名字对不上时用，见"环境要求"）
 python main.py --planner radical            # 换规划器
 python main.py --backend recording          # 换触控后端：不碰设备，整条链照样跑一遍
 python main.py --no-cache                   # 不吃也不写规划缓存
@@ -77,6 +78,14 @@ python touch.py plans/x.psap --backend recording   # 不连设备，只跑调度
 python render.py plans/0002_..._conservative.psap
 python render.py plans/x.psap --size 1280x720 --fps 30 --background chroma
 python render.py plans/x.psap --no-paths --point-color "#00ff88" --point-radius 12
+
+# 算法体检：按**游戏真实的判定规则**把规划重放一遍，报丢音、蹭键、判定分布与分数
+# （和 selftest 分工：那边抓代码 bug，这边揪算法问题；慢，而且谱面越多越慢）
+python judge.py
+python judge.py --planner geometric
+python judge.py --chart Dlyrotz
+python judge.py --plan plans/x.psap -v
+python judge.py --json out.json
 ```
 
 **落盘的规划结果就是缓存**：一张谱面 + 一个规划器对应一个 `.psap`，下次同样的组合
@@ -147,23 +156,31 @@ python render.py plans/0002_..._conservative.psap
 
 颜色写 `#rrggbb`、`rrggbb`、`#rgb`、`r,g,b` 或颜色名（`red` / `green` / `chroma` / `blue` …）。
 
-## 自检
+## 自检与体检
 
 ```sh
-python selftest.py
+python selftest.py     # 代码有没有 bug —— 5 秒，与 charts/ 里几张谱无关
+python judge.py        # 算法有没有问题 —— 逐张谱 × 每个规划器，慢
 ```
 
-不连设备也能跑，用的就是 `charts/` 里已采集的谱面。对每张谱 × 每个规划器查五件事：
-**事件流自洽**（指针 DOWN/UP 配对、时间有序）、**覆盖完整**（每个音符被判的那一刻
-确实有手指在容差内，Tap/Hold 头判与 Drag/Flick 分开判）、**存得回去**（`.psap`
-编解码往返一致）、**镜像也对**（把规划结果翻过来，拿去对按 `Chart::Mirror` 规则镜像
-出来的谱面）、**滑键起手**（每个 flick 在游戏那套 `CheckFlick` 规则下都点得亮）。
+分工是刻意的：`selftest.py` 只在"代码本身可能错"的地方报警（闸门放不放行、时钟会不会
+偏早、播放器排期、控制台回显、收工、附加目标的解析…），**不逐张谱做规划**（唯一用到谱面
+的是缓存自检，只挑最小那张）——谱面一多它就会慢到没人愿意跑，而"算法漏了一个音符"本来
+就该由另一条线来报。
 
-再往外还有十一组"整条链上下游"的自检：闸门、时钟、坐标换算、缓存、播放器、控制台、
-存活探测、收工、结算、判定对账、在位时长。每组的判据、以及它们各自做过哪些变异测试，
-写在 [impl.md](impl.md#自检)。
+`judge.py` 是那条线：把规划按游戏真实的判定规则（窗口、容差、扫描窗、hold 结算提前量，
+全部出自 [impl.md](impl.md#自检) 里那份逆向报告）重放一遍，另外还跑原有的那五项判据
+（**事件流自洽**、**覆盖完整**、**存得回去**、**镜像也对**、**滑键起手**），并报
 
-`charts/` 空着的时候它只会跳过规划相关的部分（退出码 2）。全绿才动设备。
+* **丢音** —— 哪些音符一次判定都没碰到；
+* **蹭键** —— 一次不是为某个音符按下的动作把它判掉了，并区分"计划本来按对了却被先碰掉
+  （纯丢分）"与"计划本来也没按到"；
+* **判定分布与分数** —— `900000 × acc + 100000 × maxCombo / N`，拿实机那局对过账（1156
+  音符 / 1152 Perfect / 2 Good / 连击 613 → 950926 分，与游戏报的一分不差）。
+
+`selftest.py` 里另有十二组"整条链上下游"的检查：闸门、时钟、坐标换算、缓存、播放器、
+控制台、附加目标、存活探测、收工、结算、判定对账、在位时长。每组的判据、以及它们各自
+做过哪些变异测试，写在 [impl.md](impl.md#自检)。`charts/` 空着时缓存自检会跳过。
 
 ## 输出
 
@@ -213,6 +230,30 @@ SELinux 拦截（`dmesg` 里 `u:r:ksu:s0` 域零拒绝）、Frida Launcher 的�
 
 测试设备：OnePlus CPH2491，Android 15（API 35），arm64，KernelSU。
 
+### `attach` 说找不到进程，可游戏明明开着
+
+**进程名不等于包名。** 实测（2026-09-27，OPPO/MTK 那台）：
+
+```
+enumerate_processes()      → (30501, 'Phigros')               ← 进程名是应用标签
+enumerate_applications()   → ('com.PigeonGames.Phigros', 30501)  ← 包名在这里
+device.attach('com.PigeonGames.Phigros')  → ProcessNotFoundError: unable to find process ...
+```
+
+所以 `--attach` 的解析顺序是：**先问应用列表（包管理器给的 identifier → pid），再问进程列表
+（精确名 → `包名:子进程` 前缀），最后才交给 frida 按名字找**。两条路都走不通时，它会把
+frida 当前看得见的应用与"名字像它的"进程列出来，并提示用 `--pid`：
+
+```sh
+python main.py --attach --pid 30501
+```
+
+要自己看一眼现场，跑：
+
+```sh
+python -c "import frida; d=frida.get_usb_device(); print([(p.pid,p.name) for p in d.enumerate_processes()]); print([(a.identifier,a.pid) for a in d.enumerate_applications() if a.pid])"
+```
+
 ## 目录一览
 
 ```
@@ -225,9 +266,11 @@ auto_phigros/
   planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
   touch.py          触控模块：时钟、调度器、命令行，可单独运行
   render.py         可视化：把 .psap 渲染成视频
+  judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
   storage.py        .psap 编解码 + 落盘
-  selftest.py       不连设备也能跑的自检
-  algorithms/       规划算法与契约（registry 按名字现 import）
+  selftest.py       薄入口：代码自检（真正的东西在 tests/ 里）
+  tests/            自检包：判据、替身与入口（详见 tests/__init__.py）
+  algorithms/       规划算法与契约（registry 按名字现 import）；judging.py 是判定规则唯一出处
   backends/         触控后端（scrcpy / recording）
   charts/ plans/ renders/   采集到的谱面 / 规划结果=缓存 / 渲染出来的视频
 ```
