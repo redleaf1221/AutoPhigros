@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT / "config.json"
 """落盘配置的位置。"""
 
-AGENT = ROOT / "target" / "_.js"
+AGENT = ROOT / "frida" / "target" / "_.js"
 """frida agent（`npm run build` 的产物）。"""
 
 CHARTS_DIR = ROOT / "charts"
