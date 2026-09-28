@@ -2,34 +2,14 @@
 """运行时控制台 —— **它就是主干**。
 
 ``main.py`` 起完后台件就把主线程交给这里：读一行、执行一行，直到 ``quit`` / ``exit`` /
-Ctrl+C。所以：
+Ctrl+C。所以 Ctrl+C 天然落在读输入那条线程上，与 ``quit`` 走同一条收工路。
 
-* **Ctrl+C 天然落在读输入的那条线程上** —— 它和 ``quit`` 走同一条收工路（``Controller.stop``），
-  不存在"信号撞在别的线程身上、看着像没反应"这种事；
-* **空读不等于退出**。终端上读到空行多半是一次被中止的读（窗口尺寸变化、控制台事件），
-  接着读就是；只有真正到了输入末尾（管道里的 EOF）才"停靠"—— 待机、不再读，但**不退出**，
-  因为退出意味着你没有面板可用了。
-
-它只认一个 :class:`~controller.Controller`：命令表就在这个文件里，每条命令只干一件事，
-参数怎么解析也在命令自己身上（``latency`` 认 ``0.02`` 也认 ``20ms`` 和 ``+5ms``）。
-会"记住"的命令（planner / latency / backend / cache / save-chart / device / host）改完当场
-落盘进 ``config.json``。
-
-回显这件事比看着要紧
---------------------
-三条规矩，都是为了"输入之后一定有反应"：
-
-1. **主干与 agent 的输出全都走 :func:`log`** —— 它是进程里唯一的写者，一整行不会被别的
-   线程插花；
-2. **提示符被输出顶掉就补回来** —— agent 每 100ms 就可能在打印，而 ``auto> `` 一旦写在
-   屏幕上就留在那儿了，直接 ``print`` 会接在它后面，看起来就是"提示符没了"。所以打印前
-   先用 ``\\r`` + 空格把那行擦掉，打印完再画一遍；
-3. **每条命令都要说话，包括"看不懂"和"没这个命令"** —— 控制台是运行时唯一的面板，
-   它沉默的时候人分不清是"命令没生效"还是"程序卡住了"。
-
-stdin 不是终端（管道 / 重定向）时**照样读**，并把命令自己回显出来（``auto> status``）
-好让日志能对上。这里踩过一次坑：原先"不是终端就一声不吭把自己关掉"，于是敲什么都没反应、
-连提示符都没有 —— 宁可多说一句，也不要安静地不干活。
+* **空读不等于退出**：终端上读到空行多半是一次被中止的读，接着读就是；只有真正到了输入
+  末尾（管道 EOF）才停靠 —— 待机、不再读，但不退出，因为退出意味着你没有面板可用了；
+* **每条命令都要说话**，包括"看不懂"和"没这个命令"：控制台沉默的时候，人分不清是命令
+  没生效还是程序卡住了；
+* **会记住的命令改完当场落盘**进 ``config.json``（planner / option / latency / backend /
+  cache / save-chart / log / device / host）。
 """
 
 from __future__ import annotations
@@ -37,11 +17,11 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import backends
-from algorithms import catalog
-from .config import CHARTS_DIR, log_file_path
+from algorithms import catalog, parameters, parse_option, validate
+from .config import log_file_path
 from .output import log, log_path, log_to_file, set_prompt_hooks, stop_file_log
 
 if TYPE_CHECKING:
@@ -73,7 +53,7 @@ def _devices(controller: Controller, argv: list[str]) -> None:
 
 
 def _device(controller: Controller, argv: list[str]) -> None:
-    """看 / 换选中的设备（记住）。"""
+    """看 / 换选中的设备。"""
     if not argv:
         current = controller.config.device
         if current is None:
@@ -120,14 +100,56 @@ def _planner(controller: Controller, argv: list[str]) -> None:
         return
     controller.options.planner = name
     controller.persist()
-    log(f"规划器 -> {name}（下一关生效，已记住）")
+    log(f"规划器 -> {name}（下一关生效）")
+
+
+def _option(controller: Controller, argv: list[str]) -> None:
+    """看 / 改当前规划器的参数。改了写进 ``config.json``，那份缓存随之失效。"""
+    name = controller.options.planner
+    stored = controller.config.planner_options.get(name, {})
+    if not argv:
+        log(f"{name} 的参数（= 号后面是当前值）：")
+        for item in parameters(name):
+            current = stored.get(item.name, item.default)
+            mark = " *" if item.name in stored else ""
+            log(f"  {item.name:<22} = {current!r:<8}{mark} {item.help}")
+        log(f"{len(stored)} 个改过（*）；改：option <名字> <值>，还原：option <名字> reset")
+        return
+    if len(argv) < 2:
+        log("用法：option <名字> <值>（或 option <名字> reset）；不带参数看清单")
+        return
+    key, value = argv[0], argv[1]
+    defaults: dict[str, Any] = {item.name: item.default for item in parameters(name)}
+    if key not in defaults:
+        log(f"{name} 没有 {key} 这个参数（打一个不带参数的 option 看清单）")
+        return
+    if value.strip().lower() == "reset":
+        stored.pop(key, None)
+        if not stored:
+            controller.config.planner_options.pop(name, None)
+        controller.persist()
+        log(f"{name}.{key} -> {defaults[key]!r}")
+        return
+    overrides = controller.config.planner_options.setdefault(name, {})
+    had, previous = key in overrides, overrides.get(key)
+    try:
+        overrides[key] = parse_option(value)
+        validate(name, overrides)  # 借规划器自己的参数表校验：名字、类型都在这里挡下来
+    except ValueError as error:
+        if had:
+            overrides[key] = previous
+        else:
+            overrides.pop(key, None)
+        log(f"改不了：{error}")
+        return
+    controller.persist()
+    log(f"{name}.{key} -> {overrides[key]!r}（下一关生效）")
 
 
 def _latency(controller: Controller, argv: list[str]) -> None:
     """看或改注入补偿。支持 ``0.02`` / ``20ms`` / ``+5ms``（增减）/ ``auto on|off``。
 
-    **手动给数就把自校准关掉**：人一旦自己定了这个值，说明他知道得比统计多（换设备、
-    换连接方式、或者正在排别的问题），这时候机器每局偷偷改回去最烦人。
+    手动给数就把自校准关掉：人一旦自己定了这个值，说明他知道得比统计多。
     """
     options = controller.options
     auto = "开" if controller.config.auto_latency else "关"
@@ -143,9 +165,7 @@ def _latency(controller: Controller, argv: list[str]) -> None:
             return
         controller.config.auto_latency = value
         controller.persist()
-        log(
-            f"延迟自校准 -> {'开' if value else '关'}（每局打完按 Perfect 中位数调手工补偿，已记住）"
-        )
+        log(f"延迟自校准 -> {'开' if value else '关'}")
         return
 
     text = argv[0].strip().lower()
@@ -164,8 +184,8 @@ def _latency(controller: Controller, argv: list[str]) -> None:
     controller.config.auto_latency = False
     controller.persist()
     log(
-        f"手工补偿 -> {options.latency * 1000:+.0f}ms（下一个事件起生效，已记住）"
-        + ("；延迟自校准顺手关掉了（你给了数，就不再让机器改）" if was_auto else "")
+        f"手工补偿 -> {options.latency * 1000:+.0f}ms（下一个事件起生效）"
+        + ("；自校准关掉了" if was_auto else "")
     )
 
 
@@ -184,10 +204,10 @@ def _backend(controller: Controller, argv: list[str]) -> None:
     controller.config.backend = name
     controller.persist()
     if controller.agent is None:
-        log(f"触控后端 -> {name}（下次注入时起，已记住）")
+        log(f"触控后端 -> {name}（下次注入时起）")
         return
     controller.open_backend(name)
-    log(f"触控后端 -> {name}（已重开，已记住）")
+    log(f"触控后端 -> {name}（已重开）")
 
 
 def _cache(controller: Controller, argv: list[str]) -> None:
@@ -198,7 +218,8 @@ def _cache(controller: Controller, argv: list[str]) -> None:
         return
     controller.config.cache = value
     controller.persist()
-    log(f"缓存 -> {'开' if value else '关（既不吃也不写）'}（已记住）")
+    log(f"缓存 -> {'开' if value else '关'}")
+
 
 
 def _save_chart(controller: Controller, argv: list[str]) -> None:
@@ -209,7 +230,7 @@ def _save_chart(controller: Controller, argv: list[str]) -> None:
         return
     controller.config.save_chart = value
     controller.persist()
-    log(f"存谱面 -> {'开' if value else '关'}（存到 {CHARTS_DIR.name}/，已记住）")
+    log(f"存谱面 -> {'开' if value else '关'}")
 
 
 def _log(controller: Controller, argv: list[str]) -> None:
@@ -222,13 +243,13 @@ def _log(controller: Controller, argv: list[str]) -> None:
     controller.config.log = value
     controller.persist()
     if not value:
-        # 先说再关：让日志文件的最后一行是"日志到此为止"——事后翻它的人该知道它是被关掉的
-        log("日志 -> 关（屏幕上照旧，只是不再落盘；已记住）")
+        # 先说再关：让日志文件的最后一行是"日志到此为止"
+        log("日志 -> 关（屏幕上照旧）")
         stop_file_log()
         return
     path = log_file_path()
     if log_to_file(path):
-        log(f"日志 -> 开：{path}（已记住）")
+        log(f"日志 -> 开：{path}")
     else:
         log(f"日志建不起来（{path}），仍只写屏幕", file=sys.stderr)
 
@@ -241,36 +262,33 @@ def _host(controller: Controller, argv: list[str]) -> None:
         log("加一个：host add 192.168.1.10:27042")
         return
     if argv[0] != "add" or len(argv) < 2:
-        log("用法：host add 192.168.1.10:27042（不带参数看已记住的）")
+        log("用法：host add 192.168.1.10:27042（不带参数看已保存的）")
         return
     controller.add_host(argv[1])
 
 
 def _inject(controller: Controller, argv: list[str]) -> None:
-    """开关"是否真的把触控发给设备"（**只在这次会话里有效**）。"""
+    """开关"是否真的把触控发给设备"（只在这次会话里有效）。"""
     value = _switch(argv)
     if value is None:
         log(f"触控注入现在是 {'开' if controller.options.inject else '关'}；用法：inject on|off")
         return
     controller.options.inject = value
-    if value:
-        log("触控注入 -> 开")
-    else:
-        log("触控注入 -> 关（照常排期与计时，只是不碰设备；不落盘）")
+    log(f"触控注入 -> {'开' if value else '关（照常排期与计时，不碰设备）'}")
 
 
 def _verbose(controller: Controller, argv: list[str]) -> None:
-    """开关"是否把每一个 Perfect 也打出来"（**只在这次会话里有效**）。"""
+    """开关"是否把每一个 Perfect 也打出来"（只在这次会话里有效）。"""
     value = _switch(argv)
     if value is None:
         log(f"判定流水现在是 {'开' if controller.options.verbose else '关'}；用法：verbose on|off")
         return
     controller.options.verbose = value
-    log(f"判定流水（含 Perfect）-> {'开' if value else '关'}（不落盘）")
+    log(f"判定流水（含 Perfect）-> {'开' if value else '关'}")
 
 
 def _detach(controller: Controller, argv: list[str]) -> None:
-    """断开注入：设备与触控后端**留着**，之后还能 attach / spawn 接回来。"""
+    """断开注入：设备与触控后端留着，之后还能 attach / spawn 接回来。"""
     controller.detach()
 
 
@@ -279,34 +297,30 @@ def _status(controller: Controller, argv: list[str]) -> None:
     for line in lines:
         log(line)
     if not lines:
-        # 空白回显是最难查的一种"没反应"：宁可报"这本身就不对"，也不要什么都不说
-        log("[状态] 一个字都没拿到 —— 这本身就不对，检查 Controller.status_lines")
+        log("[状态] 一个字都没拿到 —— 检查 Controller.status_lines")
 
 
 def _quit(controller: Controller, argv: list[str]) -> None:
-    """收工。拆除是**当场**做的（可能要好几百毫秒到几秒），不是给主干留个标志就走。
-
-    和 Ctrl+C 落到同一件事上（``Controller.stop``）：请求主干停手、unload 脚本、detach
-    会话、停播放器、关后端。
-    """
+    """收工。拆除是当场做的（可能要好几百毫秒到几秒），和 Ctrl+C 落到同一件事上。"""
     log("收工：断开注入、停掉触控")
     controller.stop()
 
 
 COMMANDS: tuple[Command, ...] = (
     Command("devices", "devices", "列出设备（USB、本机、远程 server）", _devices),
-    Command("device", "device <id>", "选中一台设备（记住）", _device),
+    Command("device", "device <id>", "选中一台设备", _device),
     Command("spawn", "spawn", "在选中的设备上启动游戏并注入", _spawn),
     Command("attach", "attach [pid]", "附加到已经在跑的游戏（pid 可选）", _attach),
     Command("detach", "detach", "断开注入（设备与后端留着，可再 attach）", _detach),
     Command("status", "status", "现在什么情况：设备、agent、后端、时钟、这一局", _status),
-    Command("planner", "planner [名字]", "看可用规划器 / 换一个（下一关生效，记住）", _planner),
-    Command("latency", "latency [值]", "看 / 改注入补偿：0.02、20ms、+5ms（记住）", _latency),
-    Command("backend", "backend [名字]", "看 / 换触控后端（换了当场重开，记住）", _backend),
-    Command("cache", "cache on|off", "把 plans/ 里的规划当缓存用（记住）", _cache),
-    Command("save-chart", "save-chart on|off", "顺便把谱面原文存到 charts/（记住）", _save_chart),
-    Command("log", "log on|off", "把输出抄一份到 logs/（记住）", _log),
-    Command("host", "host add <地址>", "加 / 看远程 frida-server（记住）", _host),
+    Command("planner", "planner [名字]", "看可用规划器 / 换一个（下一关生效）", _planner),
+    Command("option", "option [名字 值]", "看 / 改当前规划器的参数（下一关生效）", _option),
+    Command("latency", "latency [值]", "看 / 改注入补偿：0.02、20ms、+5ms", _latency),
+    Command("backend", "backend [名字]", "看 / 换触控后端（换了当场重开）", _backend),
+    Command("cache", "cache on|off", "把 plans/ 里的规划当缓存用", _cache),
+    Command("save-chart", "save-chart on|off", "顺便把谱面原文存到 charts/", _save_chart),
+    Command("log", "log on|off", "把输出抄一份到 logs/", _log),
+    Command("host", "host add <地址>", "加 / 看远程 frida-server", _host),
     Command("inject", "inject on|off", "是否真的把触控发给设备（仅本次会话）", _inject),
     Command("verbose", "verbose on|off", "是否把每一个 Perfect 也打出来（仅本次会话）", _verbose),
     Command("help", "help", "列出这些命令", lambda controller, argv: _help()),
@@ -363,8 +377,8 @@ class Console:
         try:
             self._loop()
         finally:
-            # 循环一走就把提示符那两个钩子摘掉：登记与"控制台还在跑"必须是同一件事，
-            # 否则收工之后别人打印还会去擦、去画一个早就没人等的提示符。
+            # 提示符钩子与"控制台还在跑"必须是同一件事：摘晚了，收工之后别人打印
+            # 还会去擦、去画一个没人等的提示符。
             self._waiting = False
             set_prompt_hooks()
 
@@ -421,16 +435,11 @@ class Console:
             self.execute(line)
 
     def _park(self, *, reason: str) -> None:
-        """输入到头了：**待机，不退出**。
+        """输入到头了：**待机，不退出**（退出意味着人没有面板可用了）。
 
-        没有输入了不等于该收工 —— 退出意味着人没有面板可用了（"没有 console 我用什么"）。
-        所以这里只是不再读，主干与 agent 照常跑，``quit`` 得从别处给（另一条命令、或者
-        Ctrl+C）。
+        不再读输入，主干与 agent 照常跑；``quit`` 得从别处给（另一条命令、或者 Ctrl+C）。
         """
-        log(
-            f"[main] {reason}（EOF），控制台进入待机：不再读输入，但**不退出** —— "
-            f"主干照常跑，要收工就按 Ctrl+C"
-        )
+        log(f"[main] {reason}（EOF），控制台进入待机：不再读输入，按 Ctrl+C 收工")
         while not self.controller.stopping:
             time.sleep(PARK_POLL)
 

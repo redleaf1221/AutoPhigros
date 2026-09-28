@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""把一次运行的日志读回来：设备**实际**判了什么，以及游戏自己记的账目。
+"""把一次运行的日志读回来：设备实际判了什么，以及游戏自己记的账目。
 
-为什么要有它：``judge.py`` 的裁判是在主机上把规划重放一遍，它准不准只能拿设备对 ——
-而"标准答案"就在 ``logs/`` 里。每条 ``[judge]`` 都带着音符身份（线 / 上下 / 第几个）、
-早晚量、判定时刻，末尾还有游戏自己的 ``[result]``：分数、四个判定计数、最大连击。
-有了这份还原，``judge.py --compare <日志>`` 就能**逐音符**说出裁判和游戏在哪里不一致，
-而不必靠人肉对总数去猜"到底哪几个音符错了"。
-
-日志里没有的东西一样都不编：认不出的行直接跳过并计数（``skipped``），让人看得见
-"这份日志里有多少条我没读懂"，而不是悄悄少算几个音符。
+``judge.py`` 的裁判准不准只能拿设备对，而"标准答案"就在 ``logs/`` 里：每条 ``[judge]``
+带着音符身份（线 / 上下 / 第几个）、早晚量、判定时刻，末尾还有 ``[result]`` 的分数与计数。
+认不出的行跳过并计数（``skipped``），不悄悄少算几个音符。
 """
 
 from __future__ import annotations
@@ -24,7 +19,9 @@ JUDGE_RE = re.compile(
     r"(?:\s+(?P<side_time>[早晚])\s*(?P<ms>\d+)ms|\s+判定于\s*(?P<at>\d+\.\d+)s)?"
 )
 
-CHART_RE = re.compile(r"^\[chart #\d+\]\s+已保存\s+(?P<name>\S+\.json)")
+# 后缀认两种：日志是当时的记录，谱面存成 npz 之前记的是 `.json` 名字。这里只认名字，
+# 落到 charts/ 里找的是现在的文件（按 stem 对，见 judge.compare）。
+CHART_RE = re.compile(r"^\[chart #\d+\]\s+已保存\s+(?P<name>\S+\.(?:json|npz))")
 PLAN_RE = re.compile(r"^\[plan #\d+\]\s+(?P<planner>[\w-]+):")
 LATENCY_RE = re.compile(r"手工补偿\s*(?P<value>[+-]?\d+(?:\.\d+)?)ms")
 RESULT_RE = re.compile(
@@ -49,7 +46,7 @@ class DeviceJudge:
     x: float
     code: int
     delta: float | None = None
-    """早为正？不 —— 与游戏一致：**晚为正**。"早 187ms" 记成 -0.187。"""
+    """与游戏一致：**晚为正**（"早 187ms" 记成 -0.187）。"""
     at: float | None = None
     """Miss 没有早晚量，只有判定时刻。"""
 
@@ -73,16 +70,13 @@ class DeviceRun:
     planner: str | None = None
     """这一局用的规划器（``[plan #…] <名字>:``）。"""
     latency: float | None = None
-    """那一局的**手工补偿**（秒，从 ``[main] 就绪 —— … 手工补偿 +0ms`` 读）。
-
-    对账时必须用它重放：计划里的落点是"音符自己那一时刻的判定点"，补偿没抵掉处理延迟时
-    落点就会偏（Credits IN 上 11 个丢音全是这么来的）。不填等于拿理想送达去解释实机结果。
-    """
+    """那一局的手工补偿（秒）。对账时要用它重放：计划里的落点是"音符自己那一刻的判定点"，
+    补偿没抵掉处理延迟时那个落点就是偏的。"""
     judges: dict[tuple[int, bool, int], DeviceJudge] = field(default_factory=dict)
     result: dict[str, float | int] = field(default_factory=dict)
     """``score`` / ``percent`` / ``maxCombo`` / 四个计数；读不到的键就不在。"""
     skipped: int = 0
-    """看着像判定、但认不出音符身份的行数（诚实计数，不悄悄吞掉）。"""
+    """看着像判定、但认不出音符身份的行数。"""
 
     @property
     def counts(self) -> dict[str, int]:

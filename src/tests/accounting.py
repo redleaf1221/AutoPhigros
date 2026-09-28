@@ -10,13 +10,12 @@ from pathlib import Path
 def check_judge() -> list[str]:
     """判定对账自检：``delta`` 与 ``nowTime − realTime`` 必须对得上。
 
-    这三个数来自三处 —— 游戏判决时算的早晚量、游戏当时的 ``nowTime``、我们从音符表抄来的
-    ``realTime``，它们之间有个恒等式。表抄错了在这里就该露馅，而不必等到"Miss 出现在一个
-    不可能的时刻"再靠人眼看出来（真出过一次：表建早了，``realTime`` 全是 0，
-    89.969 秒判掉的音符被记成 "@ 0.000s"）。
+    两个数分别来自游戏判决时算的早晚量与我们从音符表抄来的 ``realTime``，它们之间有个
+    恒等式；表抄错了在这里就该露馅，而不是等到"Miss 出现在一个不可能的时刻"再靠人眼发现。
     """
     problems: list[str] = []
     try:
+        # 这一摞 import 本身就是检查：入口那几个模块能不能一起 import 起来（frida 没装就跳过）
         from runtime import agent as agent_module
         from runtime import config
         from runtime import controller as controller_module
@@ -65,8 +64,7 @@ def check_judge() -> list[str]:
     expect("差 +89.969s" in stale or "89.969" in stale, f"抱怨里没说清差了多少：{stale.strip()!r}")
     expect(agent.judge_mismatches == 1, f"账不平的条数不对：{agent.judge_mismatches}")
 
-    # 4) 对不上账的**每一条**都要报（原先"同类只报一次"：知道有 8 条对不上，
-    #    却不知道是哪 8 条、各自差多少 —— 那诊断不了任何东西）
+    # 4) 对不上账的**每一条**都要报，带序号、带是哪个音符
     again = judge(time=89.969, note=dict(note, time=0.0))
     expect("对不上账" in again, "第二条同类问题也该当场报出来，不许省略")
     expect("警告 #2" in again, f"每条都该带上序号：{again.strip()!r}")
@@ -82,8 +80,7 @@ def check_judge() -> list[str]:
     # 6) 查不到音符（表里没有它）时不该乱报账不平
     expect("对不上账" not in judge(note=None), "没有音符可查时不该报账不平")
 
-    # 7) Hold 的收尾判决：早晚量是从"按住结束 − 0.22s"量的，不是从头量的 ——
-    #    拿头判的恒等式去对，每条 hold 都会被冤枉（实测 Dlyrotz HD 上正好冤枉了那 8 个 hold）
+    # 7) Hold 的收尾判决：早晚量是从"按住结束 − 0.22s"量的，不是从头量的
     hold_note = dict(note, type=3, time=10.0, hold=2.416)
     settle = 10.0 + 2.416 - agent_module.HOLD_SETTLE_LEAD
     agent.judge_mismatches = 0  # noqa: SLF001
@@ -91,14 +88,13 @@ def check_judge() -> list[str]:
     expect("对不上账" not in text, f"Hold 的收尾判决被冤枉了：{text.strip()!r}")
     expect(agent.judge_mismatches == 0, "Hold 的合法收尾不该计成账不平")
 
-    # 8) Miss 可以**早于** realTime：手指一直没碰、hold 中途松手都会这样。
-    #    下界原先只有 0.05（等于"早一点点都不行"），这类正常的 Miss 全被当成"表抄错了"。
+    # 8) Miss 可以**早于** realTime：手指一直没碰、hold 中途松手都会这样（下界见 MISS_EARLY）
     for early in (0.05, 0.15, 0.2):
         agent.judge_mismatches = 0  # noqa: SLF001
         text = judge(time=89.969 - early)
         expect("对不上账" not in text, f"早 {early}s 的 Miss 被冤枉了：{text.strip()!r}")
 
-    # 8) 但 Hold 的**头判**照样要认（同一条恒等式，参考点是音符时刻）
+    # 8') 但 Hold 的**头判**照样要认（同一条恒等式，参考点是音符时刻）
     text = judge(kind="Perfect", delta=0.010, time=10.010, note=hold_note)
     expect("对不上账" not in text, f"Hold 的头判被冤枉了：{text.strip()!r}")
 
@@ -110,15 +106,10 @@ def check_judge() -> list[str]:
 
 
 def check_calibration() -> list[str]:
-    """延迟自校准：拿这一局 Perfect 的**中位数**调手工补偿，而且要守三条规矩。
+    """延迟自校准：拿这一局 Perfect 的中位数调手工补偿，四条规矩都得是硬的。
 
-    为什么要钉住：这东西是**会自己改设置**的（还落盘），判错了以后每一局都跟着错，
-    而"错在哪"极难看出来 —— 所以四条规矩都得是硬的：
-
-    1. 样本不足不给结论（不是校准，是猜）；
-    2. 只认 Perfect、取中位数（Good/Bad 里混着被蹭掉、卡顿补判的离群值）；
-    3. 单次挪动有上限（越过就说明不是"送达延迟"，得先看 `[judge]`）；
-    4. **只在完整打完时**动手（结算消息到达），中途退出不动设置。
+    样本不足不给结论；只认 Perfect、取中位数（Good/Bad 里混着被蹭掉、卡顿补判的离群值）；
+    单次挪动有上限，越过就跳过并说明；只在完整打完（结算消息到达）时动手，中途退出不动设置。
     """
     problems: list[str] = []
     try:
@@ -204,8 +195,8 @@ def check_calibration() -> list[str]:
 def check_result() -> list[str]:
     """结算那两行：数字要一个不差，读不到的字段要显式写成 `?`。
 
-    字段名对不上时 frida 是**静默**返回 null 的（`<mirror>k__BackingField` 那次就是），
-    所以"读不到"必须和"真的是 0"在输出里区分得出来 —— 这一条就是盯着这个。
+    字段名对不上时 frida 是**静默**返回 null 的，所以"读不到"必须和"真的是 0"在输出里
+    区分得出来 —— 这一条就是盯着这个（`<mirror>k__BackingField` 那种）。
     """
     problems: list[str] = []
     try:
@@ -285,4 +276,3 @@ def check_result() -> list[str]:
         problems.append(f"字段读不到时应当处处是 ?：{missing.strip()!r}")
 
     return problems
-

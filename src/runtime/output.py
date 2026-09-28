@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """进程里**唯一**的那个写者。
 
-主干、agent 的消息处理和运行时控制台都往这里写 —— :func:`log` 的用法与 ``print``
-一模一样（``file=`` 之类照常透传）。之所以要统一，是因为控制台的提示符 ``auto> `` 是
-**不带换行**地画在屏幕上的：别的线程一旦直接 ``print``，那行输出就接在提示符后面，
-看起来就像"提示符没了"。写者只有一个，才谈得上"打印前先擦掉、打印完再画回来"。
-
-控制台通过 :func:`set_prompt_hooks` 把这两件事登记进来；没有控制台的时候（``touch.py``
-单独跑、自检里）它就只是个 ``print``。
-
-:func:`log_to_file` 把**到达屏幕的一切**再抄一份到文件（不是只抄 :func:`log` 走过的）：
-开发时要看的是"屏幕上看见过什么"，`scrcpy.py` 那种直接 ``print`` 的也得在里面。抄写按
-**行的语义**来 —— 只写完整行，而且一行里只保留最后一个 ``\\r`` 之后的内容（终端的显示
-规则），于是提示符的擦除/重画不会把日志文件弄得满是回车和空白。
+提示符 ``auto> `` 不带换行：别的线程直接 ``print`` 会让输出接在它后面，看起来就像提示符没了。
+:func:`log` 与 ``print`` 同签名；:func:`set_prompt_hooks` 由控制台登记擦除 / 重画提示符。
+:func:`log_to_file` 把到达屏幕的一切按行抄进文件，一行只留最后一个 ``\\r`` 之后的内容。
 """
 
 from __future__ import annotations
@@ -45,9 +36,8 @@ def set_prompt_hooks(
 def log(*args: object, **kwargs: object) -> None:
     """一整行原子地写出去，并且保证写完提示符还在。
 
-    **默认 ``flush=True``。** 不 flush 的话，输出攒在哪里、什么时候露面完全由 stdout
-    是什么决定（终端是行缓冲、管道是块缓冲）—— 表现就是"敲了一条命令没反应，再敲一条，
-    上一条的输出才出来"。输出必须当场出去，这件事不能赌缓冲策略。
+    默认 ``flush=True``：不 flush 输出攒在哪里、什么时候露面就由 stdout 是什么决定
+    （终端行缓冲、管道块缓冲），表现是"敲了一条没反应，再敲一条上一条才出来"。
     """
     kwargs.setdefault("flush", True)
     with _LOCK:
@@ -64,9 +54,7 @@ class LogFile:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        # `newline="\n"`：日志文件一律 LF 行尾。Windows 的文本模式会把 \n 翻成 \r\n，
-        # 于是"文件里除了行尾不该有别的回车"这条判据就没法查了（自检按字节读才发现）。
-        # 而且 LF 的日志跨工具都省事：grep / diff / 直接喂给别的脚本。
+        # 一律 LF 行尾：Windows 文本模式会把 \n 翻成 \r\n，日志里除行尾不该有别的回车
         self.stream = path.open("a", encoding="utf-8", newline="\n")
         self._pending = ""
 
@@ -77,8 +65,7 @@ class LogFile:
             self._pending = self._pending[-PENDING_LIMIT:]
         while "\n" in self._pending:
             line, self._pending = self._pending.split("\n", 1)
-            # 终端的规则：一行里只有最后一个 \r 之后的部分是"看得见"的。
-            # 提示符的擦除（\r + 空格 + \r）因此不会进日志。
+            # 终端的规则：一行里只有最后一个 \r 之后的部分看得见，所以擦提示符的回车不进日志
             self.stream.write(line.rsplit("\r", 1)[-1] + "\n")
         self.stream.flush()  # 每行都落盘：崩溃现场才是日志最有用的时候
 

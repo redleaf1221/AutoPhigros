@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-from bisect import bisect_right
 from collections import defaultdict
 
 from algorithms.chart import Chart, NoteType
@@ -79,10 +78,7 @@ def check_coverage(chart: Chart, result) -> tuple[int, list[str], float]:
             total += 1
             placement = place_note(line, note, screen, retime=note.kind is NoteType.FLICK)
 
-            # Drag / Flick 都是**逐帧**比对手指位置的：判定线在动，而手指在两次事件之间
-            # 不动，所以"手指投影到判定线上的横向偏移"逐帧漂。要求窗口里存在一整帧都在
-            # 容差内（见 `_longest_run`）。Flick 还额外要 `isNewFlick`（够快的滑动），
-            # 那是输入速度的事，规划这一层看不到，这里只保证位置与时长。
+            # Drag / Flick 逐帧比手指位置：窗口里要存在整整一帧都在容差内（Flick 另要 isNewFlick）。
             if note.kind in (NoteType.DRAG, NoteType.FLICK):
                 window = DRAG_WINDOW_MS if note.kind is NoteType.DRAG else FLICK_WINDOW_MS
                 run, best = _longest_run(tracks, line, note, placement.seconds, window)
@@ -131,10 +127,8 @@ def check_coverage(chart: Chart, result) -> tuple[int, list[str], float]:
 def _head(tracks: Tracks, line, note, seconds: float) -> tuple[bool, float]:
     """Tap / Hold 的头判：窗口里有没有**一次合格的按下**，以及最小偏差。
 
-    只看"那一刻有没有手指在点上"是不够的：`CheckNote` 只为 `phase == Began` 的手指
-    调用（`JudgeControl::Update` 里那一句），也就是说判定发生在"按下事件被处理的那一帧"。
-    一根早就按在屏幕上、只是被 MOVE 过来的手指是判不到 tap 的 —— 必须真的 DOWN 一次。
-    Tap 的接受窗口是 `realTime − 0.01 ~ realTime + 0.22`，按下那一帧落在里面就算数。
+    `CheckNote` 只为 `phase == Began` 的手指调用（`JudgeControl::Update` 里那一句），
+    所以被 MOVE 过来的手指判不到；接受窗是 `realTime − 0.01 ~ realTime + 0.22`。
     """
     best = math.inf
     for timestamp, position in tracks.downs_between(
@@ -149,9 +143,8 @@ def _longest_run(
 ) -> tuple[float, float]:
     """判定窗口里"有手指落在容差内"最长的一段（毫秒），以及全窗口的最小偏差。
 
-    为什么是"最长的一段"而不是"整段都不许有空洞"：帧是等间隔的，一段不短于一帧的
-    连续覆盖里**必然**含有一帧，所以只要最长的一段够一帧，任何帧相位下都至少有一帧
-    能判到；反过来，覆盖短于一帧时能不能判到就纯看帧落在哪儿 —— 也就是掷硬币。
+    要求"最长的一段够一帧"而不是"整段不许有空洞"：帧等间隔，一段不短于一帧的连续覆盖里
+    必然含有一帧，任何帧相位下都至少有一帧判得到；短于一帧就是掷硬币。
     """
     lo = seconds * 1000.0 - window_ms
     hi = seconds * 1000.0 + window_ms
@@ -174,14 +167,8 @@ def _longest_run(
 def check_dwell() -> list[str]:
     """覆盖率判据自己的回归用例：手指在位多久才算"够一帧"。
 
-    这条判据是本项目里最容易被"简化"回去的东西 —— 它看着啰嗦（"窗口里最长的一段连续
-    覆盖够不够一帧"），很容易被改回"那一瞬间在不在点上"。而后者在
-    `Eradication Catastrophe` IN 上放过 4 个必漏的 drag（手指到位 1ms 后就被抬起），
-    也在 `geometric` 上放过一批只停 1 tick（8ms）的。所以拿两根合成时间轴把**判定结论**
-    钉住（不是钉住 `_longest_run` 这个函数，而是钉住 `check_coverage` 报不报）：
-
-    * 手指到位后停一整帧以上 → 不该报；
-    * 只停 5ms 就抬起 → 必须报。
+    钉住的是 `check_coverage` 报不报，不是 `_longest_run` 这个函数：手指到位后停一整帧
+    以上不该报，只停 5ms 就抬起必须报 —— 防的是判据被"简化"回"那一瞬间在不在点上"。
     """
     from algorithms.chart import JudgeLine, Note, NoteType, Track
     from algorithms.geometry import Screen
@@ -212,23 +199,10 @@ def check_dwell() -> list[str]:
 
 
 def check_flick(chart: Chart, result: PlanResult) -> list[str]:
-    """滑键手势自检：每个 flick 在游戏那套规则下都得**点得亮**。
+    """滑键手势自检：每个 flick 在 `CheckFlick` 那套规则下都得**点得亮**。
 
-    ``FlickControl::Judge`` 自己不看手指 —— 它只等 ``ChartNote.isJudgedForFlick``。点灯的是
-    ``JudgeControl::CheckFlick``（``0x1d21828``）：只有那一帧手指带 ``Fingers.isNewFlick``
-    （一次"新起手"，由 ``FingerManagement::Update`` 按瞬时速度算）时才跑；跑的时候在
-    ``nowTime ± 0.14s`` 里**按时间顺序**挑第一个还没判过、且
-    ``|positionX − fingerPositionX| < 2.1`` 的 flick 点亮，然后把手指那个标志清掉。
-
-    两条推论就是这个自检的全部内容：
-
-    1. **一次"新起手"只点亮一个音符**，还会被窗口里更早的 flick 抢走；
-    2. 一个 flick 只划一下 = 只有一次机会，被抢走就必然漏。
-
-    实测就是这么漏的：``conservative`` 原先每个 flick 只划一下，按这套规则走一遍，
-    Dlyrotz HD 上 70 个 flick 里有 **7 个永远点不亮** —— 而真机上一局只漏一两个，
-    因为慢划动偶尔也算一次起手。把每个 flick 划两下之后就全归零了
-    （``flick_repeats``，见 ``ConservativeConfig``）。
+    `CheckFlick` 只在手指 `isNewFlick`（一次新起手）那一帧跑，在 `nowTime ± 0.14s` 里按时间顺序
+    挑第一个还没判过、横向 < 2.1 的 flick 点亮；一次起手只点亮一个，只划一下就必然漏。
     """
     flicks = sorted(
         (
@@ -283,4 +257,3 @@ def check_flick(chart: Chart, result: PlanResult) -> list[str]:
         + "、".join(f"{seconds:.3f}s" for seconds, _, _, _ in missing[:5])
     ]
     return problems
-

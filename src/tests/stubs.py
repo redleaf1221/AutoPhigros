@@ -1,8 +1,8 @@
 """与 `agent.py` / `controller.py` 打交道时的替身。
 
-`agent.Agent` 只要一个"能 post、能 ping 的对象"，`controller.Controller` 只要一份配置
-—— 顶掉它们就能在没有设备、没有 frida 会话的情况下把闸门、探活、收工、附加目标这几条路
-走一遍。`make_config()` 出来的配置**不会落盘**（自检不该动真的 config.json）。
+`agent.Agent` 只要一个"能 post、能 ping 的对象"，`controller.Controller` 只要一份配置，
+顶掉它们就能在没有设备、没有 frida 会话的情况下走完闸门、探活、收工、附加目标。
+`make_config()` 出来的配置**不会落盘**（自检不该动真的 config.json）。
 """
 
 from __future__ import annotations

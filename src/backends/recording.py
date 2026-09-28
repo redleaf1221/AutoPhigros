@@ -1,8 +1,7 @@
 """干跑后端：不连设备，只把"什么时候发了什么"记下来。
 
-看着像测试替身，其实是个正经后端：`touch.py --backend recording` 就是完整的调度器
-演练 —— 时钟、排序、提前量全都跑一遍，只是最后一步不写进设备。没有设备时这是唯一
-能验调度器精度的办法，`selftest.py` 也用它。
+`touch.py --backend recording` 是完整的调度器演练（时钟、排序、提前量照跑），也是没有
+设备时唯一能验调度精度的办法；``selftest.py`` 也用它。
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ class RecordingBackend:
 
     def __init__(self, *, serial: str | None = None) -> None:
         self.serial = serial
-        """本来要发给哪台设备。注册表把公共参数一视同仁地递给每个后端，收下记着就是。"""
+        """本来要发给哪台设备；注册表把公共参数递给每个后端，收下记着就是。"""
         self.screen: Screen | None = None
         self.calls: list[tuple[float, tuple[TouchEvent, ...]]] = []
         """``(主机 monotonic 时刻, 这一批事件)``，按发出顺序。"""

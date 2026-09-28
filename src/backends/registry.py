@@ -1,11 +1,8 @@
 """后端注册表 —— "支持多种后端"的全部机关。
 
-和 ``algorithms/registry.py`` 一个套路：注册表只登记"后端叫什么、在哪个模块、干什么用的"，
-**不** import 它们；真正的 import 发生在 :func:`create`，所以没被选中的后端连同它的依赖
-（比如 scrcpy 那个只在这里用到的 ``socket``）都不会被加载。
-
-要加一个后端，写一个模块、在里面放一个类并赋值给 ``BACKEND``，再到 ``_BUILTIN`` 里
-登记一行即可；外部插件可以调 :func:`register`。
+只登记"后端叫什么、在哪个模块、干什么用的"，**不** import 它们：真正的 import 在
+:func:`create`，没被选中的后端连同它的依赖都不会被加载。加一个后端 = 写一个模块
+（里面放一个类并赋值给 ``BACKEND``）+ 在 ``_BUILTIN`` 里登记一行；外部插件调 :func:`register`。
 """
 
 from __future__ import annotations

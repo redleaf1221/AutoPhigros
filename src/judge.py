@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """算法体检：把规划按**游戏真实的判定规则**重放一遍，报丢音、蹭键与判定分布。
 
-和 `selftest.py` 的分工：
-
-    python src/selftest.py     ← 代码有没有 bug（闸门、时钟、播放器、控制台、收工…），很快
-    python src/judge.py        ← 算法有没有问题（丢音、蹭键、分布、分数），慢，且越全越慢
+`selftest.py` 查代码有没有 bug，很快；本模块查算法有没有问题，慢，且越全越慢。
+判定窗口、容差、扫描窗、分数公式全部来自 `algorithms/judging.py`，出处见那里的注释与
+`Phigros4.0-音游内核逆向报告.md`。
 
 用法（conda 环境 auto_phigros）：
 
     python src/judge.py                          # 所有谱面 × 所有规划器（吃 plans/ 里的缓存）
     python src/judge.py --planner geometric      # 只体检一个规划器
     python src/judge.py --chart Dlyrotz          # 名字里带 Dlyrotz 的都跑（子串匹配）
-    python src/judge.py --plan plans/xxx.psap    # 直接体检一份已有的规划（不再重算）
+    python src/judge.py --plan plans/xxx.npz     # 直接体检一份已有的规划（不再重算）
     python src/judge.py --no-cache               # 不吃也不写缓存，全部现算
     python src/judge.py --json out.json          # 另存一份机器可读的结果
-
-报告的每一行都对应一件能被验证的事：判定窗口、容差、扫描窗、分数公式全部来自
-`algorithms/judging.py`（出处见那里的注释与 `Phigros4.0-音游内核逆向报告.md`）。
 """
 
 from __future__ import annotations
@@ -25,12 +21,21 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 import planner
-from algorithms import catalog
+from algorithms import catalog, options_from_args
 from algorithms.chart import Chart
 from algorithms.judging import Report, Verdict, simulate
-from formats.storage import ChartRef, decode_plan
+from formats.storage import (
+    CHART_SUFFIX,
+    ChartRef,
+    NpzFormatError,
+    load_chart,
+    load_plan,
+    plan_meta,
+    plan_path_for,
+)
 from tests.archive import check_mirror, check_storage
 from tests.coverage import check_coverage, check_flick, check_stream
 
@@ -48,23 +53,31 @@ class QuietProgress:
 
 
 def charts_named(needle: str | None) -> list[Path]:
-    paths = sorted(
-        path for path in CHARTS_DIR.glob("*.json") if not path.name.endswith(".meta.json")
-    )
+    paths = sorted(CHARTS_DIR.glob(f"*{CHART_SUFFIX}"))
     if needle:
         paths = [path for path in paths if needle.lower() in path.name.lower()]
     return paths
 
 
-def chart_for(path: Path) -> tuple[Chart, str]:
-    text = path.read_text(encoding="utf-8")
-    return Chart.parse(text), text
+def chart_for(path: Path) -> tuple[Chart, str, ChartRef]:
+    """读一张谱面：原文、解析结果、以及它的身份（身份取自文件自己，不另算一个）。"""
+    text, ref = load_chart(path)
+    return Chart.parse(text), text, ref
 
 
-def plan_for(chart: Chart, text: str, ref: ChartRef, name: str, *, cache: bool) -> object:
+def plan_for(
+    chart: Chart,
+    text: str,
+    ref: ChartRef,
+    name: str,
+    *,
+    cache: bool,
+    options: Mapping[str, Any] | None = None,
+) -> object:
     return planner.plan(
         text,
         planner=name,
+        options=options,
         ref=ref,
         cache=cache,
         directory=PLANS_DIR,
@@ -110,10 +123,17 @@ def print_report(report: Report, *, problems: list[str], verbose: bool) -> bool:
 
 
 def judge_one(
-    chart: Chart, text: str, ref: ChartRef, name: str, *, cache: bool, verbose: bool
+    chart: Chart,
+    text: str,
+    ref: ChartRef,
+    name: str,
+    *,
+    cache: bool,
+    verbose: bool,
+    options: Mapping[str, Any] | None = None,
 ) -> tuple[bool, Report | None, list[str]]:
     try:
-        result = plan_for(chart, text, ref, name, cache=cache)
+        result = plan_for(chart, text, ref, name, cache=cache, options=options)
     except Exception as error:  # noqa: BLE001 - 一个规划器失败不该带走整轮体检
         print(f"  {name:<28} 规划失败：{type(error).__name__}: {error}")
         return False, None, []
@@ -121,7 +141,7 @@ def judge_one(
     problems = check_stream(result)
     total, misses, _ = check_coverage(chart, result)
     problems += [f"覆盖：{miss}" for miss in misses]
-    problems += check_storage(text, name, result)
+    problems += check_storage(text, name, result, options)
     problems += check_flick(chart, result)
     _, mirror_misses, _ = check_mirror(text, result)
     problems += [f"镜像后：{miss}" for miss in mirror_misses]
@@ -133,46 +153,47 @@ def judge_one(
 
 
 def judge_plan(path: Path, *, verbose: bool) -> tuple[bool, Report | None]:
-    """直接体检一份已有的 `.psap`：从旁边的 meta 里找回谱面。"""
-    result = decode_plan(path.read_bytes())
-    meta_path = path.with_suffix(".meta.json")
-    if not meta_path.is_file():
-        print(f"  {path.name} 旁边没有 meta.json，找不到它对应的谱面")
+    """直接体检一份已有的规划（不再重算）：谱面的身份就在规划结果自己的 meta 里。"""
+    try:
+        meta = plan_meta(path)
+        result = load_plan(path)
+    except (OSError, NpzFormatError) as error:
+        print(f"  {path.name} 读不了：{error}")
         return False, None
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    digest = meta.get("digest") or meta.get("hash")
-    matches = [p for p in charts_named(None) if digest and digest in p.name]
+
+    chart_meta = meta.get("chart") or {}
+    ref = ChartRef(
+        seq=int(chart_meta.get("seq") or 0),
+        context=chart_meta.get("context") or {},
+        digest=str(chart_meta.get("hash") or "unknown"),
+    )
+    matches = [chart for chart in charts_named(None) if chart.stem == ref.stem]
     if not matches:
-        print(f"  {path.name} 对应的谱面不在 charts/ 里（digest={digest}）")
+        print(f"  {path.name} 对应的谱面（{ref.stem}）不在 charts/ 里")
         return False, None
-    chart, text = chart_for(matches[0])
+    plan_chart, _, _ = chart_for(matches[0])
     problems = check_stream(result)
-    _, misses, _ = check_coverage(chart, result)
+    _, misses, _ = check_coverage(plan_chart, result)
     problems += [f"覆盖：{miss}" for miss in misses]
-    problems += check_flick(chart, result)
-    report = report_plan(chart, result, chart_name=matches[0].name, plan_name=path.stem)
+    problems += check_flick(plan_chart, result)
+    report = report_plan(plan_chart, result, chart_name=matches[0].name, plan_name=path.stem)
     clean = print_report(report, problems=problems, verbose=verbose)
-    _ = text
     return clean, report
 
 
 def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
     """把裁判和**设备那一次运行**逐音符对上 —— 不一致的地方就是要修裁判的地方。
 
-    为什么要这么比：光看总数（设备 1152P/2G/1B/1M vs 裁判 1140P/14G/0B/2M）只能知道
-    "大概哪里不对"，说不出是哪几个音符、差在哪。而日志里每条判定都带着音符身份
-    （线 / 上下 / 第几个），裁判那边用的是同一把钥匙 —— 于是能一条条列出来。
-
-    这个模式**不改任何东西**，它只报事实：哪些音符两边判得不一样、各自判成了什么。
-    修裁判（或者修规划）是看完它之后的事。
+    身份是游戏自己的 `noteCode` 那套（线 / 上或下 / 同侧第几个），所以两边能一条条对起来
+    —— 光比总数只知道"大概哪里不对"，说不出是哪几个音符、差在哪。这个模式**不改任何
+    东西**，只报事实：哪些音符两边判得不一样、各自判成了什么。
     """
     from tools import device_log
 
     run = device_log.read(log_path)
     print(f"{log_path.name}：{len(run.judges)} 条判定，设备自己的账目是 {run.label}")
     if run.latency is not None:
-        # 拿这一局**真实的**送达补偿去重放。计划里的落点是"音符自己那一时刻的判定点"，
-        # 补偿没抵掉处理延迟时那个落点就是偏的 —— 拿理想送达去解释实机结果会冤枉规划。
+        # 用这一局真实的送达补偿重放：补偿没抵掉处理延迟时，计划里的落点本身就是偏的
         import algorithms.judging as judging
 
         judging.DELIVERED_LATENCY = run.latency
@@ -184,17 +205,19 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
         print("  日志里没写清是哪张谱面 / 哪个规划器（要 `[chart …] 已保存 …` 与 `[plan …]`）")
         return 1
 
-    charts = [path for path in charts_named(Path(run.chart).stem) if path.name == run.chart]
+    # 按 stem 找：日志记的是存成 npz 之前的文件名（`.json`），身份是 stem。
+    stem = Path(run.chart).stem
+    charts = [path for path in charts_named(stem) if path.stem == stem]
     if not charts:
-        print(f"  charts/ 里没有 {run.chart} —— 采集时没开 save-chart？")
+        print(f"  charts/ 里没有 {stem} —— 采集时没开 save-chart？")
         return 1
-    plan_path = PLANS_DIR / f"{Path(run.chart).stem}_{run.planner}.psap"
-    if not plan_path.is_file():
-        print(f"  plans/ 里没有 {plan_path.name} —— 先跑一次规划（或 --no-cache 现算）")
+    chart, _, ref = chart_for(charts[0])
+    plan_path = plan_path_for(ref, run.planner, PLANS_DIR)
+    try:
+        result = load_plan(plan_path)
+    except (OSError, NpzFormatError):
+        print(f"  plans/ 里没有可用的 {plan_path.name} —— 先跑一次规划（或 --no-cache 现算）")
         return 1
-
-    chart, _ = chart_for(charts[0])
-    result = decode_plan(plan_path.read_bytes())
     report = report_plan(chart, result, chart_name=charts[0].name, plan_name=plan_path.stem)
     mine = report.counts
     score, percent = report.score()
@@ -301,7 +324,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[info.name for info in catalog()],
         help="只体检这个规划器（默认全部）",
     )
-    parser.add_argument("--plan", type=Path, default=None, help="直接体检这份 .psap")
+    parser.add_argument("--plan", type=Path, default=None, help="直接体检这份 .npz")
+    parser.add_argument(
+        "--set",
+        action="append",
+        metavar="名字=值",
+        help="改一个规划器参数（要跟 --planner 一起用，可重复）",
+    )
     parser.add_argument(
         "--cache",
         action=argparse.BooleanOptionalAction,
@@ -328,6 +357,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return compare(args.compare, verbose=args.verbose)
 
+    try:
+        options = options_from_args(args.set)
+    except ValueError as error:
+        print(f"参数写错了：{error}", file=sys.stderr)
+        return 2
+    if options and not args.planner:
+        print("--set 要跟 --planner 一起用（参数是某个规划器的）", file=sys.stderr)
+        return 2
+
     entries: list[dict] = []
     clean = True
 
@@ -346,12 +384,17 @@ def main(argv: list[str] | None = None) -> int:
             print("charts/ 里没有匹配的谱面。先用 main.py --save-chart 采一张。", file=sys.stderr)
             return 2
         for path in paths:
-            chart, text = chart_for(path)
-            ref = ChartRef.of_text(text, seq=0, context={"songsId": path.stem})
+            chart, text, ref = chart_for(path)
             print(f"\n{path.name}（{chart.note_count} 音符 / {len(chart.lines)} 判定线）")
             for name in names:
                 ok, report, problems = judge_one(
-                    chart, text, ref, name, cache=args.cache, verbose=args.verbose
+                    chart,
+                    text,
+                    ref,
+                    name,
+                    cache=args.cache,
+                    verbose=args.verbose,
+                    options=options,
                 )
                 clean = clean and ok
                 if report is not None:

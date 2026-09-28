@@ -1,19 +1,9 @@
-# auto_phigros 的 Python 依赖。
-#
-#   conda create -n auto_phigros python=3.14 -y
-#   conda activate auto_phigros
-#   pip install -r requirements.txt
-#
-# 这里是**实测跑通的那一组版本**。唯一有讲究的是 frida：客户端与设备上的
-# frida-server 必须同一个版本，而且都不能是 17.19.0 —— 那一版 attach 任何进程都会抛
-# `TransportError: agent connection closed unexpectedly`（spawn 却是好的，很有迷惑性）。
-# 详见 README 的"环境要求"。
-#
-# 为什么没有 rich / z3-solver / PyQt5 / av / pyusb / lz4 / Pillow，见 impl.md 的
-# "依赖的取舍"一节。
+# auto_phigros 的 Python 依赖（conda 环境 auto_phigros，Python 3.14）。
+# frida 必须与设备上的 frida-server 同版本，且不能是 17.19.0 —— 见 README「环境要求」。
 
 frida==17.17.0
 shapely==2.1.2
+numpy==2.5.3
 tqdm==4.70.1
 opencv-python==5.0.0.93
 imageio-ffmpeg==0.6.0

@@ -9,16 +9,19 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 from algorithms.geometry import Screen
 from algorithms.utils import PlanResult, Touch
-from formats.storage import ChartRef, plan_path_for
+from formats.storage import PLAN_SUFFIX, ChartRef, plan_path_for
 import planner
 from .stubs import Recorder, make_controller
 
 
 def check_gate() -> tuple[list[str], str]:
-    """闸门自检：不连设备，只往 agent 里喂消息。返回 (问题列表, 被吞掉的输出)。"""
+    """闸门自检：不连设备，只往 agent 里喂消息。返回（问题列表、被吞掉的输出）。"""
     try:
+        # 这一摞 import 本身就是检查：入口那几个模块能不能一起 import 起来（frida 没装就跳过）
         from runtime import agent as agent_module
         from runtime import config
         from runtime import controller as controller_module
@@ -72,14 +75,12 @@ def check_gate() -> tuple[list[str], str]:
         if recorder.released != [2]:
             problems.append(f"作业抛异常时也必须放行，实际 {recorder.released}")
 
-        # 3) 开谱 -> 规划：喂进去的一定是 FromJson 的那份原文（**规范解**），
-        #    镜像不进规划、而是交给播放器在执行时翻
+        # 3) 开谱 -> 规划：喂进去的一定是 FromJson 的原文（**规范解**），镜像不进规划、交给播放器翻
         for mirror, expected in ((True, True), (False, False), (None, False)):
             agent, recorder = build()
             calls: list[dict] = []
             plays: list[tuple[object, bool, int]] = []
-            # 真正跑的是 Controller.handle_level_start，只把最后一步"架播放器"换成记账 ——
-            # 于是这一段验的是真代码，而不是它的一份复述
+            # 真正跑的是 Controller.handle_level_start，只把最后一步"架播放器"换成记账。
             controller = make_controller()
             controller.play = lambda plan, *, mirror, seq: plays.append((plan, mirror, seq))
             real_plan = planner.plan
@@ -125,8 +126,7 @@ def check_gate() -> tuple[list[str], str]:
         if recorder.released != [4]:
             problems.append(f"没有谱面时也必须放行，实际 {recorder.released}")
 
-        # 5) 播放状态与"这一局没了"：**由游戏说了算**，主机只负责转发
-        #    （这两条以前是靠"值多久没变 / 多久没样本"猜的，撤了）
+        # 5) 播放状态与"这一局没了"：**由游戏说了算**，主机只负责原样转发
         agent, _ = build()
         seen: list[tuple[str, object]] = []
         agent.on_play_state = lambda playing, moment: seen.append(("play", (playing, moment)))
@@ -156,17 +156,10 @@ def check_gate() -> tuple[list[str], str]:
 
 
 def check_clock() -> list[str]:
-    """游戏时钟自检：喂合成的样本流，看估出来的是不是真的。
+    """游戏时钟自检：喂合成的样本流，看估出来的是不是真的。判据只有一条 —— **宁可偏晚，
+    绝不能偏早**（偏晚最多晚按一下，偏早就是抢拍）。
 
-    ``GameClock`` 是"完美同步"的全部依据（触控模块按它排事件），而它要对付的正是
-    "样本必然晚到、还会抖动"这件事。判据只有一条：**宁可偏晚，绝不能偏早** ——
-    偏晚最多是晚按一下，偏早就是抢拍。
-
-    1. 稳定推进 + 固定延迟：估计值应当恰好晚一个"最小延迟"；
-    2. 延迟抖动：取最小值应当把抖动滤掉；
-    3. 起播前的等待（`nowTime` 被钉在 0.00001）：不能提前放行，音乐起来后要重新对表；
-    4. 中途暂停：暂停期间不能发事件，恢复后也要重新对表；
-    5. 时钟倒着走：当成重开一局。
+    六种情形：稳定推进、延迟抖动、起播前的等待、中途暂停、时钟倒走、传输打嗝补样本。
     """
     import touch
 
@@ -194,9 +187,8 @@ def check_clock() -> list[str]:
     def lag(harness: Harness, truth: float) -> float:
         """估计值落在真值后面多少秒。正 = 偏晚（安全），负 = 偏早（抢拍）。
 
-        "偏晚"是刻意的：`min(h − v)` 把真实偏移**高估**了一个最小传输延迟，
-        于是我们总在游戏时间真正到点之后一点点才动手。抢拍比晚按严重得多，
-        所以判据是"绝不为负"。
+        `min(h − v)` 把真实偏移**高估**了一个最小传输延迟，于是总在游戏时间真正到点之后
+        一点点才动手 —— 所以判据是"绝不为负"。
         """
         estimate = harness.clock.now()
         assert estimate is not None
@@ -257,9 +249,7 @@ def check_clock() -> list[str]:
     if not -tolerance <= drift <= 0.001 + tolerance:
         problems.append(f"重开一局后没有重新对表，{drift * 1000:+.1f}ms")
 
-    # 6) 传输打嗝：400ms 收不到样本，之后一口气补上一串**过时**的样本。
-    #    这是 late good 的头号嫌疑 —— 补上来的头几笔带的是几百毫秒前的值，
-    #    要是把它们误当成"暂停过"、把窗口清掉重新对表，就会照着它们的延迟整体晚发。
+    # 6) 传输打嗝：400ms 收不到样本，之后一口气补上一串**过时**的样本，不许被当成"暂停过"而重锚
     h = Harness()
     h.run(lambda t: t - 12.5, start=0.0, stop=5.0, step=0.1, delay=0.005)
     before = h.clock.reanchors
@@ -271,17 +261,9 @@ def check_clock() -> list[str]:
     if not -tolerance <= drift <= 0.005 + tolerance:
         problems.append(f"传输打嗝之后对齐偏了 {drift * 1000:+.1f}ms")
 
-    # 说明：这里**不**用"多久没样本"去判断"这一局还在不在"。那条路走过，撤了 ——
-    # 暂停与退出在样本上只差一次抖动那么宽，而且暂停时样本照样每 100ms 来一次（值不变）。
-    # "这一局还在不在"由 agent 的暂停 / 退场 hook 直说，见 tests/liveness.py。
+    # 这里**不**用"多久没样本"判断"这一局还在不在"：暂停与退出在样本上只差一次抖动（见 docs/impl.md）。
 
-    # 7) 暂停与恢复：游戏说停就**按住**，说走就**从零重新对表**。
-    #
-    #    真踩过（用户报的"恢复之后像没在打"）：暂停期间 nowTime 哪怕只是缓慢爬升，
-    #    `min(h−v)` 也会被 2 秒窗口里最老的那个样本拖住 —— 对齐能偏到 1~2 秒之前，
-    #    于是恢复后每个事件都被算成"迟到太多"而被 LATE_SKIP 丢掉，整首歌一个事件都发不出去。
-    #    完全冻住的暂停反而自愈（值停过 → 重锚），所以它是**不稳定**的：取决于暂停期间
-    #    时钟到底怎么动。与其猜，不如按住 + 重新对表。
+    # 7) 暂停与恢复：说停就**按住**，说走就**从零重新对表**（不重锚会被 2 秒窗口里最老的样本拖偏）。
     for creep in (0.0, 0.02, 0.1, 0.5):
         h = Harness()
         h.run(lambda t: t - 12.5, start=0.0, stop=5.0, step=0.1, delay=0.0)
@@ -352,10 +334,8 @@ def check_pixels() -> list[str]:
 def check_log_file() -> list[str]:
     """日志文件自检：抄得全、提示符的擦除不进文件、关掉之后真的不写了。
 
-    这东西的价值全在"出事之后"，所以三条都得钉住：**到达屏幕的一切**都要在里面（不只
-    走 ``output.log`` 的那些 —— `scrcpy.py` 那种直接 ``print`` 的也得有）、一行里只有最后
-    一个 ``\\r`` 之后的内容算数（控制台擦提示符会写 ``\\r`` + 空格 + ``\\r``，那些不该进
-    日志）、以及按行落盘（崩溃现场才是它最有用的时候）。
+    抄的是**到达屏幕的一切**（直接 ``print`` 的也要在里面）；一行里只留最后一个 ``\\r``
+    之后的内容（控制台擦提示符的那些不算）；关掉之后既不再写、``log_path()`` 也变 None。
     """
     from runtime import output
 
@@ -378,8 +358,7 @@ def check_log_file() -> list[str]:
                 sys.stdout.write("auto> ")  # 提示符本身：不带换行
                 sys.stdout.write("\r        \r[d] 下一行\n")
                 sys.stdout.flush()
-                # 还原成"包装之前那个"必须在**还处在重定向里**的时候查：`redirect_stdout`
-                # 退出时会把 sys.stdout 覆盖回去，在外面查等于没查（第一版就是这么漏的）
+                # "还原成包装之前那个"必须在**还处在重定向里**的时候查（退出时 sys.stdout 会被覆盖回去）。
                 output.stop_file_log()
                 if sys.stdout is not out_buffer:
                     problems.append("stop_file_log() 没有把 sys.stdout 还原成包装之前那个")
@@ -391,7 +370,6 @@ def check_log_file() -> list[str]:
             sys.stdout, sys.stderr = stdout, stderr
 
         # **按字节读**：`read_text` 会把 \r 归一成 \n，那样"日志里不许有回车"就永远成立了
-        # （第一版就是这么写的，变异测试里把过滤拆掉都抓不住）
         raw = path.read_bytes()
         text = raw.decode("utf-8")
         for fragment in (
@@ -468,11 +446,7 @@ def check_player() -> list[str]:
         if any(abs(a - b) > 1e-9 for a, b in zip(got, want, strict=True)):
             problems.append(f"mirror={mirror} 时坐标是 {got}，应当是 {want}")
 
-    # 收尾那一发"把按着的手指全抬起来"
-    #
-    # 手指是**物理按在屏幕上**的：排期停了不等于手抬了，而留在屏幕上的手指会继续被游戏
-    # 读成"在位"，下一个音符可能被它碰掉（打完 / 退出 / 暂停 / 重开 / 收工都会遇到）。
-    # 三个用例，都不靠 sleep 抢时序：一批事件发完循环就结束，收尾随即发生。
+    # 收尾那一发"把按着的手指全抬起来"：手指物理按在屏幕上，排期停了不等于手抬了（都不靠 sleep 抢时序）。
     from algorithms.utils import Touch as Action
 
     def burst(frames, *, inject=True) -> tuple[int, list[tuple[int, str]]]:
@@ -502,11 +476,7 @@ def check_player() -> list[str]:
     if released or stream:
         problems.append(f"注入关着时一根都没按过，不该凭空发抬起：released={released} {stream}")
 
-    # 暂停 → 抬手；恢复 → **按回原位**（不是按到计划的下一个位置）。
-    #
-    # 为什么必须按回原位：flick 判的就是"按下之后那一下位移"。把计划里紧接着的 MOVE 改写成
-    # DOWN（之前的做法）等于按在目标位置上不动，`isNewFlick` 永远不会亮 —— 恢复之后有些
-    # flick 划不出来就是这么来的。
+    # 暂停 -> 抬手；恢复 -> **按回原位**：flick 判的是"按下之后那一下位移"，改写成 DOWN 就不亮了。
     backend = create("recording")
     screen = Screen(16.0, 9.0)
     backend.open(screen)
@@ -557,6 +527,16 @@ def check_player() -> list[str]:
     return problems
 
 
+def _set_cache_key(path: Path, value: str) -> None:
+    """把落盘的规划结果里的算法指纹改掉 —— 模拟"这是上一版算法算出来的文件"。"""
+    with np.load(path) as data:
+        arrays = {name: data[name] for name in data.files}
+    meta = json.loads(str(arrays["meta"]))
+    meta["cache_key"] = value
+    arrays["meta"] = np.array(json.dumps(meta, ensure_ascii=False))
+    np.savez_compressed(path, **arrays)
+
+
 def check_cache(text: str) -> list[str]:
     """缓存自检：命中、失效、以及"不吃也不写"。"""
     from algorithms.utils import SilentProgress
@@ -576,9 +556,7 @@ def check_cache(text: str) -> list[str]:
         if again.frames != fresh.frames:
             problems.append("缓存读回来的事件流与原来不一致")
 
-        # 缓存命中时**统计也要跟着回来**：`.psap` 是二进制、只有事件流，stats/warnings 在
-        # 旁边的 .meta.json 里。真踩过：不补的话 `stats["notes"]` 是 None，主机拿它去跟游戏
-        # 报的音符数核对，于是打出"游戏 372，JSON None -> 不一致！"这种假警报。
+        # 缓存命中时统计也要跟着回来（它们与事件流在同一个 npz 里）
         for key in ("notes", "frames"):
             if again.stats.get(key) != fresh.stats.get(key):
                 problems.append(
@@ -589,19 +567,32 @@ def check_cache(text: str) -> list[str]:
             problems.append(f"缓存命中之后 warnings 丢了：{again.warnings!r}")
 
         # 算法指纹一变，缓存就该失效
-        meta_path = plan_path_for(ref, fresh.planner, out).with_suffix(".meta.json")
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["cache_key"] = "stale"
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        path = plan_path_for(ref, fresh.planner, out)
+        _set_cache_key(path, "stale")
         stale = planner.plan(text, ref=ref, cache=True, directory=out, progress=SilentProgress())
         if stale.stats.get("cached"):
             problems.append("算法指纹变了还能命中缓存")
 
+        # 参数也是指纹的一部分：换了参数不许复用旧结果，而且**不进文件名**（一个规划器一个文件）
+        tuned = {"flick_repeats": 3}
+
+        def rerun(**overrides):
+            return planner.plan(
+                text, ref=ref, cache=True, directory=out, progress=SilentProgress(), **overrides
+            )
+
+        if rerun(options=tuned).stats.get("cached"):
+            problems.append("换了规划器参数还命中旧缓存（参数没算进 cache_key）")
+        if not rerun(options=tuned).stats.get("cached"):
+            problems.append("同一套参数第二次应当命中缓存")
+        files = sorted(item.name for item in out.glob(f"*{PLAN_SUFFIX}"))
+        if files != [path.name]:
+            problems.append(f"换了参数之后 plans/ 里多出了文件：{files}")
+
         # cache=False：既不吃也不写
         bare = Path(workspace) / "bare"
         only = planner.plan(text, ref=ref, cache=False, directory=bare, progress=SilentProgress())
-        if only.stats.get("cached") or list(bare.glob("*.psap")):
+        if only.stats.get("cached") or list(bare.glob(f"*{PLAN_SUFFIX}")):
             problems.append("cache=False 时不该读也不该写缓存")
 
     return problems
-

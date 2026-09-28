@@ -1,14 +1,35 @@
 """各规划算法的实现。
 
-本包只提供"按名字造一个规划器"的能力，不提供命令行 —— 对外入口是上一层的
-``planner.py``（它既被 ``main.py`` 调用，也能单独跑）。
+对外入口是上一层的 ``planner.py``（既被 ``main.py`` 调用，也能单独跑）。
 """
 
-from .registry import DEFAULT_PLANNER, PlannerInfo, catalog, create, register
-from .utils import Planner, PlanResult, PlanningError, Progress, SilentProgress, Touch, TouchEvent
+from .registry import (
+    DEFAULT_PLANNER,
+    PlannerInfo,
+    catalog,
+    create,
+    names,
+    parameters,
+    register,
+    validate,
+)
+from .utils import (
+    Parameter,
+    Planner,
+    PlanResult,
+    PlanningError,
+    Progress,
+    SilentProgress,
+    Touch,
+    TouchEvent,
+    build_options,
+    options_from_args,
+    parse_option,
+)
 
 __all__ = [
     "DEFAULT_PLANNER",
+    "Parameter",
     "PlanResult",
     "Planner",
     "PlannerInfo",
@@ -17,7 +38,13 @@ __all__ = [
     "SilentProgress",
     "Touch",
     "TouchEvent",
+    "build_options",
     "catalog",
     "create",
+    "names",
+    "options_from_args",
+    "parameters",
+    "parse_option",
     "register",
+    "validate",
 ]

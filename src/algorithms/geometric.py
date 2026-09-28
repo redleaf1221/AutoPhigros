@@ -1,20 +1,16 @@
 """几何算法（吸收自 phisap 的"极端/几何算法"）。
 
-思路：以 125Hz（8ms）为基准把谱面切成互不影响的帧，一个 tick 就是一帧。给每个 note
-算出一条贯穿屏幕的判定区窄带；同一帧里，与 tap 判定区相交的 drag 就并进去，drag 之间
-相交的也并起来 —— 一次按下可以同时判掉一整片区域里的音符。这是三个算法里最省手指的，
-代价是判定区宽度只是 phisap 的经验值，精度不如保守算法。
-
-平面几何全部交给 shapely：窄带是 ``LineString.buffer`` 与屏幕矩形求交，合并是
-``Polygon.intersection``，落点取 ``shapely.centroid``。
+以固定 tick 把谱面切成互不影响的帧；给每个 note 算出一条贯穿屏幕的判定区窄带，同一帧里
+与 tap 窄带相交的 drag 并进来、drag 之间相交的也并起来 —— 一次按下同时判掉一整片区域。
+最省手指，代价是判定区宽度只是 phisap 的经验值。
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import NamedTuple
+from dataclasses import dataclass, field
+from typing import Any, Mapping, NamedTuple
 
 from shapely.geometry import Point, Polygon
 
@@ -23,6 +19,7 @@ from .geometry import JudgeAreaBuilder, Screen, centre_of, place_note
 from .track import EventTrack
 from .utils import (
     MIN_DWELL_MS,
+    WARNING_LIMIT,
     PlanResult,
     PlanningError,
     Position,
@@ -30,36 +27,30 @@ from .utils import (
     Touch,
     TouchEvent,
     Vector,
+    build_options,
 )
 
+
 FRAME_MS = 8
-"""125Hz 的时间栅格：1 tick = 8 毫秒。算法内部一律以 tick 计时。"""
+"""时间栅格：1 tick = 8ms（125Hz）。算法内部一律以 tick 计时，所以它是结构不是旋钮。"""
 
 DRAG_DWELL_TICKS = math.ceil(MIN_DWELL_MS / FRAME_MS)
-"""drag / flick 占住一根手指的 tick 数。
-
-本来是 1 tick（8ms）—— 按"判定区已经合并好了，一帧就够"的想法。但游戏是**逐帧**读手指
-位置的：手指只在那个位置停 8 毫秒的话，60fps（16.7ms 一帧）下能不能撞上一帧全看运气。
-所以按 :data:`~algorithms.utils.MIN_DWELL_MS` 折算成 tick 数，让手指在一个位置待够一帧。
-"""
-
-WARNING_LIMIT = 20
+"""drag / flick 占住一根手指的 tick 数：把 :data:`~algorithms.utils.MIN_DWELL_MS` 折算成 tick。"""
 
 
 @dataclass(slots=True)
 class GeometricConfig:
-    flick_ticks: int = 3
-    """滑键手势的持续 tick 数（3 tick = 24 毫秒）。"""
-    flick_repeats: int = 2
-    """一次滑键手势重复划几下。**别调回 1。**
+    """几何算法的参数（控制台 ``option`` 或 config.json 的 ``planner_options`` 都能改）。"""
 
-    游戏那边一次"新起手"（``Fingers.isNewFlick``）只够点亮一个 flick，而且会被判定窗口
-    里更早的音符抢走 —— 只划一下就是一个音符只有一次机会（``conservative`` 那边同样的
-    理由与测算写在 ``ConservativeConfig.flick_repeats``）。每多划一下，多一次独立机会。
-    """
-    flick_direction: int = 0
-    """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
-    max_pointers: int = 10
+    flick_ticks: int = field(default=3, metadata={"help": "滑键手势的持续 tick 数"})
+    flick_repeats: int = field(default=2, metadata={"help": "一次滑键手势重复划几下"})
+    flick_direction: int = field(
+        default=0, metadata={"help": "0 = 垂直判定线滑动，1 = 平行判定线滑动"}
+    )
+    max_pointers: int = field(default=10, metadata={"help": "最多几根手指"})
+
+
+CONFIG = GeometricConfig
 
 
 class PlainNote(NamedTuple):
@@ -129,14 +120,7 @@ class PointerAllocator:
                 drag_areas.append(note.judge)
 
         for note in frame.taps:
-            # **按在音符自己的判定点上**，不要按"合并区域"的中心。
-            # 踩过（Credits IN 上 11 个丢音）：drag 并进来之后，按下点被拉到了两个窄带的
-            # 中间，于是横向偏差比隔壁那个 TAP 大一点点（0.011），而游戏挑的是**度量最小的
-            # 那个候选** —— 这一下就被隔壁抢走、它自己去判了隔壁的音符（Good −139ms），
-            # 原来瞄的那个音符什么都没得到。
-            # 自己的判定点上横向偏差是 0（度量的下界），别的音符除非位置完全相同比不过它；
-            # 合并仍然保留在两件事上：drag 不再单独占一根手指、以及"已经在屏幕上的手指
-            # 落进并后的区域也算它被顺手判掉"。
+            # 按在音符自己的判定点上（横向偏差 0，是度量的下界），不要按合并区域的中心
             position = note.position
             pointer = self._take_idle_or_resting(position)
             if isinstance(pointer, Pointer):
@@ -155,8 +139,7 @@ class PointerAllocator:
             swipe = note.position
             for repeat in range(self.flick_repeats):
                 base = self.now + repeat * (self.flick_ticks + 1)
-                # 每一下都先**蹦回**判定点再划出去（见 GeometricConfig.flick_repeats），
-                # 那一下跳变就是游戏要找的"新起手"
+                # 每一下都先蹦回判定点再划出去，那一下跳变就是游戏要找的"新起手"
                 self._insert(
                     base, note.position, action if repeat == 0 else Touch.MOVE, bound.id
                 )
@@ -242,8 +225,8 @@ def _on_screen(screen: Screen, line: JudgeLine, moment: float, offset: float) ->
 class GeometricPlanner:
     name = "geometric"
 
-    def __init__(self, config: GeometricConfig | None = None) -> None:
-        self.config = config or GeometricConfig()
+    def __init__(self, options: Mapping[str, Any] | None = None) -> None:
+        self.config = build_options(GeometricConfig, options)
 
     def plan(self, chart: Chart, progress: Progress) -> PlanResult:
         screen = chart.screen

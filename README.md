@@ -21,7 +21,7 @@ conda activate auto_phigros
 pip install -r requirements.txt
 ```
 
-[requirements.txt](requirements.txt) 里就五行，但 **frida 的版本是有讲究的**：
+[requirements.txt](requirements.txt) 里就六行，但 **frida 的版本是有讲究的**：
 客户端与设备上的 frida-server 必须同一个版本，且**都不能是 17.19.0**
 （那一版 attach 任何进程都会抛 `TransportError: agent connection closed unexpectedly`，
 `spawn` 却是好的 —— 详见下面的"环境要求"）。
@@ -57,27 +57,34 @@ python src/main.py
 #   spawn / attach [pid]   注入（游戏关掉了用 spawn，还开着用 attach）
 #   其余设置见下面的"控制台"
 
-# 规划模块：吃一个谱面文件、吐一个规划结果文件（落盘的那份同时就是缓存）
-python src/planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
-python src/planner.py Chart.json --no-cache     # 既不吃也不写缓存
-python src/planner.py Chart.json --planner radical -o /tmp/out
+# 规划模块：吃一张采集下来的谱面、吐一份规划结果（落盘的那份同时就是缓存）
+python src/planner.py charts/Glaciaxion.SunsetRay.0_HD_93215ea2.npz
+python src/planner.py Chart.npz --options              # 这个规划器能调什么
+python src/planner.py Chart.npz --planner radical --set flick_repeats=1
+python src/planner.py Chart.npz -o /tmp/out --no-cache  # 既不吃也不写缓存
 
-# 触控模块：把一个 .psap 发到设备上（自己跑 = 不接游戏，按本地时钟打）
-python src/touch.py plans/0002_..._conservative.psap
-python src/touch.py plans/x.psap --mirror --latency 0.02
-python src/touch.py plans/x.psap --backend recording   # 不连设备，只跑调度器看迟到量
+# 触控模块：把一份规划结果发到设备上（自己跑 = 不接游戏，按本地时钟打）
+python src/touch.py plans/Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.npz
+python src/touch.py plans/x.npz --mirror --latency 0.02
+python src/touch.py plans/x.npz --backend recording   # 不连设备，只跑调度器看迟到量
 
 # 可视化：把规划结果渲染成能叠到录屏上的视频
-python src/render.py plans/0002_..._conservative.psap
-python src/render.py plans/x.psap --size 1280x720 --fps 30 --background chroma
-python src/render.py plans/x.psap --no-paths --point-color "#00ff88" --point-radius 12
+python src/render.py plans/Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.npz
+python src/render.py plans/x.npz --size 1280x720 --fps 30 --background chroma
+python src/render.py plans/x.npz --no-paths --point-color "#00ff88" --point-radius 12
+
+# 看 npz 里到底有什么（谱面原文 / 规划结果 / meta 都是它）
+python src/npz.py charts/Glaciaxion.SunsetRay.0_HD_93215ea2.npz
+python src/npz.py plans/x.npz --member meta
+python src/npz.py charts/x.npz --member chart -o chart.json   # 把谱面原文取出来
 
 # 算法体检：按**游戏真实的判定规则**把规划重放一遍，报丢音、蹭键、判定分布与分数
 # （和 selftest 分工：那边抓代码 bug，这边揪算法问题；慢，而且谱面越多越慢）
 python src/judge.py
 python src/judge.py --planner geometric
 python src/judge.py --chart Dlyrotz
-python src/judge.py --plan plans/x.psap -v
+python src/judge.py --plan plans/x.npz -v
+python src/judge.py --planner geometric --set flick_repeats=1   # 拿一组参数体检
 python src/judge.py --json out.json
 ```
 
@@ -86,11 +93,12 @@ python src/judge.py --json out.json
 回到初始状态）—— planner / latency / auto-latency / backend / cache / save-chart / device / host
 都在里面。
 
-**落盘的规划结果就是缓存**：一张谱面 + 一个规划器对应一个 `.psap`，下次同样的组合
-直接读回来（算法源码动过自动失效）。`cache off` 表示既不吃也不写。
+**落盘的规划结果就是缓存**：一张谱面 + 一个规划器对应一个 `.npz`。命中与否看它 meta 里的
+``cache_key``（算法源码 + 规划器名 + **这一套参数**），所以换了参数一定重算；参数不进文件名，
+一个规划器就一个文件。`cache off` 表示既不吃也不写。
 
-`planner.py` 单独跑时会先找同目录下的 `<名字>.meta.json`（采集时留下的那份），
-从里面恢复序号、来源上下文与内容哈希，所以单独规划出来的结果和主干规划的落在同一个命名下。
+谱面与规划结果都是 **npz**：原文（或事件流）与那段 `meta`（来源、统计、算法指纹）**装在
+同一个文件里**，没有陪嫁的 `.meta.json`。想用眼睛看，就 `python src/npz.py <那个文件>`。
 
 ## 第一次上设备：按这个顺序
 
@@ -99,7 +107,7 @@ python src/judge.py --json out.json
 
 1. `cd src && python -m backends.scrcpy` —— 只查 adb、server 文件和屏幕尺寸（包内相对
    import，得在 `src/` 里用 `-m` 跑）；
-2. `python src/touch.py <某个短谱的 .psap> --backend recording` —— 调度器；
+2. `python src/touch.py <某个短谱的 .npz> --backend recording` —— 调度器；
 3. `python src/main.py`，然后在控制台里 `backend recording` + `spawn` —— **整条链**（闸门、
    缓存、对表、排事件）都不碰设备地跑一遍，对着日志看 `[gate]`、`[plan]`、
    `[touch] 打完：发了 N 个事件，最大迟到 X ms` 合不合意；
@@ -107,7 +115,7 @@ python src/judge.py --json out.json
    会把整张谱**逐个报成 Miss / Bad**：这正好把音符表从头到尾走一遍，不用碰设备就能验两件事
    —— `[notes] 音符表就绪：N 个音符` 的 N 等于这张谱的音符数，以及 `[judge]` 那几行里
    **没有一句**"（音符表里没有它）"。对得上再 `inject on`；
-5. `python src/touch.py <同一个 .psap>` —— 真发。先用一首短谱看能不能点到，再调 `latency`；
+5. `python src/touch.py <同一份 .npz>` —— 真发。先用一首短谱看能不能点到，再调 `latency`；
 6. `spawn`（或 `attach`）—— 全自动。第一次要 `devices` 看列表、`device <id>` 选一台
    （USB 下那个 id 就是 adb 的序列号），之后就记住了。
 
@@ -120,26 +128,33 @@ python src/judge.py --json out.json
 auto> help
 命令：
   devices                  列出设备（USB、本机、远程 server）
-  device <id>              选中一台设备（记住）
+  device <id>              选中一台设备
   spawn                    在选中的设备上启动游戏并注入
   attach [pid]             附加到已经在跑的游戏（pid 可选）
+  detach                   断开注入（设备与后端留着，可再 attach）
   status                   现在什么情况：设备、agent、后端、时钟、这一局
-  planner [名字]             看可用规划器 / 换一个（下一关生效，记住）
-  latency [值]              看 / 改注入补偿：0.02、20ms、+5ms（记住；手动给数会关掉自校准）
-  latency auto on|off      每局完整打完，按这一局 Perfect 的中位数自动校准补偿（记住）
-  backend [名字]             看 / 换触控后端（换了当场重开，记住）
-  cache on|off             把 plans/ 里的规划当缓存用（记住）
-  save-chart on|off        顺便把谱面原文存到 charts/（记住）
-  log on|off               把输出抄一份到 logs/<时间>.log（记住）
-  host add <地址>            加 / 看远程 frida-server（记住）
+  planner [名字]            看可用规划器 / 换一个（下一关生效）
+  option [名字 值]          看 / 改当前规划器的参数（下一关生效）
+  latency [值]             看 / 改注入补偿：0.02、20ms、+5ms（手动给数会关掉自校准）
+  latency auto on|off      每局完整打完，按这一局 Perfect 的中位数自动校准补偿
+  backend [名字]            看 / 换触控后端（换了当场重开）
+  cache on|off             把 plans/ 里的规划当缓存用
+  save-chart on|off        顺便把谱面原文存到 charts/
+  log on|off               把输出抄一份到 logs/<时间>.log
+  host add <地址>            加 / 看远程 frida-server
   inject on|off            是否真的把触控发给设备（仅本次会话）
   verbose on|off           是否把每一个 Perfect 也打出来（仅本次会话）
   help                     列出这些命令
   quit                     收工：断开注入并退出（等同 Ctrl+C）
 ```
 
-`respawn` / `reattach` 是 `spawn` / `attach` 的老名字，照样能用。改了就是立刻生效：
-`latency` 下一个事件起、`planner` 下一关起、`inject` / `verbose` 当场起、`backend` 当场重开。
+改了就是立刻生效：`latency` 下一个事件起、`planner` / `option` 下一关起、`inject` / `verbose`
+当场起、`backend` 当场重开。除了 `inject` / `verbose`，其余都落盘进 `config.json`。
+
+**规划器的参数是配置项**：`option` 不带参数列出当前规划器能调什么（名字、默认值、说明），
+`option flick_repeats 3` 改一个、`option flick_repeats reset` 还原。同一份东西也在
+`config.json` 的 `planner_options` 里（`{"radical": {"flick_repeats": 3}}`），可以照着改。
+换参数会让那份规划结果的缓存失效并重算 —— 参数算进了 cache_key，但**不进文件名**。
 
 **`inject` 与 `verbose` 故意不落盘**：一个持久化的 `inject off` 会让人下一次以为在打歌、
 其实一根手指都没发出去。
@@ -161,15 +176,15 @@ auto> help
 ## 可视化
 
 ```sh
-python src/render.py plans/0002_..._conservative.psap
+python src/render.py plans/Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.npz
 ```
 
-把 `.psap` 里的手指运动画成视频：手指是点，运动轨迹是线。默认输出**带 alpha 的 `.mov`**，
+把规划结果里的手指运动画成视频：手指是点，运动轨迹是线。默认输出**带 alpha 的 `.mov`**，
 因为这东西的用途是叠到游戏录屏上做对照，能直接拖进 Premiere / AE。
 
 | 参数 | 说明 |
 |---|---|
-| `plan` | 输入的 `.psap` |
+| `plan` | 输入的 `.npz` |
 | `-o, --output` | 输出文件（默认 `renders/<名字>.mov`） |
 | `--size` | 分辨率，如 `1920x1080`（默认）；宽高会向上取到 8 的倍数 |
 | `--fps` | 帧率，默认 60 |
@@ -202,26 +217,25 @@ python src/judge.py        # 算法有没有问题 —— 逐张谱 × 每个规
 * **判定分布与分数** —— `900000 × acc + 100000 × maxCombo / N`，拿实机那局对过账（1156
   音符 / 1152 Perfect / 2 Good / 连击 613 → 950926 分，与游戏报的一分不差）。
 
-`selftest.py` 里另有十三组"整条链上下游"的检查：闸门、时钟、坐标换算、缓存、播放器、
-控制台、附加目标、配置、存活探测、收工、结算、判定对账、在位时长。每组的判据、以及它们
-各自做过哪些变异测试，写在 [impl.md](docs/impl.md#自检)。`charts/` 空着时缓存自检会跳过。
+`selftest.py` 里另有十六组"整条链上下游"的检查：闸门、时钟、坐标换算、播放器、控制台、
+附加目标、存活探测、收工、结算、延迟自校准、判定对账、裁判、在位时长、配置、日志、缓存。
+每组的判据、以及它们各自做过哪些变异测试，见 [impl.md](docs/impl.md#自检) 的「自检」一节
+与它的附录「黑历史」；`charts/` 空着时缓存自检会跳过。
 
 ## 输出
 
 ```
 charts/
-  Glaciaxion.SunsetRay.0_HD_93215ea2.json        # 谱面 JSON（FromJson 抓到的原文）
-  Glaciaxion.SunsetRay.0_HD_93215ea2.meta.json   # 来源上下文 + 长度 + 哈希 + 音符数比对
+  Glaciaxion.SunsetRay.0_HD_93215ea2.npz        # chart = FromJson 抓到的原文；meta = 来源上下文 + 长度 + 哈希 + 音符数比对
 plans/
-  Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.psap      # 规划结果 = 缓存（规范解，不镜像不偏移）
-  Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.meta.json # 规划参数、统计、告警、cache_key
+  Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.npz   # 事件流 + meta（规划参数、统计、告警、cache_key）
 renders/
-  Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.mov       # 可视化视频（带 alpha）
+  Glaciaxion.SunsetRay.0_HD_93215ea2_conservative.mov   # 可视化视频（带 alpha）
 ```
 
-谱面只有一份，文件名里的哈希就是它的内容哈希；`<名字>.json` + `<名字>.meta.json` +
-`<名字>_<规划器>.psap` 三者前缀永远一致。镜像与延迟**不落盘**（它们是运行时的事），
-所以同一份 `.psap` 对所有局面通用。
+谱面只有一份，文件名里的哈希就是它的**内容**哈希；`<名字>.npz` 与 `<名字>_<规划器>.npz`
+前缀永远一致（规划结果自己的 meta 里也记着它对应哪张谱面）。镜像与延迟**不落盘**
+（它们是运行时的事），所以同一份规划结果对所有局面通用。
 
 > `<名字>` = **歌曲 + 难度 + 内容哈希**，**不含 `seq`**。`seq` 是 agent 的会话内计数器
 > （这一局进程里解析的第几张谱面），换个会话同一张谱面就会拿到另一个号。曾经把它拼进
@@ -229,9 +243,9 @@ renders/
 > 闸门里现算几十秒 —— 缓存永远落空。`seq` 仍然写进 meta、仍然出现在日志的
 > `[gate #0002]` 里，只是不参与身份。
 
-`meta.json` 里 `notes_in_json`（主机从 JSON 数出来的）与 `notes_reported`（游戏自己
+谱面 meta 里 `notes_in_json`（主机从原文数出来的）与 `notes_reported`（游戏自己
 `Chart::GetNoteCount` 数出来的）应当一致，`notes_match` 给出结论 —— 这是"抓到的就是
-游戏真正用的那一份"的证据。`cache_key` 则是"这份结果是哪一版算法算出来的"。
+游戏真正用的那一份"的证据。规划结果 meta 里的 `cache_key` 则是"这份结果是哪一版算法算出来的"。
 
 ## 环境要求
 
@@ -286,12 +300,13 @@ auto_phigros/
     main.py             薄入口：读/建 config.json → 起主干（控制台）→ 收工
     planner.py          规划模块（落盘即缓存），可被调用、也可单独运行
     touch.py            触控模块：时钟、调度器、命令行，可单独运行
-    render.py           可视化：把 .psap 渲染成视频
+    render.py           可视化：把规划结果渲染成视频
     judge.py            算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
+    npz.py              查看工具：把谱面 / 规划结果的 npz 读成 JSON
     selftest.py         薄入口：代码自检（真正的东西在 tests/ 里）
     algorithms/         规划算法与契约（registry 按名字现 import）；judging.py 是判定规则唯一出处
     backends/           触控后端（scrcpy / recording）
-    formats/            .psap 编解码 + 落盘（storage.py）
+    formats/            npz 的读写：谱面与规划结果的布局都在 storage.py
     runtime/            主干那一套
       console.py        主干：命令表 + 读输入（跑在主线程上，Ctrl+C 落在这里）
       controller.py     这一把的全部家当：设备、后端、时钟、注入、播放器、收工
@@ -322,6 +337,9 @@ auto_phigros/
 * **包内的兄弟模块一律相对 import**（`from .config import …`）：包被搬走或改名都不会断；
   `from config import …` 那种写法其实要靠 `sys.path` 才成立 —— 上次按职责细分目录时就断在这里，
   自检直接 `ModuleNotFoundError`，别再写回去。
+* **可调的东西写成配置项，不写成常量**：规划器参数进 `config.json` 的 `planner_options`
+  （控制台 `option` 改，`planner.py/judge.py --set` 也能临时给），运行期旋钮进 `Options`。
+  只有游戏/引擎的事实（判定窗口、时间栅格、地址偏移）才留作常量。
 
 每个模块的职责与设计取舍见 [impl.md](docs/impl.md#结构)。
 
@@ -329,5 +347,5 @@ auto_phigros/
 
 * 真后端只有 scrcpy 一个。要加别的（比如 frida 侧注入、minitouch），
   在 `src/backends/registry.py` 的 `_BUILTIN` 里加一行、写一个模块即可。
-* `--latency` 只能手工调，还没有"打完一局看判定结果自动回填"的闭环 —— 现在有判定流水了，
-  这个闭环的原料（每个音符判成什么、早晚多少）已经齐了。
+* human-like 算法：草案在 [human-like.md](docs/human-like.md)，一行代码还没写。
+* geometric 合并拖拽那条路上还有一处可以更省的线性扫描。

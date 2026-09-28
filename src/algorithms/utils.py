@@ -1,15 +1,18 @@
 """规划器的契约层。
 
-规划器只依赖本模块、``screen`` 与 ``chart``：它们不 import frida、不打印、
-不关心谱面从哪来、结果往哪去。主机用 ``registry`` 造出规划器、注入 ``Progress``、
-把结果交给 ``storage`` —— 这就是本项目依赖注入的全部约定。
+规划器只依赖本模块、``screen`` 与 ``chart``：不 import frida、不打印、不关心谱面从哪来。
+主机用 ``registry`` 造出规划器、注入 ``Progress``、把结果交给 ``storage``。
+
+规划器的可调参数是**配置项**，不是散落在模块里的常量：每个规划器声明一个配置
+dataclass（字段默认值 + 一句 ``metadata={"help": ...}``），:func:`build_options` 负责
+把用户写的覆盖项盖上去。``planner.py`` / ``judge.py`` / 控制台都从这条路上走。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, NamedTuple, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, NamedTuple, Protocol, TypeVar
 
 if TYPE_CHECKING:
     from .chart import Chart
@@ -26,20 +29,9 @@ T = TypeVar("T")
 MIN_DWELL_MS = 20
 """一根手指摆到一个位置之后，至少要保持这么久才允许被挪走或抬起。
 
-因为**游戏是逐帧读手指位置的**：``JudgeControl::GetFingerPosition`` 每帧重算一次
-``fingerPositionX = (手指 − 判定线原点)·判定线朝向``，而手指在两次触控事件之间是不动的
-—— 判定线一直在动，手指的横向偏移就跟着漂。所以一个音符能不能被判到，取决于"它窗口里
-有没有**整整一帧**手指都落在容差内"，而不是"有没有那么一瞬间对上"：
-
-* Tap / Hold 头判只看"按下那一帧"（``CheckNote`` 只为 ``phase == Began`` 的手指调用），
-  按下去之后马上抬起没关系；
-* Drag / Flick 是逐帧比位置的（``DragControl::Judge`` 的窗口是 ±0.1s），
-  手指在窗口里只停 1 毫秒，能不能撞上帧全看运气 —— 实测就是这么漏音的。
-
-取 20ms = 一帧多一点。一帧有多长由游戏的帧率策略定
-（``GameInformation::CheckFrameRate``：刷新率 ≤ 89Hz 时 ``targetFrameRate = 60``，
-更高则取 ``2 × 刷新率``，上限 300；``vSyncCount`` 恒为 0），
-60fps 是它支持的最低档，就按这一档兜底。
+游戏是**逐帧**读手指位置的（``JudgeControl::GetFingerPosition``），两次触控事件之间手指
+不动、判定线在动，所以"能不能判到"取决于窗口里有没有整整一帧手指都落在容差内。
+取 20ms = 游戏支持的最低帧率（60fps）的一帧多一点。推导见 impl.md 的"在位时长"。
 """
 
 
@@ -47,13 +39,13 @@ class PlanningError(RuntimeError):
     """规划器给不出可行解，例如同时按下的音符超过十指上限。"""
 
 
-class Touch(IntEnum):
-    """触控动作。
+WARNING_LIMIT = 20
+"""每个规划器最多写多少条 ``warnings``：同一类问题成片出现时，再多日志就没法看了。"""
 
-    编号是**本项目内部**的（DOWN/MOVE/UP/CANCEL = 0/1/2/3），随 ``.psap`` 一起落盘。
-    Android 的 MotionEvent 动作码是 DOWN/UP/MOVE/CANCEL = 0/1/2/3 —— MOVE 与 UP 对调，
-    所以下发到设备前由触控后端显式映射（``scrcpy.py`` 的 ``_ACTIONS``）；
-    规划结果本身不跟 Android 的 ABI 绑在一起。
+
+class Touch(IntEnum):
+    """触控动作。编号是项目内部的约定，下发前由触控后端映射成 Android 的 MotionEvent 码
+    （那边 MOVE / UP 与这里**对调**，见 ``backends/scrcpy.py`` 的 ``_ACTIONS``）。
     """
 
     DOWN = 0
@@ -88,6 +80,84 @@ class SilentProgress:
         return iter(iterable)
 
 
+@dataclass(frozen=True, slots=True)
+class Parameter:
+    """规划器的一个可调参数：名字、默认值、一句话说明。"""
+
+    name: str
+    default: Any
+    help: str
+
+
+def parameters(config_type: type[Any]) -> tuple[Parameter, ...]:
+    """从配置 dataclass 里读出参数表 —— 说明就写在字段的 ``metadata`` 里。"""
+    return tuple(
+        Parameter(item.name, item.default, str(item.metadata.get("help", "")))
+        for item in fields(config_type)
+    )
+
+
+def build_options(config_type: type[T], options: Mapping[str, Any] | None = None) -> T:
+    """把覆盖项盖到默认值上。
+
+    认不得的名字、类型不对的值都当场报错 —— 配置写错了不该悄悄按默认值跑完整首歌。
+    """
+    if not options:
+        return config_type()
+    defaults = {item.name: item.default for item in fields(config_type)}
+    unknown = sorted(set(options) - set(defaults))
+    if unknown:
+        raise ValueError(f"不认识的参数：{'、'.join(unknown)}")
+    return config_type(**{name: _coerce(name, defaults[name], value) for name, value in options.items()})
+
+
+def _coerce(name: str, default: Any, value: Any) -> Any:
+    """按默认值的类型收一下用户给的值（命令行与控制台都只能写字）。"""
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} 要 true / false，给的是 {value!r}")
+        return value
+    if isinstance(default, int):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} 要整数，给的是 {value!r}")
+        if float(value) != int(value):
+            raise ValueError(f"{name} 要整数，给的是 {value!r}")
+        return int(value)
+    if isinstance(default, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} 要数，给的是 {value!r}")
+        return float(value)
+    if not isinstance(value, type(default)):
+        raise ValueError(f"{name} 要 {type(default).__name__}，给的是 {value!r}")
+    return value
+
+
+def parse_option(text: str) -> Any:
+    """把命令行 / 控制台里写的一个值变成 Python 值：``1`` / ``1.5`` / ``true`` / 其余当字符串。"""
+    lowered = text.strip().lower()
+    if lowered in ("true", "on", "yes"):
+        return True
+    if lowered in ("false", "off", "no"):
+        return False
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return text
+
+
+def options_from_args(pairs: Iterable[str] | None) -> dict[str, Any]:
+    """把 ``名字=值`` 这样的命令行参数解析成覆盖项（类型由 :func:`build_options` 收）。"""
+    options: dict[str, Any] = {}
+    for pair in pairs or ():
+        name, _, text = pair.partition("=")
+        if not name.strip() or not text:
+            raise ValueError(f"要写成 名字=值，收到的是 {pair!r}")
+        options[name.strip()] = parse_option(text)
+    return options
+
+
 @dataclass(slots=True)
 class PlanResult:
     """一张谱面的完整规划结果：按时间戳（毫秒）分组的触控事件序列。"""
@@ -113,16 +183,9 @@ class PlanResult:
     def mirrored(self) -> PlanResult:
         """水平镜像：每个触点 ``x → 屏宽 − x``。
 
-        游戏打开"谱面镜像"时，``Chart::Mirror`` 对场景做的是**整个画面绕中线左右翻**：
-        判定线移动事件 ``x → 1 − x``、旋转事件 ``θ → −θ``、音符 ``positionX → −positionX``。
-        三者合起来，判定线上的每个点都只是变成了 ``(16 − x, y)``：
-
-        .. code-block:: text
-
-            note' = (16 − lx, ly) + R(−θ)·(−offset) = (16 − (lx + offset·cosθ), ly + offset·sinθ)
-
-        最后一项正好是原音符判定点的镜像。既然要按的每个点都只是翻了个身，那规划结果
-        跟着翻一下，就是镜像后谱面的解 —— 镜像**不需要重算**，重算反而要再去读一遍谱面。
+        ``Chart::Mirror`` 把画面绕中线左右翻（判定线 ``x → 1−x``、``θ → −θ``、音符
+        ``positionX → −positionX``），合起来就是判定线上每个点 ``(x, y) → (16−x, y)``，
+        所以镜像**不需要重算**，翻一下坐标就是镜像后谱面的解。推导与验收见 impl.md。
         """
         width = self.screen.width
         return PlanResult(
@@ -138,11 +201,7 @@ class PlanResult:
 
 
 class Planner(Protocol):
-    """规划器接口。``registry`` 按名字造出实例，主机只认这个形状。
-
-    叫什么、干什么用的写在 ``registry`` 的清单里，不在这里重复一份 ——
-    清单要能在不 import 任何算法的前提下列出来。
-    """
+    """规划器接口。``registry`` 按名字造出实例，主机只认这个形状。"""
 
     name: str
 

@@ -1,23 +1,14 @@
 """自检入口：**只跑与代码有关的那几项**，不逐张谱做规划。
 
-分工是这样的（`python src/selftest.py` 与 `python src/judge.py` 各管一头）：
-
-* 这里 —— 捕捉**真正的 bug**：闸门放不放行、时钟会不会偏早、坐标换算、播放器排期、
-  控制台回显、存活探测、收工、结算、判决对账、在位时长、规划缓存。都很快，
-  与 `charts/` 里有几张谱无关；
-* `judge.py` —— 揪**算法问题**：逐张谱 × 每个规划器跑一遍，报丢音、蹭键、判定分布。
-  那个慢，而且慢得有用（谱面越多越慢）。
-
-唯一用到谱面的是缓存自检（它得真的规划一次才能验编解码往返），所以只挑**最小**的那张。
+这里捕捉真正的 bug（闸门放行、时钟、坐标、播放器排期、控制台、探活、收工、结算、
+判决对账、在位时长、规划缓存），与 `charts/` 里有几张谱无关；逐张谱 × 规划器的算法体检
+在 `judge.py`。唯一用到谱面的是缓存自检（要真的规划一次），所以只挑**最小**的那张。
 """
 
 from __future__ import annotations
 
 if __package__ in (None, ""):
-    # `python src/tests/cli.py` 这种跑法：进 sys.path 的是脚本目录 `src/tests/`，而顶层包在它
-    # 上一层的 `src/` 里，于是 `import algorithms` 立刻失败（相对 import 更是连父包都没有）。
-    # 既然 `tests/__init__.py` 里承诺了"哪种跑法都能跑"，这里就自己把源码根挂上、再以包的身份
-    # 跑一遍。
+    # `python src/tests/cli.py` 跑法：脚本目录是 src/tests/、顶层包在 src/ 里，自己挂上源码根再以包的身份跑一遍。
     import sys
     from pathlib import Path
 
@@ -28,6 +19,7 @@ if __package__ in (None, ""):
 
 from algorithms import catalog
 
+from formats.storage import CHART_SUFFIX, load_chart
 from . import ROOT
 from .accounting import check_calibration, check_judge, check_result
 from .attach import check_attach
@@ -35,14 +27,12 @@ from .console import check_console
 from .coverage import TOLERANCE, check_dwell
 from .liveness import check_liveness, check_shutdown
 from .referee import check_referee
-from .runtime import check_cache, check_clock, check_gate, check_log_file, check_pixels, check_player
+from .pipeline import check_cache, check_clock, check_gate, check_log_file, check_pixels, check_player
 from .settings import check_config
 
 
 def _charts() -> list:
-    return sorted(
-        path for path in (ROOT / "charts").glob("*.json") if not path.name.endswith(".meta.json")
-    )
+    return sorted((ROOT / "charts").glob(f"*{CHART_SUFFIX}"))
 
 
 def main() -> int:
@@ -87,7 +77,7 @@ def main() -> int:
 
     if charts:
         smallest = min(charts, key=lambda path: path.stat().st_size)
-        problems = check_cache(smallest.read_text(encoding="utf-8"))
+        problems = check_cache(load_chart(smallest)[0])
         print(f"缓存自检（最小的 {smallest.name}）：" + ("通过" if not problems else "有问题"))
         for problem in problems:
             print(f"  ! {problem}")

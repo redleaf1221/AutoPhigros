@@ -1,11 +1,8 @@
 /* =============================================================================
  * 与 il2cpp 打交道的零碎工具
  * -----------------------------------------------------------------------------
- * 两个原则：
- *
- * 1. **读字段一律用 ``tryField``** —— 字段名一旦对不上（换版本、IDA 认错类型）就安静地
- *    跳过，绝不让观测把游戏搞崩；
- * 2. **读不到就是 null**，由调用方决定怎么退化，这里不猜。
+ * 读字段一律走 ``tryField``：字段名对不上（换版本、类型认错）就安静返回 null，
+ * 绝不让观测把游戏搞崩；读不到就是 null，由调用方决定怎么退化。
  * ========================================================================== */
 
 /** 遍历所有程序集找类，避免硬编码程序集名。 */
@@ -29,9 +26,7 @@ export function readStringField(obj: Il2Cpp.Object, fieldName: string): string |
     }
 }
 
-/**
- * 读一个对象字段（失败、字段不存在、值为 null 都返回 null）。
- */
+/** 读一个对象字段（失败、字段不存在、值为 null 都返回 null）。 */
 export function readObjectField(obj: Il2Cpp.Object | null, fieldName: string): Il2Cpp.Object | null {
     if (obj === null) {
         return null;
@@ -99,13 +94,9 @@ export function readStaticNumberField(klass: Il2Cpp.Class | null, fieldName: str
     }
 }
 
-/**
- * 遍历一个 ``List<T>``（只走前 ``_size`` 个，容量 ``_items.length`` 通常更大）。
- *
- * 用 ``_items`` / ``_size`` 两个字段直接走数组，而不是调一次 ``get_Item`` 托管方法：
- * 一张谱面上千个音符，每个音符省一次托管调用与一次装箱，建表就只是纯内存读。
- * 返回真正遍历到的元素个数（拿不到列表就是 0）。
- */
+/** 遍历 ``List<T>`` 的前 ``_size`` 项（容量 ``_items.length`` 通常更大），返回遍历到的个数。
+ * 直接走 ``_items`` / ``_size`` 而不调托管 ``get_Item``：一张谱面上千个音符，省掉每个音符一次
+ * 托管调用与一次装箱；拿不到列表就是 0。 */
 export function forEachInList(
     list: Il2Cpp.Object | null,
     visit: (item: Il2Cpp.Object) => void

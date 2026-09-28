@@ -1,13 +1,7 @@
 """附加目标的解析：**先问应用列表，再问进程列表，最后才按名字找**。
 
-这条顺序是被实机教出来的（2026-09-27 那台 OPPO/MTK 设备）：
-
-    enumerate_processes()  里有 (30501, 'Phigros')          ← 进程名是**应用标签**
-    enumerate_applications() 里有 ('com.PigeonGames.Phigros', 30501)
-    device.attach('com.PigeonGames.Phigros') → ProcessNotFoundError
-
-即"游戏明明开着，按包名却找不到"。所以这里的用例全都盯着一件事：**包名不在进程列表里
-时也必须附加得上**，而且失败时要自己把 frida 看得见的东西列出来（不然永远只能靠猜）。
+盯的是一件事：**包名不在进程列表里时也必须附加得上**（实机上有进程名是应用标签
+``Phigros``、包名只在应用列表里的设备）。失败时要把 frida 看得见的东西列出来。
 """
 
 from __future__ import annotations
@@ -111,7 +105,7 @@ def _check_attach() -> list[str]:
     )
     expect(
         build(device)._resolve_target() == 30501,  # noqa: SLF001
-        "包名不在进程列表里时，没能从应用列表拿到 pid（这正是实机上 attach 失败的原因）",
+        "包名不在进程列表里时，没能从应用列表拿到 pid",
     )
 
     # 2) 应用列表读不到，但进程名就是包名
@@ -153,7 +147,5 @@ def _check_attach() -> list[str]:
     for fragment in ("30501", config.PACKAGE, "Phigros"):
         expect(fragment in text, f"候选清单里少了 {fragment!r}：{text!r}")
     expect("--pid" in text, "没告诉人可以用 --pid 绕开名字查找")
-
-    return problems
 
     return problems

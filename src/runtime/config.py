@@ -1,19 +1,8 @@
 """项目内的固定常量，以及**落盘的那份配置**。
 
-两种东西放在一起，是因为它们是同一件事的两面：哪些是"默认值"（写死在这里），哪些是
-"用户改过的"（覆盖在 `config.json` 里）。判断标准很简单 —— **删掉 `config.json` 应该
-回到刚 clone 下来的状态**，所以它不进版本库（见 `.gitignore`）。
-
-哪些不进 config.json，以及为什么
---------------------------------
-``inject`` / ``verbose`` 只活在会话里：
-
-* 一个持久化的 ``inject off`` 会让你下一次以为正在打歌，其实一根手指都没发出去 ——
-  这种"配置留下的坑"比多敲一次命令贵得多；
-* ``verbose`` 是排障开关，开着一局几百条 Perfect，没有理由跨会话记住。
-
-``spawn`` / ``attach`` 也不落盘：它们是**一次动作**，不是设置。下次启动要不要注入，
-由你再打一次决定。
+写死在这里的是"默认值"，用户改过的覆盖在 `config.json` 里 —— **删掉它就回到刚 clone 的
+状态**，所以它不进版本库。``inject`` / ``verbose`` 只在会话里活着（一个持久化的
+``inject off`` 会让人下次以为在打歌），它们是 ``options.py`` 的事。
 """
 
 from __future__ import annotations
@@ -23,17 +12,13 @@ import sys
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from algorithms import DEFAULT_PLANNER
 from .output import log
 
 ROOT = Path(__file__).resolve().parents[2]
-"""项目根目录 —— ``src/`` 的上一层。
-
-源码整体搬进 ``src/`` 之后，这个文件是 ``src/runtime/config.py``，所以项目根在它的**上两层**。
-数据（``charts/`` / ``plans/`` / ``logs/`` / ``target/``）与 ``config.json`` 都留在项目根，
-不在源码树里 —— 运行时用这个常量找它们，别再拿 ``Path(__file__).parent`` 往上去拼。
-"""
+"""项目根目录 —— ``src/`` 的上一层（本文件在 ``src/runtime/`` 里）。"""
 
 CONFIG_PATH = ROOT / "config.json"
 """落盘配置的位置。"""
@@ -52,11 +37,7 @@ LOGS_DIR = ROOT / "logs"
 
 
 def log_file_path(moment: datetime | None = None) -> Path:
-    """这一次运行的日志文件：``logs/2026-02-14_13-45-02.log``。
-
-    为什么一次一份而不是覆盖同一个文件：出问题的时候你要比的是"这次和上次有什么不一样"，
-    而覆盖恰好把上一次抹掉了 —— 那是最需要它的时候。
-    """
+    """这一次运行的日志文件：``logs/2026-02-14_13-45-02.log``。"""
     stamp = (moment or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
     return LOGS_DIR / f"{stamp}.log"
 
@@ -77,6 +58,13 @@ class Config:
     planner: str = DEFAULT_PLANNER
     """用哪个规划器。下一关生效（规划本来就在开谱那一刻做）。"""
 
+    planner_options: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """各规划器的参数覆盖项：``{"radical": {"flick_repeats": 1}}``。
+
+    没写的参数用规划器自己的默认值。控制台 ``option`` 改的就是这里，改了之后那份规划结果
+    的缓存自动失效（参数算进 cache_key）。
+    """
+
     backend: str = "scrcpy"
     """用哪个触控后端。换的时候当场重开。"""
 
@@ -84,13 +72,7 @@ class Config:
     """注入链路的手工补偿（秒），正数 = 提前发。立刻生效。"""
 
     auto_latency: bool = True
-    """每一局**完整打完**之后，用这一局 Perfect 的中位数自动校准 `latency` 并落盘。
-
-    为什么要它：我们发出触摸、游戏在**下一帧**才处理（实测中位 +29ms），所以设备那边量到的
-    早晚量会稳定偏正。这不是"计划错了"，是送达晚了一帧 —— 该由延迟补偿吃掉，而且该自动吃。
-
-    手动 `latency <值>` 会把它关掉（见 `console.py`）：人一旦自己定了数，就别再让机器改。
-    """
+    """每一局**完整打完**之后，用这一局 Perfect 的中位数自动校准 `latency` 并落盘。"""
 
     cache: bool = True
     """把 `plans/` 里的规划结果当缓存用：命中就不重算。关掉 = 既不吃也不写。"""
@@ -99,21 +81,13 @@ class Config:
     """把采集到的谱面原文存到 `charts/`。"""
 
     log: bool = True
-    """把这一次运行的输出抄一份到 `logs/<时间>.log`。
-
-    默认开着：这东西的价值全在"出事之后" —— 真出问题时再让人记得打开就晚了。代价只是
-    一次运行一个文本文件（我们的输出量很小），所以不必省。
-    """
+    """把这一次运行的输出抄一份到 `logs/<时间>.log`。"""
 
     # ------------------------------------------------------------ 读写
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
-        """读配置；**不存在就按默认值写一份**，坏了就备份成 `.bak` 再来一份。
-
-        为什么缺文件时要写出来而不是静默用默认值：让人看得见"能改什么"。一个空目录里
-        跑一次 `python src/main.py` 就该多出一个可以照着改的 `config.json`。
-        """
+        """读配置；不存在就按默认值写一份，坏了就备份成 `.bak` 再来一份。"""
         path = CONFIG_PATH if path is None else path
         if not path.is_file():
             config = cls()

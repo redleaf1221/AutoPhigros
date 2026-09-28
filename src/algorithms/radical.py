@@ -1,56 +1,58 @@
 """激进算法（吸收自 phisap 的"激进算法"）。
 
-思路：把 hold 拆成"开头一次 tap + 之后每毫秒一个 drag"，于是全曲只剩 tap / drag / flick
-三种瞬时动作；然后在 1 毫秒的时间栅格上贪心分配手指 —— 优先复用"还停在屏幕上但已经
-完成使命"的手指（一条 MOVE 就能就位），实在没有才按下新的。手指固定十根，没有就报错
-（``ignore_allocation_errors`` 打开时改为跳过这一笔）。
-
-与 phisap 版本的差别：原实现在调用 ``Screen.remap`` 时把"旋转向量"当成了"弧度"又取了
-一次 ``exp``（``remap(pos, cmath.exp(angle * 1j))``，而 ``angle`` 本身已经是
-``cmath.exp(...)`` 的结果），这里按本意传入旋转向量。
+把 hold 拆成"开头一次 tap + 之后每毫秒一个 drag"，全曲只剩 tap / drag / flick 三种瞬时
+动作；然后在 1 毫秒的时间栅格上贪心分配手指 —— 优先复用刚闲下来、一条 MOVE 就能就位的
+手指，没有才按下新的。
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Iterator, NamedTuple
+from dataclasses import dataclass, field
+from typing import Any, Iterator, Mapping, NamedTuple
 
 from .chart import Chart, NoteType
 from .geometry import Screen, place_note
 from .track import EventTrack
-from .utils import PlanResult, PlanningError, Position, Progress, Touch, TouchEvent, Vector
+from .utils import (
+    WARNING_LIMIT,
+    PlanResult,
+    PlanningError,
+    Position,
+    Progress,
+    Touch,
+    TouchEvent,
+    Vector,
+    build_options,
+)
 
 
 @dataclass(slots=True)
 class RadicalConfig:
-    flick_start: int = -17
-    """滑键手势相对判定时刻的起点偏移（毫秒）。"""
-    flick_end: int = 17
-    flick_repeats: int = 2
-    """一次滑键手势重复划几下。**别调回 1。**
+    """激进算法的参数（控制台 ``option`` 或 config.json 的 ``planner_options`` 都能改）。"""
 
-    游戏那边一次"新起手"（``Fingers.isNewFlick``）只够点亮一个 flick，而且会被判定窗口里
-    更早的音符抢走 —— 一个音符只划一下就是一次机会，漏了就是漏了（``conservative`` 那边
-    同样的理由与测算写在 ``ConservativeConfig.flick_repeats``）。这里每多划一下，
-    就多一次独立机会：第二下从 ``+半径`` **跳**回去重新划，跳变本身就是一次新起手。
-    """
-    flick_sample_ms: int = 2
-    """滑键手势里隔多少毫秒补一个触点。
+    flick_start: int = field(
+        default=-17, metadata={"help": "滑键手势相对判定时刻的起点偏移（毫秒）"}
+    )
+    flick_end: int = field(default=17, metadata={"help": "滑键手势的终点偏移（毫秒）"})
+    flick_repeats: int = field(default=2, metadata={"help": "一次滑键手势重复划几下"})
+    flick_sample_ms: int = field(
+        default=2, metadata={"help": "滑键手势里隔多少毫秒补一个触点"}
+    )
+    flick_direction: int = field(
+        default=1, metadata={"help": "0 = 垂直判定线滑动，1 = 平行判定线滑动"}
+    )
+    recycle_scope_ratio: float = field(
+        default=0.05, metadata={"help": "可以顺手征用的手指与目标的横向距离阈值（占对角线比例）"}
+    )
+    max_pointers: int = field(default=10, metadata={"help": "最多几根手指"})
+    ignore_allocation_errors: bool = field(
+        default=False, metadata={"help": "手指不够时跳过这一笔，而不是报错"}
+    )
 
-    本来是 1ms（这个算法的时间栅格就是 1ms），但重复两下之后事件数直接翻倍：实测
-    ``Eradication Catastrophe`` IN 的峰值冲到 **419 个/秒** —— 而 362 个/秒正是本项目
-    量出来"会把注入链和游戏主线程一起拖住"的那个量级（见 ``ConservativeConfig.sample_delay``）。
-    改成 2ms 之后每个 flick 的事件数与改之前一样多（34 个），峰值回到 200 出头，
-    而每 2ms 走完 ``2/34`` 个半径的位移，比游戏的速度阈值宽得多。
-    """
-    flick_direction: int = 1
-    """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
-    recycle_scope_ratio: float = 0.05
-    """可以顺手征用的手指与目标的横向距离阈值，取屏幕对角线的这个比例。"""
-    max_pointers: int = 10
-    ignore_allocation_errors: bool = False
+
+CONFIG = RadicalConfig
 
 
 class PlainNote(NamedTuple):
@@ -182,10 +184,7 @@ class PointerAllocator:
 
     def _tap(self, pointer: Pointer, note: PlainNote) -> None:
         if pointer.note is not None:
-            # 征用一根还按着的手指：抬起排在**最后一刻**（这一帧的前一毫秒）。
-            # 别排成"上次用完的下一毫秒" —— 手指摆在哪儿就是判定依据，早抬一毫秒
-            # 就等于把上一个音符的覆盖砍成一个时间点，而游戏是逐帧读位置的
-            # （见 algorithms.utils.MIN_DWELL_MS）。
+            # 抬起排在最后一刻（这一帧的前一毫秒）：早抬就把上一个音符的覆盖砍成一个时间点（见 MIN_DWELL_MS）
             self._insert(self.now - 1, pointer.note.position, Touch.UP, pointer.id)
         pointer.note = note
         pointer.age = 0
@@ -236,10 +235,7 @@ class PointerAllocator:
 
     def done(self) -> list[tuple[int, tuple[TouchEvent, ...]]]:
         if self.last_timestamp is not None:
-            # 抬起时刻要同时盖过两件事：
-            #   * flick 的滑动事件会一直铺到当前帧之后若干毫秒；
-            #   * 没有事件产生的帧（drag 被"已经按住的手指"顺手判掉时就是这样）
-            #     手指依然按在屏幕上，不能因为它没说话就把它当成已经抬起。
+            # 抬起时刻要盖过 flick 铺到当前帧之后的滑动事件，以及"没说话但还按着"的手指
             latest = self.track.latest(self.last_timestamp)
             final = max(self.last_timestamp, latest) + 1
             for pointer in self.pointers:
@@ -257,8 +253,8 @@ def _distance(from_note: PlainNote | None, to_note: PlainNote) -> float:
 class RadicalPlanner:
     name = "radical"
 
-    def __init__(self, config: RadicalConfig | None = None) -> None:
-        self.config = config or RadicalConfig()
+    def __init__(self, options: Mapping[str, Any] | None = None) -> None:
+        self.config = build_options(RadicalConfig, options)
 
     def plan(self, chart: Chart, progress: Progress) -> PlanResult:
         screen = chart.screen

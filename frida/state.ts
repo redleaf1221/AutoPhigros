@@ -1,8 +1,8 @@
 /* =============================================================================
  * agent 的全部可变状态
  * -----------------------------------------------------------------------------
- * hooks/ 里那几个模块都往这里读写，而不是各自在自己模块里放一份模块级变量 ——
- * 这样"现在到底处在什么状态"只有一个地方能看，`status` 之类的出口也不会漏掉某一项。
+ * hooks/ 各模块都往这里读写，不放各自的模块级变量：状态只有一个地方能看，
+ * `status` 之类的出口也不会漏项。
  * ========================================================================== */
 
 import type { LevelContext, NoteRef } from "./protocol";
@@ -26,12 +26,8 @@ export const state = {
     /** 已经报过账的那一关；结算方法可能被调两次（断关分支 + 结算协程），只报一次。 */
     lastResultSeq: -1,
 
-    /**
-     * noteCode -> 音符。每次 ``SetCodeForNote`` 重建一份。
-     *
-     * 存的是纯数字（见 ``protocol.ts`` 的 :interface:`NoteRef`），所以判定那一刻
-     * 只是查一次表，不去碰任何 il2cpp 对象。
-     */
+    /** noteCode -> 音符。每次建表（hook 5）重建一份；存的是纯数字（见 ``protocol.ts`` 的
+     * :interface:`NoteRef`），判定那一刻只查一次表，不碰任何 il2cpp 对象。 */
     noteIndex: new Map<number, NoteRef>(),
 
     /** 安装 hook 时留下的类引用，采集时直接复用，不重复查表。 */
@@ -40,7 +36,7 @@ export const state = {
     }
 };
 
-/** 换一关：把只属于上一局的账清掉。 */
+/** 换一关：清掉只属于上一局的账（进度节流、音符表）。 */
 export function resetForLevel(): void {
     state.lastProgressSent = 0;
     state.noteIndex.clear();

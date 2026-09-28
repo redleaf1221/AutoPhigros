@@ -29,7 +29,8 @@ auto_phigros/
     planner.py        规划模块（落盘即缓存），可被调用、也可单独运行
     judge.py          算法体检：按游戏真实判定重放规划（丢音 / 蹭键 / 分布 / 分数）
     touch.py          触控模块：时钟、调度器、命令行，可单独运行
-    render.py         可视化模块，把 .psap 渲染成视频
+    render.py         可视化模块，把规划结果渲染成视频
+    npz.py            查看工具：把谱面 / 规划结果的 npz 读成 JSON
     selftest.py       薄入口：代码自检（判据与替身在 tests/ 里）
     runtime/          主干那一套（不可独立运行；包内用相对 import）
       console.py        主干：命令表 + 读输入（跑在主线程上）
@@ -39,7 +40,7 @@ auto_phigros/
       options.py        运行时设置（控制台改的就是它）
       output.py         进程里唯一的写者：整行原子输出 + 补回提示符 + 抄一份到 logs/
     formats/
-      storage.py        .psap 编解码 + 落盘
+      storage.py        两种 npz 的布局与读写（谱面 / 规划结果）
     tools/
       device_log.py     运行日志的读回（judge --compare 拿它当"设备标准答案"）
     backends/         触控后端，按名字现 import
@@ -48,7 +49,7 @@ auto_phigros/
       registry.py     后端注册表
       scrcpy.py       scrcpy 控制协议（目前唯一的真后端）
       recording.py    干跑：不连设备，只记录（自检与 backend recording 用）
-    tests/            自检包：coverage / archive / runtime / console / liveness / accounting /
+    tests/            自检包：coverage / archive / pipeline / console / liveness / accounting /
                       attach / settings / referee / stubs / cli
     algorithms/
       __init__.py     对外只暴露 catalog() / create() / register()
@@ -388,7 +389,7 @@ op.wait();          // 主线程挂起，等主机 script.post()
 
 判定点只是翻了个身，手指跟着翻一下当然还是判得中 —— 所以 `planner.plan(mirror=True)`
 就是"先对着原文规划，再把结果整体水平翻过去"（`PlanResult.mirrored`），镜像开关原样
-记进来源上下文，`.psap` 和 `meta.json` 里都看得见。
+记进来源上下文，谱面与规划结果的 npz 里都看得见。
 
 > 这条推理有个硬判据：`../src/selftest.py` 会把规划结果翻过来、拿去对 **按 `Chart::Mirror`
 > 规则镜像出来的那份谱面**，要求 393/393 全中。实测镜像前后的最大横向偏差 **逐位相同**
@@ -556,23 +557,41 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 这是**悲观**假设（只认"手指位置跳变"那种够快的起手），它报问题一定有问题，说没问题时
 真机上的机会只会更多。把它掰回"只划一下"，Dlyrotz HD 上立刻报 7 个 flick 点不亮。
 
+### 规划器参数是配置项
+
+三个规划器各有一个配置 dataclass（`ConservativeConfig` / `RadicalConfig` / `GeometricConfig`），
+字段默认值 + 一句 `metadata={"help": ...}` 就是参数表，`registry.parameters(名字)` 读它，
+`registry.create(名字, 覆盖项)` 用它造规划器。三个入口都通到同一张表：
+
+* 控制台：`option` 列清单，`option <名字> <值>` 改，`option <名字> reset` 还原；
+* `config.json` 的 `planner_options`：`{"radical": {"flick_repeats": 3}}`（控制台改的就是它）；
+* 命令行：`planner.py --options`、`planner.py/judge.py --set 名字=值`（可重复）。
+
+`build_options` 按默认值的类型收一遍用户写的值：名字写错、类型不对当场报错，不会悄悄按
+默认值跑完整首歌。**结构性常数不进参数表**：`geometric.FRAME_MS`（时间栅格）、
+`judging.py` 里的判定窗口都是逆向出来的事实，改了就不是这个游戏了，它们留作常量。
+
 ### 规划结果就是缓存
 
-规划结果是**谱面的纯函数**，所以缓存不需要另立门户 —— 落盘的那个 `.psap` 就是缓存：
+规划结果是**谱面 + 规划器 + 参数**的纯函数，所以缓存不需要另立门户 —— 落盘的那份规划结果
+就是缓存：
 
-* 位置由 `storage.plan_path_for` 定：`<谱面文件名前缀>_<规划器>.psap`，
+* 位置由 `storage.plan_path_for` 定：`<谱面文件名前缀>_<规划器>.npz`，
   一张谱面 + 一个规划器对应一个文件，天然一一对应；
-* 命中判据是 meta 里的 `cache_key` —— `../src/algorithms/**/*.py` 加 `../src/planner.py` 的哈希。
-  改了算法、改了谱面解析、改了坐标换算，指纹就变，下次自动重算；
-* 镜像、延迟这些**运行时**设置一概不进缓存：`.psap` 存的是规范解（不镜像、不偏移），
+* 命中判据是同一个文件里 meta 的 `cache_key`：`../src/algorithms/**/*.py` 加
+  `../src/planner.py` 的哈希，**再加上规划器名与这一套参数**。改了算法、改了谱面解析、
+  改了坐标换算、换了参数，指纹都变，下次自动重算；
+* **参数不进文件名**：文件名里塞参数会变成一坨（而且长得没法看），一个规划器一个文件，
+  换了参数就在原地覆盖；
+* 镜像、延迟这些**运行时**设置一概不进缓存：存的是规范解（不镜像、不偏移），
   由 `touch.Player` 在执行时临时改。于是一张谱面的缓存在任何局面下都能用，
   也不用为"开着镜像再存一份"。
 
-要强制重算就删掉那个 `.psap`（或者 `--no-cache`）。
+要强制重算就删掉那个 `.npz`（或者 `--no-cache`）。
 
 ## 触控
 
-把 `.psap` 里的触点按时发到设备上。后端都在 `../src/backends/` 包里，照 `../src/algorithms/` 的套路来：
+把规划结果里的触点按时发到设备上。后端都在 `../src/backends/` 包里，照 `../src/algorithms/` 的套路来：
 一张注册表按名字现 import，加一个后端 = 写一个模块 + 在 `registry._BUILTIN` 里加一行。
 
 | 后端 | 干什么 |
@@ -581,7 +600,7 @@ if (v5 < PerfectTimeRange * -1.75) ScoreControl::Miss(...);   // -0.14s
 | `recording` | 干跑：不连设备，只把"什么时候发了什么"记下来；没有设备时唯一能验调度器的办法 |
 
 两边都能选：控制台里 `backend <名字>`（整条链：闸门 → 规划 → 放行 → 对表 → 排事件，换了
-当场重开）与 `touch.py --backend <名字>`（单机放一个 `.psap`）。
+当场重开）与 `touch.py --backend <名字>`（单机放一份 `.npz`）。
 
 ### 为什么借 scrcpy
 
@@ -612,10 +631,25 @@ python -m backends.scrcpy      # 只查 adb、server 文件和屏幕尺寸
 （`../src/backends/` 里的模块是包内相对 import，所以得在 `src/` 里用 `-m` 跑 —— 直接
 `python src/backends/scrcpy.py` 不行。）
 
-一条触摸消息 32 字节（大端，字段逐一对过 v4.1 的 `control_msg.h` 与
-`ControlMessageReader.java`，见 `../src/backends/scrcpy.py` 顶部）：动作、指针号、x、y、屏宽、屏高、
-压力（按下 `0xffff`、抬起 0）、`action_button`、`buttons`。多指索引由 server 自己算 ——
-客户端只管发 DOWN/UP/MOVE 和各自的指针号。
+一条触摸消息 32 字节（大端），逐字段对着 v4.1 的 `control_msg.h`、`control_msg.c` 与
+`ControlMessageReader.java` 核过：
+
+```
+INJECT_TOUCH_EVENT = 2，共 32 字节
+u8  type
+u8  action          0 = ACTION_DOWN，1 = ACTION_UP，2 = ACTION_MOVE，3 = CANCEL
+u64 pointer_id      每根手指一个；别用 -1 / -2 / -3（scrcpy 自己保留）
+u32 x / u32 y / u16 screen_width / u16 screen_height
+u16 pressure        u16 定点（2^16 = 1.0）：按下 0xffff，抬起 0
+u32 action_button   手指触控恒 0
+u32 buttons         手指触控恒 0
+```
+
+多指由 server 的 `Controller.injectTouch` 自己改写：同时有两个以上指针时，把 DOWN/UP 变成
+`ACTION_POINTER_DOWN/UP | (index << 8)`，所以客户端只管发 DOWN/UP/MOVE + 各自的指针号。
+连接用 `tunnel_forward`（server 侧 listen、主机侧 connect），比默认的 `adb reverse` 少一个
+"主机监听 + 等 accept"的环节；连上以后**先读掉一个字节**才算对面真的在监听
+（`DesktopConnection.open()` 在第一个 socket 上写了那个 0）。
 
 > 只开控制通道时 server 的 `displayData` 是 null，`Controller` 走的是
 > "**按原始坐标注入**"那条分支：我们发设备像素。所以坐标换算（见下）必须自己算准。
@@ -846,7 +880,8 @@ python src/selftest.py
      只是被 MOVE 过来的手指是判不到 tap 的。
    * **Drag / Flick**：逐帧比手指位置，所以要求"判定窗口里**存在整整一帧**手指都在容差内"。
      hold 主体另外按 `HOLD_GRACE_MS` 扫全程。
-3. **存得回去** —— 走一遍 `planner.plan(cache=True)` 与 `storage`，`.psap` 编解码往返一致。
+3. **存得回去** —— 走一遍 `planner.plan(cache=True)` 与 `storage`，谱面与规划结果两份 npz
+   都读回来一致（事件流、统计、警告、身份，一样不能少）。
 4. **镜像也对** —— 把规划结果翻过来，拿去对按 `Chart::Mirror` 规则镜像出来的那份谱面，
    要求全中；顺带查镜像两次回到原样、事件数与音符数不变。
 5. **滑键起手** —— 见上面「Flick 光"摆在那儿"不算」：按 `CheckFlick` 的规则把整局走一遍，
@@ -859,7 +894,7 @@ python src/selftest.py
 | 闸门 | 用假消息喂 `agent.Agent`：一局恰好放行一次、`seq` 对得上、作业抛异常也放行、没收到谱面也放行；喂给规划器的永远是 FromJson 原文，**镜像不进缓存的身份**、而是交给播放器；播放状态（`play-state`）与"这一局没了"（`level-gone`）原样转给主机 |
 | 时钟 | 六种情形下 `GameClock` 的估计：稳定推进、延迟抖动、起播前的等待、中途暂停、时钟倒走、传输打嗝补样本。判据只有一条 —— **宁可偏晚，绝不能偏早** |
 | 坐标换算 | 16:9 / 20:9（左右留黑边）/ 4:3 三种宽高比，以及 y 轴翻转 |
-| 缓存 | 第一次不算命中、第二次命中且事件流一致、算法指纹变了就失效、`cache=False` 既不读也不写；命中时 `stats` / `warnings` 也必须跟着回来（`.psap` 是二进制、这些在 `.meta.json` 里 —— 不补的话"音符数核对"会拿 `None` 去比，喊假警报） |
+| 缓存 | 第一次不算命中、第二次命中且事件流一致、算法指纹变了就失效、`cache=False` 既不读也不写；命中时 `stats` / `warnings` 也必须跟着回来（它们与事件流在同一个 npz 里，漏了的话"音符数核对"会拿 `None` 去比，喊假警报） |
 | 播放器 | 用记录后端跑一遍：每批事件比"游戏时钟走到那一刻"早 `latency` 秒发出（±30ms），`--mirror` 时坐标 `x → 16 − x`；外加**收尾那一发"把按着的手指全抬起来"**：计划自己留了没抬的、两根都还按着的、以及注入关着（一根都没按过，不许凭空发） |
 | 控制台 | 命令解析与那几个运行时旋钮：`latency` 的三种写法（`0.02` / `20ms` / `+5ms`）、`inject` / `verbose` / `planner` 生效、换到不存在的规划器时设置不动、`devices` / `device` / `spawn` / `attach [pid]` / `backend` / `cache` / `save-chart` / `host` 各走各的（含"没有会话时换后端不该去重开"）、会落盘的真的落盘而 `inject` / `verbose` 绝不落盘、打错/打空/打注释都不炸；回显三条规矩 —— 每条命令都得有回话（包括 `status_lines()` 给空的时候）、管道模式下命令要回显、别的线程打印完提示符必须画回来、`log()` 必须当场 flush；**空读不退出**：管道读到 EOF 要停靠（不退出、说清楚怎么收工）、终端上一次空读要接着读；再加一条**源码级检查**：任何 `subprocess` 调用都不许继承 stdin |
 | 附加目标 | 先问应用列表（包管理器给的 identifier → pid）、再问进程列表（精确名 → `包名:子进程` 前缀）、最后才按名字找；实机那种"进程名是应用标签 `Phigros`、包名不在进程列表里"必须附加得上；给了 pid 就跳过查找；两边都读不到时不瞎猜；失败清单里必须有 pid / 包名 / `--pid` 提示 |
@@ -947,18 +982,46 @@ Drag / Flick 是 2.1 × 0.9 = 1.89（`DragControl::Judge` 用的是 2.1，跟 Fl
 > 两处教训：一是查任何一瞬间都要让**目标与手指状态同刻**；二是对会跳的目标，
 > 单点采样本身就是掷硬币，得按游戏真正的宽容窗口去扫。
 
-## `.psap` 里存了什么
+## npz 里存了什么
 
-`.psap` 布局（大端）：
+两种 npz，布局都由 `../src/formats/storage.py` 定义（`plan_arrays()` 那份注释是唯一出处）。
+
+**谱面** —— `<来源>_<难度>_<哈希>.npz`：
 
 ```
-'APSP' | u8 版本 | u8 名字长度 | utf8 规划器名
-f64 屏宽 | f64 屏高 | u32 帧数
-每帧: i64 时间戳(ms) | 事件个数 u16 | 每个事件: u8 动作 | u32 指针号 | f64 x | f64 y
+chart   u1[N]   游戏 FromJson 抓到的原文（UTF-8 字节）
+meta    U1      JSON：seq / hash / chars / context / notes_in_json / notes_reported / notes_match
 ```
 
-坐标是虚拟屏幕坐标（官谱 16×9，y 轴向上），`storage.decode_plan()` 直接读回
-`PlanResult`；映射到真实分辨率是触控模块的事。
+**规划结果** —— `<来源>_<难度>_<哈希>_<规划器>.npz`：
+
+```
+screen         f8[2]    虚拟屏幕 (宽, 高)
+frame_time     i8[F]    每帧的时间戳（毫秒）
+frame_events   i8[F]    每帧几个事件，加起来等于 E
+event_pointer  i4[E]    指针号
+event_action   u1[E]    动作（Touch 的编号：DOWN/MOVE/UP/CANCEL = 0/1/2/3）
+event_xy       f8[E, 2] 虚拟屏幕坐标
+meta           U1       JSON：planner / chart / stats / warnings / cache_key
+```
+
+坐标是虚拟屏幕坐标（官谱 16×9，y 轴向上），`storage.load_plan()` 直接读回 `PlanResult`；
+映射到真实分辨率是触控模块的事。
+
+三个决定的理由：
+
+* **为什么是 npz** —— 事件流本来就是几列并排的数值，numpy 直接做成了数组、自带 zlib 压缩；
+  容器里还能再放一段 JSON。于是"一份东西 = 一个文件"，不用在事件流旁边再挂一个 `.meta.json`
+  （挂了就得记住"读回结果时把它捞回来"，漏一次就出假警报）。
+* **事件流为什么贴平** —— 帧只记长度，第 i 帧的事件是 `[前 i 帧之和, +第 i 帧长度)` 那一段。
+  一帧一个数组会得到几百上千个小数组，而 npz 每个成员都有自己的 zip 头，那样更笨重。
+* **谱面原文为什么按 UTF-8 字节存** —— numpy 的字符串是定长 Unicode（4 字节/字符），
+  那份 14.8MB 的 `Retribution IN` 会撑成 60MB 内存，存下来也比 UTF-8 大一半
+  （实测 2.86MB vs 1.83MB，压缩耗时 0.73s vs 0.17s）。
+
+读取一律 `allow_pickle=False`：能读出来的必定是数据，不是别人塞进来的代码。
+`../src/npz.py` 是看它的工具（`python src/npz.py <文件> [--member 名字]`），
+背后就是 `storage.read_npz()`。
 
 ## 消息协议
 
@@ -995,8 +1058,9 @@ script.exports_sync.revert()    # 还原全部 hook（名单就是 frida/index.t
 
 ## 依赖的取舍
 
-Python 侧就 [requirements.txt](../requirements.txt) 里那五行（conda 环境 `auto_phigros`，
-Python 3.14），frida 的版本是唯一有讲究的一个。
+Python 侧就 [requirements.txt](../requirements.txt) 里那六行（conda 环境 `auto_phigros`，
+Python 3.14），frida 的版本是唯一有讲究的一个；numpy 本来只是 opencv 的陪嫁，现在 npz
+的读写直接用它，所以单列了一行。
 
 **刻意没用**的：`rich`（进度条用 tqdm 替了）、`z3-solver`（phisap 只在"指定目标分数"
 那套预处理里用到它，而那套代码算完 `perfect/good/miss/combo` 之后什么也没干就
@@ -1007,4 +1071,456 @@ Python 3.14），frida 的版本是唯一有讲究的一个。
 Node 侧：`frida-il2cpp-bridge@0.14.0`、`esbuild`、`@types/frida-gum` 都在
 `node_modules`；本地 `tsc` 只用于类型检查，不参与构建（打包是 esbuild 干的，
 `../tsconfig.json` 因此配的是 `module: esnext` + `moduleResolution: bundler`）。
+
+## 附录：黑历史
+
+写代码时踩出来的现场，从注释里搬过来的：实测数字、日志文件名、复现步骤、失败与成功的对比。
+正文各节讲的是"现在为什么这样设计"，这里记的是"怎么发现的、当时错在哪"。
+按模块分组，每条一句话一件事。
+
+
+### 算法（`src/algorithms/`）
+
+#### judging.py：扫描窗那对常量在 bisect 里写反过
+
+症状：实机某一局，裁判把一次"早 187ms 的按下偷走了一个未来音符"报成 Perfect，设备判的是 Bad。
+量到的东西：`CheckNote` 的扫描窗是不对称的 —— `realTime ∈ (nowTime − 0.18, nowTime + 0.22)`，
+反过来的 Δ = nowTime − realTime ∈ (−0.22, +0.18)：**早**最多 220ms、**晚**最多 180ms。
+结论：`SCAN_BACK` / `SCAN_AHEAD` 原先在 bisect 里写成了 `[nowTime − 0.22, nowTime + 0.18]`，
+于是"未来音符被偷"这类事件落在裁判窗口之外 —— 游戏看得见，裁判看不见。窗口不对称，别照直觉写。
+出处：`JudgeControl::CheckNote`（报告 §6.3）；验收线 `judge.py --compare logs/2026-09-27_19-49-47.log`。
+
+#### judging.py：PROCESS_DELAY 的 29ms 与 100.000s 那两个音符
+
+症状：同一局里裁判报 Bad、设备报 Good，两个音符都发生在 100.000s。
+量到的东西：拿 `logs/2026-09-27_19-49-47.log`（AT + geometric）与裁判逐音符比"同一个音符、
+两边同档"的 `delta` 之差：1149 条的中位数 +28.9ms、分布 12~48ms（一帧量化，60Hz 一帧 16.7ms）。
+结论：判定发生在游戏处理这次按下的那一帧，所以判定时刻要用 `发出 + PROCESS_DELAY`；差的那 29ms
+正好跨过 0.18 的档位边界。固定管线可以建模，帧相位不可知，只能按中位数取常数、残差留 ±1 帧。
+
+#### judging.py：一次按下只判一个音符
+
+症状：第一版按"把所有够得着的音符都判掉"写，Credits IN 上凭空多出 80 个 Good。
+量到的东西：那张谱实机是 All Perfect 级别，80 个 Good 不可能真发生。
+结论：`CheckNote` 在手指 `phase == Began` 那一帧只挑**一个**候选（`selection_metric` 最小的），
+不是把所有够得着的都判掉；一个音符只判一次、先到先得。改成一按下判一个之后 Good 归零。
+出处：`JudgeControl::CheckNote`（报告 §6.2/§6.3）；这条同时也是"蹭键"与"级联"的来源。
+
+#### judging.py：Hold 身体判 Miss 可以早于 realTime
+
+症状：AT 谱 99.310s 的 hold 在 99.217s 就被判 Miss —— 比音符自己的时刻**早 93ms**。
+量到的东西：`HoldControl::Judge` 的身体段只在**头判之后**跑，逐帧查所有按着的手指；
+一根"不是瞄它"的手指把头判标记上之后随即离开，`_safeFrame` 连续落空就判 Miss。
+结论：漏音判据不能只看"音符到点了没有"；头判被蹭掉 + 手指没留住是一条独立的丢音路径。
+出处：`HoldControl::Judge` 0x1d32668 第 241-295 行。
+
+#### judging.py：`step` 拿 FRAME_MS 去加，一步跨了 16 秒
+
+症状：hold 身体的循环一圈就"撑到收尾"，那条早 93ms 的 Miss 死活看不见。
+量到的东西：`FRAME_MS` 是 **毫秒**（16.67），身体循环要的是**秒**。
+结论：`step = FRAME_MS / 1000.0`；拿毫秒当秒去累加，一步就跨过整段 hold。
+
+#### judging.py：deviation 不要绕 Screen.remap
+
+症状：Glaciaxion 125.143s 那一下，一个横向偏差 0.000 的 tap 头判被裁判算成 2.625（容差 1.71），冤枉成丢音。
+量到的东西：那条判定线在 tick 起点处 y=90（被谱师藏到屏幕外），`Screen.remap` 的探针交不到屏幕，
+静默退回屏幕中心 (8, 4.5)，横向信息整个丢了。
+结论：横向偏差直接用垂直判定的式子算 —— `(手指 − 判定线原点)·判定线朝向 − note.offset`；
+`remap` 是给规划器找"够得着的落点"用的，不能拿来量偏差。
+
+#### judging.py：音符表必须按时间排序
+
+症状：Credits IN 上出现 104 个"假丢音"：明明有一次零偏差的按下，这些音符却全被判成丢音。
+量到的东西：谱面 JSON 里一条线的音符是 `notesAbove` 接着 `notesBelow`，**不是**按时间排的。
+结论：`_by_line` 给每条线排序之后才能拿 `bisect` 划扫描窗；不排序就会得到成片的错误区间。
+出处：Credits IN（`charts/Credits.Frums.0_IN_ffa91e32.npz`）上的 104 个假丢音。
+
+#### judging.py：并列时按扫描顺序，而不是按线号
+
+症状：裁判说某个音符被蹭掉了，实机日志里游戏判的是 Perfect，两边差出一百多毫秒。
+量到的东西：AT 谱 34 秒那一簇有 5 个 Tap 的判定点完全相同 —— 都是 `(+8.00, +1.80)`，
+只是线号与时刻不同（线 8/16/17/18）。位置一样，`selection_metric` 就一样。
+结论：平局的胜负由扫描顺序定，而游戏用 `SortForNoteWithFloorPosition` 把音符按**时间**排成
+一条扫描表（报告 §6.2），所以胜出的是时刻最早的那个；按线号分组会挑中线号最小的那个，选错。
+出处：实机日志逐音符比出来的（`judge.py --compare`）。
+
+#### judging.py：音符身份是表内下标，不是 (线, 时刻)
+
+症状：同一 `(线, 时刻)` 上叠着两个音符时，按 `(线, 时刻)` 判重会把另一个悄悄丢掉。
+量到的东西：Credits IN 实测有 7 处这种叠着的音符（同一条线、同一时刻，上下各一个那种）。
+结论：`Slot.index`（表内下标）才是身份；`(线, 上/下, 同侧第几个)` 那套是给设备日志对账用的。
+
+#### judging.py：drag / flick 的起手会顺手判掉 TAP
+
+症状：`夢の降る日に` 里线 21 上一个 TAP 被判成 Good(−180ms)，没人打算按它。
+量到的东西：抢它的是同一时刻一根按住 144ms 的 drag 起手 —— 而 tap 是按下即抬（8ms 上下）。
+结论：`CheckNote` 眼里"按下"就是"按下"，不分手势；所以判据要能按**在位时长**把两种按下分开
+（≥24ms 视为 drag / flick 起手），报告里"是 tap 抢的还是起手抢的"修法完全不同。
+出处：`Fingers.dwell_ms`；同局共 6 个蹭键、全部由 24–144ms 的起手造成（`docs/human-like.md`）。
+
+#### judging.py：与实机对齐的旧基线
+
+症状：AT 谱 + geometric 那一局，裁判与设备逐音符比出 3 条不一致。
+量到的东西：1156 个音符里 3 条不一致，分数差 39/951099，最大连击完全相同。
+结论：这 3 条修完之后基线是 0 处不一致（见 正文的"裁判与实机逐音符对齐"）。
+留着这个数是为了知道对齐到什么程度算"到了"：分数量级对得上、连击全同、只剩个位数条。
+
+#### geometry.py：place_note 的 retime 是给 DESTRUCTION 3,2,1 打的补丁
+
+症状：DESTRUCTION 3,2,1 的最后一个 flick 判定点在屏幕外，短划线在屏幕中心怎么划都够不着。
+量到的东西：那个谱面 138bpm，一拍 13.6ms，而 Perfect 判定窗是 80ms。
+结论：沿时间轴前后各找几拍、取第一个把判定点带回屏幕内的时刻当判定时刻；偏移只有一两拍，
+远小于 Perfect 窗，所以这条补丁不会把档位弄坏。phisap 早年就是这么绕过去的。
+
+#### judging.py：minDeltaTime 不是输入，是输出
+
+症状：报告 §9 曾把 `CheckNote` 开头的 `minDeltaTime` 守卫列成"未解之谜"，容易当成"允许多早"的旋钮。
+量到的东西：每次调用开头都写 `*(_QWORD *)&this->minDeltaTime = -3118710784LL;` —— 低 32 位 `0x461C4000` = **10000.0f**
+（高 32 位 `0xFFFFFFFF` 是相邻字段的哨兵），所以 `if (realTime - nowTime >= minDeltaTime + 0.01) goto skip;` **永远为假**，是死代码。
+结论：真值由第 425 行 `this->minDeltaTime = fabsf(note->realTime - nowTime);` 写出，它记录"刚判掉的那个音符差多少"，
+是个**输出**（给命中特效与统计用），判据里不能拿它当上界。出处：`JudgeControl::CheckNote` 0x1d21104 第 124 / 186 / 425 行。
+
+#### radical.py：phisap 把旋转向量当成弧度又取了一次 exp
+
+症状：radical 早期版本所有落点都偏，横向偏差量级离谱。
+量到的东西：`JudgeLine.rotation_at` 返回的是**旋转向量** `exp(iθ)`，而 phisap 的写法是
+`Screen.remap(point, exp(rotation))` —— 等于把这个向量再当弧度取一次 `exp`。
+结论：`Screen.remap` 要的就是旋转向量（它内部再乘 `1j` 拿法线方向），别再套一层 `exp`。
+
+#### geometric.py：按下点取音符自己的判定点，不取合并区域中心
+
+症状：Credits IN 上 11 个丢音，都是 TAP 被判成了隔壁音符。
+量到的东西：drag 并进来之后，按下点被拉到两个窄带中间，横向偏差比隔壁 TAP 大一点点（0.011）；
+游戏挑的是**度量最小**的候选，于是这一下被隔壁抢走、自己去判了隔壁（Good −139ms），
+原来瞄的那个音符什么都没得到。
+结论：tap 一律按在**音符自己的判定点**上（那里横向偏差是 0，是度量的下界）；合并只保留两件事 ——
+drag 不再单独占一根手指、以及"已经在屏幕上的手指落进并后的区域也算被顺手判掉"。
+
+
+### 运行时、后端与格式（`src/runtime/`、`src/backends/`、`src/formats/`）
+
+#### controller.py：用墙上的时间量游戏里的事必然误报
+
+症状是每一局都报"这一局很可能一个音符都按不到"，紧接着打出一个 All Perfect。判据原先只有
+一条："播放器起来之后过了 3 秒还没发第一个事件"，而播放器是在**闸门放行之前**架好的 ——
+闸门一开游戏还得起播、再走到谱面 1.8s，加起来轻松超过 3s。出处：真机日志
+`logs/2026-09-27_21-46-38.log`。结论：改看**游戏时钟自己**有没有越过首个事件
+（`CLOCK_LATE_MARGIN = 0.2` 的余量），而且只报不改状态；"这一局还在不在"交给 agent 的
+暂停 / 退场 hook 直说。自检那一侧也记着（附录「自检」组的 liveness.py）。
+
+#### agent.py：MISS_EARLY 的下界是被一条正常的 hold Miss 逼出来的
+
+账不平的下界原先只有 `-0.05`（等于"早一点点都不行"），于是一批完全正常的 Miss 全被报成
+"音符表抄错了"。量到的东西：实测见过早 0.093s 的那一条 —— AT 谱 99.310s 的 hold，判定于
+99.217s；成因是 hold 的**身体**宽限耗尽（`_safeFrame = 2`，忍 3 帧、第 4 帧判 Miss，
+`HoldControl::Judge` 第 241-295 行），这个时刻可以早于音符自己的 `realTime`，注释里另记着
+"实测最多早 0.15s 上下"。结论：下界放宽到 `MISS_EARLY = 0.22`。自检那一侧也记着
+（附录「自检」组的 referee.py 与 accounting.py）。
+
+#### agent.py：hold 的收尾判决不是从头量的
+
+症状是一局里每一条 hold 都被报成账不平 —— Dlyrotz HD 上正好冤枉了那 8 条，就是那 8 个 hold。
+量到的东西：一个 2.4 秒的 hold 收尾时 `nowTime − realTime` 是 +2.2 出头，而游戏报的 `delta`
+只有十几毫秒。出处：`HoldControl::Judge` 在 `realTime + holdTime − 0.22` 结算，**传给
+Perfect/Good 的早晚量是从这个结算点量的**。结论：对账时头判与收尾两个参考点都认。
+自检那一侧也记着（附录「自检」组的 accounting.py）。
+
+#### agent.py：谱面在通道上传输时 ping 必然超时
+
+症状是加载 9MB 谱面那两秒，agent 被判"进程被系统冻结"，白停一次触控、还打出一行吓人的日志。
+量到的东西：脚本那边在序列化、我们这边在收，`ping` 排在大消息后面必然超时 —— 这不是猜的，
+是我们**自己知道**正在干的事。结论：`CHART_WAIT = 20s` 的 `busy_until` 期间，ping 超时算
+"忙"而不算 hang。自检那一侧也记着（附录「自检」组的 liveness.py）。
+
+#### agent.py：账不平只报第一次，等于没报
+
+症状是知道"本局有 8 条判决与音符表对不上账"，却不知道是哪 8 条、各自差多少 —— 那诊断不了
+任何东西（正文的「判定流水」那节还留着"同类问题一局只报第一次"这句旧描述）。
+结论：对不上账的判决**每一条**都当场打出来，行首带序号（"警告 #2"）、带音符身份，结算行再给
+本局总数。自检那一侧也记着（附录「自检」组的 accounting.py）。
+
+#### storage.py：谱面身份里不能带 seq
+
+症状是同一张 Glaciaxion HD 在 charts/ 里攒出了 `0001` / `0002` / `0003` 三份 npz，而第二次
+开谱照样得在闸门里现算几十秒。量到的东西：`seq` 是 agent 的**会话内计数器**（这一局进程里
+解析的第几张谱面），换个会话同一张谱面就会拿到另一个号，拼进文件名就永远对不上缓存。
+结论：`seq` 仍然写进 meta 供查账，但不参与命名（`ChartRef.stem` 只用来源上下文 + 内容哈希）。
+
+#### controller.py：Phigros 的进程名不是包名
+
+症状是 `device.attach(PACKAGE)` 报 `ProcessNotFoundError: unable to find process with name
+'com.PigeonGames.Phigros'`，而游戏明明开着。现场（2026-09-27）：`enumerate_processes()` 里
+只有 `(30501, 'Phigros')`（进程名是应用标签），`enumerate_applications()` 里才有
+`('com.PigeonGames.Phigros', 30501)`。结论：解析顺序改成先应用列表、再进程列表（精确名 /
+`包名:子进程` 前缀）、最后才交给 frida 按名字找。完整现场在 README 的「`attach` 说找不到
+进程」与附录「自检」组的 attach.py。
+
+#### agent.py：frida 17.19.0 注入任何进程都失败
+
+症状是 attach 抛 `TransportError: agent connection closed unexpectedly`，而 `spawn` 本身
+成功、进程 `resume` 后也正常跑 —— 只有注入环节挂掉，很有迷惑性。判别方法：attach 一个无关
+进程（`com.android.systemui`）同样失败，就与 Phigros 无关，是 frida 层的问题。设备是
+OnePlus CPH2491 / Android 15 / arm64 / KernelSU；已排除 frida-server 版本号与架构不匹配、
+SELinux 拦截、Frida Launcher。结论：`TESTED_FRIDA = ["17.10.1", "17.17.0"]`。完整记录在
+README 的「环境要求」。
+
+#### output.py：日志文件必须是纯 LF 行尾
+
+症状是日志文件里冒出 `\r\n`，"文件里除行尾不该有别的回车"这条判据就查不了。发现方式：
+自检按字节读才发现 —— `read_text` 会把 `\r` 归一成 `\n`，这条判据一度永远成立，变异测试里
+把 `\r` 过滤整个拆掉都抓不住。结论：`LogFile` 用 `newline="\n"` 打开，一行里只保留最后一个
+`\r` 之后的内容（终端的显示规则），提示符的擦除因此不会把日志弄成满屏回车。自检那一侧也
+记着（附录「自检」组的 pipeline.py）。
+
+#### controller.py：frida 自带的设备永远存在，"只有一台就自动选中"永远不触发
+
+症状是明明只插了一台设备，每次还得手打 `device <id>`。量到的东西：frida 的
+`local` / `socket` / `barebone` 是给桌面进程用的，跟 Phigros 没关系却永远存在，而且在
+Windows 上它们**都报 `remote` 类型**，按类型滤不掉。结论：`list_devices()` 只收 USB 设备与
+手动 `host add` 加过的远程 server（后者用"加进去时返回的那台设备"认，不猜类型）。
+
+
+### 顶层工具（`src/touch.py`、`judge.py`、`render.py`、`main.py`、`npz.py`）
+
+#### touch.py：用 Event.wait 睡觉会把事件拖晚 14ms
+
+症状是排期明明算好了，事件却成片偏晚。量到的东西：Windows 上带超时的锁等待只有系统时钟
+滴答（15.6ms）的精度，播放器线程用 `Event.wait(remaining)` 睡到该发的时刻，醒来时已经过了
+滴答边界，最大迟到 14ms；换成 `time.sleep` 一小步一小步地对表之后，`--backend recording`
+实测最大迟到 0.5ms。结论：睡眠一律走 `time.sleep`（`COARSE_NAP` + `POLL` 两级），
+`Event.wait` 只用来叫醒。代价是 stop 标志只能在每一小步之间看到，最长 50ms，收尾时无所谓。
+出处：正文的「已经验过什么 / 还没验什么」也记着这条（原注释里指向它）。
+
+#### touch.py：GameClock.reset 不清统计，会把上一局换关的空档算进本局
+
+症状是日志里冒出"采样最大间隔 10300ms"，看着像是本局采样断了。量到的东西：那个数其实是
+上一局结束到本局第一个样本之间的空档 —— 换关那几秒本来就没有 `progress` 样本。结论：
+`reset()` 换一局时不能只清样本，`max_gap` / `reanchors` 这些统计、`_value_host`
+（"从什么时候没变过"的时间戳）和按住状态都要一起清。出处：正文的
+「排期出问题时看什么」把"采样最大间隔"列为采样断过的直接证据，自检里"时钟"那组按这个口径验。
+
+#### judge.py：`--compare` 一开始两边账目对不上，也不能拿理想送达去解释实机
+
+症状是裁判与实机同一条时间轴却对不上账。量到的东西：第一次跑 `judge.py --compare <日志>` 时，
+设备（日志）1152P / 2G / 1B / 1M，裁判（本机）1140P / 14G / 0B / 2M —— 那 14 个 Good 说明
+裁判把一批音符判早或判晚了，而光看总数说不出是哪几个音符。结论：按
+`(线, 上/下, 同侧第几个)` 逐音符列出来对；另外，拿"理想送达"去重放实机日志会冤枉规划 ——
+计划里的落点是"音符自己那一时刻的判定点"，必须先按这一局真实的送达补偿重放
+（`judging.DELIVERED_LATENCY = run.latency`）。修完之后的验收线在正文的
+「裁判与实机逐音符对齐」：1152P 2G 1B 1M，逐音符 1156 条全一致。
+
+#### main.py：`python src/main.py --help` 会挂在一个等 stdin 的控制台上
+
+症状是敲完命令什么都不像有反应，进程就那么挂着。复现：`python src/main.py --help` ——
+`main.py` 没有命令行参数，但一开始收到参数也照常起主干，于是终端交给了一个正在读 stdin 的
+控制台循环：想看的帮助没有，`--help` 那几个字还被后面的控制台当成输入吃掉。结论：
+`__main__` 里先看 `sys.argv`，有参数就把收到的参数原样念出来、说明没有参数、以退出码 2
+收场。出处：`src/main.py` 的 `__main__` 分支；正文的「回显」一节只讲了
+"管道模式照样读并回显"，没提这一条。
+
+
+### 自检（`src/tests/`）
+
+#### attach.py：包名不在进程列表里，按包名附加不上
+
+实机（2026-09-27，那台 OPPO/MTK 设备）：`enumerate_processes()` 里只有 `(30501, 'Phigros')`
+—— 进程名是**应用标签**；`enumerate_applications()` 里才有
+`('com.PigeonGames.Phigros', 30501)`。照着包名调 `device.attach(...)` 直接抛
+`ProcessNotFoundError`，症状是"游戏明明开着、frida 却说找不到"。结论：解析顺序改成先问
+应用列表（identifier → pid）、再问进程列表（精确名、`包名:子进程` 前缀）、最后才把包名
+原样交给 frida，失败时把两份清单打出来。
+
+#### console.py：空读 / EOF 差点把控制台带走
+
+控制台改成主干（跑在主线程上读输入）之后，"输入读到头"就变成能带走整个进程的事：管道
+读完最后一行是 EOF，终端上一次被打断的读会返回空串。两者都当成退出的话，人就再没有面板
+可用了。结论：空读与 EOF 一律**停靠**（不退出、说清楚怎么收工），只有 `quit` / `exit` /
+Ctrl+C 才收工。
+
+#### console.py：subprocess 继承 stdin 会吃掉控制台里敲的那一行
+
+`adb shell` 这类调用会把它自己的 stdin 接到本地 stdin 上，设备端一读就把用户在控制台里
+敲的那一行半路吃掉。这种错不报错，只表现为"偶尔有一行没反应"，极难查。结论：所有
+`subprocess` 调用都必须显式 `stdin=DEVNULL`，自检用源码级扫描（按调用的括号找 `stdin=`）
+盯住这一条。
+
+#### coverage.py：覆盖率判据被"简化"回"那一瞬间在不在点上"
+
+判据写成"窗口里最长的一段连续覆盖够不够一帧"时看着啰嗦，很容易被改回单点采样。单点采样
+在 `Eradication Catastrophe` IN 上放过了 4 个必漏的 drag（手指到位 1ms 后就被抬起），
+也在 `geometric` 上放过一批只停 1 tick（8ms）的 —— 60fps 下这种停留撞上一帧的概率不到
+一半。结论：`check_dwell` 拿两根合成时间轴把**结论**钉住（停 100ms 不报、只停 5ms 必报），
+而不是钉住 `_longest_run` 这个函数。
+
+#### liveness.py：传谱面那几秒被判成游戏冻住，白停一次触控
+
+实机踩过：9MB 的谱面在通道上传输那两秒，主线程正忙，`ping` 必然排不上队而超时 —— 看门狗
+把它当成"进程被 Android 冻结"，停了一次触控。结论：探活超时先看"我们自己忙不忙"
+（`gate_open` 有值、或 `busy_until` 还没过），"忙"时算「忙」、不打警告；但"忙"的理由一没
+就照常报 hang，不许把它当万能挡箭牌。
+
+#### liveness.py：等不到时钟的假警报，后面紧跟着一个 All Perfect
+
+踩过（`logs/2026-09-27_21-46-38.log`）：判据原先只看"播放器起来之后过了几秒还没发第一个
+事件"，而播放器是在**闸门放行之前**架好的 —— 闸门一开游戏还得起播、再走到谱面 1.8s，
+加起来轻松超过 3s，于是每一局都误报"这一局很可能一个音符都按不到"，紧接着打出一个
+All Perfect。用墙上的时间量游戏里的事，必然这样。结论：改看**游戏时钟自己**有没有越过
+首个事件，并且只报不改状态。
+
+#### pipeline.py：日志里"不许有回车"的判据一度永远成立
+
+日志自检要查"控制台擦提示符的回车不许进文件"，第一版拿 `read_text` 读回来看 —— 而
+`read_text` 会把 `\r` 归一成 `\n`，这条判据于是永远成立，变异测试里把 `\r` 过滤整个拆掉
+都抓不住。结论：改成 `read_bytes()` 按字节查。
+
+#### pipeline.py：stop_file_log 的还原在外面查等于没查
+
+`stop_file_log()` 要把 `sys.stdout` 还原成包装之前那个。第一版在 `redirect_stdout` 退出
+**之后**才去查，而退出本身就会覆盖 `sys.stdout`，等于没查。结论：这个断言必须放在
+`redirect_stdout` 里面（还处在重定向里）当场查。
+
+#### referee.py：候选按线号扫，凭空多出 Good 与 Miss
+
+AT 谱 34 秒那一簇是一堆判定点完全相同、只有线和时刻不同的 Tap（线 8/16/17/18 都在
+`(+8.00, +1.80)`）。位置一样时挑选度量并列，胜负全看扫描顺序；按线号分组会挑中线号最小的
+那个，与按下时刻差出一百多毫秒，于是实机那一局是 Perfect 的地方，裁判报出 Good 与 Miss。
+结论：候选按**时间序**扫。
+
+#### referee.py：|Δy| 量成"到音符判定点"的距离，按下被配错
+
+挑选度量里的纵向分量是"指尖到**判定线**的法向距离"（报告 §6.3 的 `array_normal`），原先
+量的是"指尖到音符判定点"的距离。同一条线上有两个候选时，前者对两点必然并列、后者会分出
+大小 —— 按下于是被配给时刻更远的那个。AT 谱 147.5/147.6s 那一对就是这么配错的。结论：
+量法向距离，而且和横向一起都在**按下那一帧**上算。
+
+#### referee.py：度量并列时按"更小的度量"挑，正好挑反
+
+AT 谱 147.500/147.586 那一对：设备在度量并列时是**按时间序先遇到的胜出**，我原先按"更小
+的度量"挑，挑反了。千分之几的法向差（我这边是插值出来的线位置）不该推翻扫描顺序，所以
+定下 `METRIC_EPSILON = 0.005`：差在这个以内算平局、交给顺序。结论：自检里两条线的法向
+距离刻意差 0.002，否则这条判据在同一条线的构造下永远成立、等于没测。
+
+#### referee.py：一次按下判掉了所有够得着的音符
+
+早先按"把所有够得着的都判掉"写，Credits IN 上凭空多出 80 个 Good。设备一次按下只判一个
+音符。结论：判据里放两个完全同时同位的音符，一次按下只许判掉一个、另一个必须留着。
+
+#### referee.py：Hold 的身体 Miss 可以早于 realTime
+
+实机踩过：AT 谱 99.310s 的 hold 在 99.217s 就判了 Miss（早了 93ms）。成因是一次"不是瞄
+它"的按下把头判标上了号，那根手指随即离开，身体宽限耗尽就判 Miss。结论：身体判的 Miss
+允许早于音符时刻，裁判与自检都不许把它当成错误。
+
+#### accounting.py：账不平只报一次，等于没报
+
+判决对账发现 `delta` 与 `nowTime − realTime` 对不上时，原先"同类只报一次"：知道有 8 条
+对不上，却不知道是哪 8 条、各自差多少 —— 那诊断不了任何东西。结论：每一条都当场报，
+带序号（"警告 #2"）、带是哪个音符（线号 + `noteCode`）。
+
+#### accounting.py：Miss 早于 realTime 被当成"表抄错了"
+
+账不平的下界原先只有 0.05（等于"早一点点都不行"），而手指一直没碰、hold 中途松手都会让
+Miss 早于 `realTime` 触发，这类正常的 Miss 全被冤枉成"表抄错了"。结论：Miss 的早判下界
+放到 `MISS_EARLY = 0.22`；自检里用 0.05 / 0.15 / 0.2 三种提前量钉住。
+
+#### accounting.py：Hold 的收尾判决被头判的恒等式冤枉
+
+Hold 的收尾判决是从"按住结束 − 0.22s"量早晚的，拿头判的恒等式去对，每条 hold 都会被判成
+账不平 —— 实测 Dlyrotz HD 上正好冤枉了那 8 个 hold。结论：Hold 的收尾与头判是两个参考
+点，两边都要认，两头都对不上才报。
+
+#### 已在正文里记着的（不重复）
+
+* **`accounting.py`：表建早了，`realTime` 全是 0** —— 89.969 秒才判掉的 Flick 被记成 `"@ 0.000s"`。
+  见上文「建表挂在 `LevelControl::SetInformation` 上」。
+* **`accounting.py`：结算字段读不到**（`<mirror>k__BackingField` 那次）—— 见上文 `isPlaying`
+  与镜像字段那两处。
+* **`archive.py` / `coverage.py`：v1 老谱的镜像模型、滑键起手只划一下、HOLD 主体的宽限窗口** ——
+  见「自检」一节与 v1 镜像那两段引文。
+* **`console.py`：回显判据第一版太松**（只查"结尾不是擦除码"，漏掉"擦掉就完事"）—— 见「自检」
+  一节末尾的变异测试记录。
+* **`liveness.py`：收工那十条逐条掰坏、存活探测双向变异** —— 见「自检」一节。
+* **`pipeline.py`：暂停期间不按住时钟（爬升 0.02 / 0.1 / 0.5 时老做法偏 1~2 秒）、拿"多久没样本"
+  猜这一局还在不在、把 `MOVE` 改写成 `DOWN` 丢掉 flick 位移、传输打嗝补样本被当成暂停** ——
+  见上文暂停 / 退场与 `GameClock` 两节。
+* **`liveness.py`：`agent.playing` 初值 False，一局 All Perfect 被报成"音乐没在走"**
+  （`logs/2026-09-27_21-46-38.log`）—— 见上文 `ProgressControl::Play` 那一段。
+
+
+### frida agent（`frida/`）
+
+#### hooks/chart.ts：为什么 `FromJson(String, Type)` 是唯一咽喉点
+
+`_Start_d__46::MoveNext`（0x1d27748）里只有一句 `chart = JsonUtility::FromJson<Chart>(textAsset.text);`，
+所有谱面最终都变成同一个 Chart 实例。`Chart` / `ChartNote` / `JudgeLine` / `SpeedEvent` /
+`JudgeLineEvent` 的构造函数在整个 .so 里没有任何代码调用者（只有 `.data.rel.ro` 里的 method 指针
+槽位），也没有内联的谱面 JSON 字面量 —— 绕不过它。`FromJson<T>` 的引用类型实参走共享泛型
+`FromJson<System.Object>`，真身是非泛型 `FromJson(String, Type)`（**0x3a5025c**）：`typeof(T)` 从
+rgctx 取出当第二参，反编译 0x1f664a4 为 `v7 = JsonUtility::FromJson(json, Type::GetTypeFromHandle(...));`。
+
+#### protocol.ts：镜像开关为什么要取属性 getter
+
+字段名 `<mirror>k__BackingField`（`+0x60`）与 `get_mirror`（**0x1ca407c**）报告 §2.1/§3.7 已有，
+报告没有的是这条翻车：IDA 把 `<` `>` 洗成 `_` 显示成 `_mirror_k__BackingField`，照着它的写法去
+`tryField` 会**静默查不到**（返回 null，不报错），实测就这么翻过一次车 —— getter 名才是干净的。
+
+#### hooks/gate.ts：闸门是怎么把 Unity 主线程按住的
+
+`LevelControl::Start` 是协程、跑在主线程；闸门实现体也在主线程，只要在实现体里"停住不返回"，
+渲染就停帧、协程不再推进、音乐不会开始、判定线一根都不生成（为什么选 `0x1d25350` 见报告 §3.6）。
+停住用的是 Frida 官方阻塞式收信（`frida_docs/messages.md`）：`const op = recv("release", () => {}); op.wait();`。
+风险是主线程被按住太久 Android 可能弹 ANR —— 规划一张谱面要几秒，忍了；主机侧用 try/finally
+保证无论如何都放行。
+
+#### hooks/gate.ts：放行接收者为什么必须先注册
+
+`recv()` 是一次性的：先 announce 后注册的话，主机回得足够快时放行消息会落在没有接收者的空档里，
+游戏永远卡住；反过来即使主机在 `op.wait()` 之前就回了，消息也会立刻投递、`wait()` 直接返回。
+放行消息带 `seq`：对不上的（上一关残留、手工误发）重新注册接着等，免得把下一关悄悄放走；不带
+`seq` 的一律认，方便手工操作。
+
+#### hooks/gate.ts：替换实现后如何调用原方法
+
+在实现体内用 `this.method<...>("名字").invoke(原参数...)` 同步调用原实现，拿到原返回值再原样
+return。依据 Frida 官方文档（`frida_docs/javascript-api.md`，Interceptor.replace 一节）：
+"you can synchronously call `target` through a NativeFunction inside your implementation, which
+will bypass and go directly to the original implementation."；`Il2Cpp.Method.invoke` 内部正是
+`new NativeFunction(this.virtualAddress, ...)`。
+
+#### hooks/notes.ts：音符表为什么建在 `SetInformation` 而不是 `SetCodeForNote`
+
+顺序（闸门 → 发号 → SetInformation → 按时间排序）与 `realTime` / `positionX` 的公式见报告
+§3.3/§3.4；报告没有的：两个方法都只由开谱协程调用一次，调用点分别是 0x1d27ef8 与 0x1d27f00
+（中间夹着 `SetCodeForNote` 0x1d2516c）；写 `realTime`（`+0x2C`）的指令在 0x1d25848、写
+`positionX`（`+0x18`）的缩放在 0x1d25808（另一份记录给的是 0x1d25840 / 0x1d25800 一带）。
+在 `SetCodeForNote` 处建表抄到的是一整张 `realTime == 0` —— 实测的表现是判决日志把每个音符都
+写成 `@ 0.000s`（一个在 89.969s 被判掉的 Flick，报出来是"0.000 秒"）。
+
+#### hooks/notes.ts：为什么不自己按公式推 noteCode
+
+编码公式报告 §3.5 已有；报告没有的是：写入指令是 `STR S0, [X0, #0x38]`，而 **IDA 给
+`ChartNote +0x38` 贴的字段名 `judgeControl` 是错的**，ChartNote 里没有这个字段。不推号的理由：
+编码依赖列表当时的顺序，而列表刚在闸门处被 `SortForNoteWithFloorPosition` 按 `floorPosition` 排过，
+主机手里那份 JSON 的顺序已经不是它了；自己推就得在主机上把排序再实现一遍，抄错了不报错，只会
+"查出来的音符全都不对"。
+
+#### hooks/score.ts：判定方法的第一个参数是 noteCode，不是时间
+
+报告 §6.6/§6.7 只写了 Δ 与"第二参数取反"；报告没有的：反编译出来的形参名 `noteCode` 是真的，
+四个调用点全都写 `noteFoo->noteCode`（方法起点 **0x1d30a84** / **0x1d30c3c** / **0x1d30e20** /
+**0x1d30ff0**）；取反那一步的调用点地址是 `ClickControl::Judge` 0x1d307a0 一带、
+`DragControl::Judge` 0x1d315a4（函数起点 0x1d3060c / 0x1d313f0）；Miss 不传时间。Vector3 是判定点
+的世界坐标（音符自己 Transform 的 position），这里不读 —— 定位音符用 `positionX` + 第几条线就够。
+
+#### hooks/score.ts：结算字段为什么用带下划线的私有名
+
+`ScoreControl` 的字段偏移报告 §7 已有；报告没有的是这条坑：数值字段是私有名 `_score` / `_percent` /
+`_combo`，同名的 `score` / `combo` 是给 UI 用的 `Text*` —— 读错了会拿到一个对象指针。这套名字
+逐个对着 IL2CPP 类型信息核过（size `0xd0`，`maxcombo +0x54` 是小写 c）。
+
+#### index.ts：`ping` 为什么一个字都不碰 il2cpp
+
+主机拿它当存活探测：进程被杀了 frida 会自己报 detached，但进程被 Android 冻结（切后台缓存）时
+连接还在、脚本却不动了 —— 那种情况只有一次真调用才问得出来。闸门正按着 Unity 主线程时它也要能
+立刻应答，所以不能去碰任何 il2cpp 对象。
 

@@ -2,22 +2,12 @@
 import "frida-il2cpp-bridge";
 
 /* =============================================================================
- * auto_phigros / 谱面采集与判定观测 agent —— 入口
+ * auto_phigros / agent 入口（composition root）：找类、装 hook、留 RPC 出口。
  * -----------------------------------------------------------------------------
- * 这个文件只干三件事：**装 hook**、**留 RPC 出口**、**把状态报给主机**。
- * 每个 hook 的来龙去脉都在它自己的模块里：
- *
- *     protocol.ts        消息协议：类型名、方法名、事件名与载荷（改协议只改这一个文件）
- *     state.ts           agent 的全部可变状态
- *     bridge.ts          与 il2cpp 打交道的零碎工具（读字段、遍历 List）
- *     hooks/chart.ts     hook 1/2  谱面原文（FromJson）、音符数（GetNoteCount）
- *     hooks/gate.ts      hook 3/4  关卡上下文（SongsItem）、闸门（SortForNoteWithFloorPosition）
- *     hooks/notes.ts     hook 5    音符表（SetInformation）：noteCode -> 音符
- *     hooks/clock.ts     hook 6    游戏时钟（ProgressControl::Update）
- *     hooks/score.ts     hook 7/8  判定流水（Perfect/Good/Bad/Miss）、结算（GetLevelResultInfo）
- *
- * 八个 hook 点的清单与完整消息协议见 ``protocol.ts`` 顶部。这个文件是 composition root：
- * 找类、按顺序装、缺了什么就报什么。
+ * hook 点地址表与消息协议见 ``protocol.ts`` 顶部；模块分工：
+ *     state.ts 状态 · bridge.ts il2cpp 工具 · hooks/ 十个 hook
+ *     （1/2 chart，3/4 gate，5 notes，6 clock，7/8 score，9/10 level）。
+ * install 与 revert 共用同一份名单 ``INSTALLED_HOOKS``：装了哪些就撤哪些。
  * ========================================================================== */
 
 import { findClass } from "./bridge";
@@ -45,11 +35,7 @@ import {
 } from "./protocol";
 import { state } from "./state";
 
-/**
- * 装过的 hook 一览 —— ``revert()`` 照着它还原。
- *
- * 表放在这里而不是各 hook 模块里各留一份，是因为"装了什么"与"撤什么"必须是同一份名单。
- */
+/** 装过的 hook 一览 —— ``revert()`` 照着它还原；与 install 共用同一份名单。 */
 const INSTALLED_HOOKS: ReadonlyArray<{ type: string; method: string; parameters: number }> = [
     { type: JSON_UTILITY_TYPE, method: "FromJson", parameters: 2 },
     { type: CHART_TYPE, method: "GetNoteCount", parameters: 0 },
@@ -103,7 +89,7 @@ function install(): void {
 
     const ProgressControl = findClass(PROGRESS_CONTROL_TYPE);
     if (ProgressControl === null) {
-        send({ event: "warn", reason: `找不到 ${PROGRESS_CONTROL_TYPE}，游戏时钟跟不上` });
+        send({ event: "warn", reason: `找不到 ${PROGRESS_CONTROL_TYPE}，游戏时钟读不到` });
     } else {
         installProgressHook(ProgressControl);
         installPlayStateHook(ProgressControl);
@@ -123,11 +109,8 @@ function install(): void {
 /** 供主机（以及手工排障）用的 RPC 表面。 */
 rpc.exports = {
     /**
-     * 应答一声。
-     *
-     * 主机拿它当**存活探测**：进程被杀了 frida 会自己报 detached，但进程被 Android
-     * 冻结（切后台缓存）时连接还在、脚本却不动了 —— 那种情况下只有一次真调用才问得出来。
-     * 所以这个函数必须**一个字都不碰 il2cpp**：闸门正按着 Unity 主线程的时候它也要能立刻返回。
+     * 存活探测：进程被 Android 冻结时连接还在、脚本却不动，只有真调用才问得出来。
+     * 所以这里一个字都不碰 il2cpp —— 闸门正按住 Unity 主线程时它也要能立刻返回。
      */
     ping(): string {
         return "pong";

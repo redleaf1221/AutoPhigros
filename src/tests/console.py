@@ -1,8 +1,8 @@
 """控制台检查：命令解析、回显三条规矩、"空读不退出"，以及"子进程不许继承 stdin"的审计。
 
-控制台现在是**主干**（跑在主线程上读输入），所以这里多了一组以前没有的判据：空读与
-EOF 都不能把它带走 —— 没有面板可用是这个项目里最难受的一种状态（"没有 console 我用什么"），
-只有 `quit` / `exit` / Ctrl+C 才让两者一起退出。
+控制台是**主干**（跑在主线程上读输入），所以空读与 EOF 都不能把它带走 —— 只有 `quit` /
+`exit` / Ctrl+C 才让两者一起退出。回显三条规矩：每条命令都得有回话（包括 `status_lines()`
+给空的时候）、管道模式下命令要回显、别的线程打印完提示符必须画回来。
 """
 
 from __future__ import annotations
@@ -17,10 +17,8 @@ from .stubs import make_config
 
 
 def check_console() -> list[str]:
-    """控制台自检。
-
-    盯的是三件事：``latency`` 的三种写法与"打错命令不该把控制台带走"、会落盘的命令真的
-    落盘（不落盘的绝不落盘）、以及**空读 / EOF 不退出**。
+    """控制台自检：`latency` 的三种写法与"打错命令不该把控制台带走"、落盘边界
+    （`inject` / `verbose` 绝不落盘，别的该落的真落），以及**空读 / EOF 不退出**。
     """
     from runtime.console import Console
     from runtime.options import Options
@@ -116,6 +114,28 @@ def check_console() -> list[str]:
     expect(fake.persists > before, "planner 改了却没落盘")
     run("planner 没有这个")
     expect(fake.options.planner == "radical", "换到不存在的规划器时不该改动设置")
+
+    # 规划器参数：改了就落盘、名字写错不许写进去、类型不对不许覆盖、reset 回到默认值
+    run("option flick_repeats 3")
+    expect(
+        fake.config.planner_options.get("radical", {}).get("flick_repeats") == 3,
+        f"option 没写进配置：{fake.config.planner_options}",
+    )
+    run("option 没这个参数 1")
+    expect(
+        fake.config.planner_options.get("radical", {}).get("没这个参数") is None,
+        "不认识的参数不该写进配置",
+    )
+    run("option flick_repeats 不是整数")
+    expect(
+        fake.config.planner_options.get("radical", {}).get("flick_repeats") == 3,
+        "类型不对的值不该覆盖掉原来的",
+    )
+    run("option flick_repeats reset")
+    expect(
+        "flick_repeats" not in fake.config.planner_options.get("radical", {}),
+        "reset 之后不该还留着",
+    )
 
     # 设备与注入
     run("devices")
@@ -319,8 +339,7 @@ def check_console() -> list[str]:
         "log() 没有 flush —— 管道里会攒成「敲了一条没反应、再敲一条上一条才出来」",
     )
 
-    # 谁都不许继承我们的 stdin：`adb shell` 会把本地 stdin 转发给设备端，
-    # 用户在控制台里敲的那一行就被它半路吃掉了 —— 这种错不报错，只表现为"偶尔有一行没反应"
+    # 谁都不许继承我们的 stdin：`adb shell` 会把本地 stdin 转发给设备端，把控制台里敲的那一行半路吃掉
     for path in sorted(SOURCE_ROOT.glob("*.py")) + sorted((SOURCE_ROOT / "backends").glob("*.py")):
         for number in _subprocess_calls_without_stdin(path.read_text(encoding="utf-8")):
             problems.append(f"{path.name}:{number} 的 subprocess 调用没有 stdin=DEVNULL")
@@ -331,8 +350,7 @@ def check_console() -> list[str]:
 def _subprocess_calls_without_stdin(text: str) -> list[int]:
     """找出所有没给 ``stdin=`` 的 subprocess 调用，返回行号。
 
-    判据是"这次调用的括号里有没有 ``stdin=``"，不是"这一行里有没有" —— 参数写成多行
-    是很正常的写法（``scrcpy.py`` 里就是）。
+    判据是"这次调用的括号里有没有 ``stdin=``"，不是"这一行里有没有"（参数写成多行很正常）。
     """
     import re
 

@@ -1,55 +1,12 @@
 #!/usr/bin/env python3
 """scrcpy 控制协议后端：只借它的控制通道往设备里注入多点触控。
 
-为什么不自己造
---------------
-把触摸事件送进 Android 有两条路：`adb shell input`（慢、单点、带抬起延迟）和
-`InputManager.injectInputEvent`（快、多点、可精确到帧）。后者需要 INJECT_EVENTS 权限，
-而 scrcpy 的 server 已经在设备上把这条路走通了 —— 我们只按它的协议发字节就行。
-
-协议（对着 scrcpy **v4.1** 的 `app/src/control_msg.h` / `control_msg.c` 与
-`server/.../control/ControlMessageReader.java` 逐字段核过；控制协议是**大端**）
-
-.. code-block:: text
-
-    INJECT_TOUCH_EVENT = 2
-    u8  type
-    u8  action          0 = ACTION_DOWN，1 = ACTION_UP，2 = ACTION_MOVE，3 = CANCEL
-    u64 pointer_id      每根手指一个；别用 -1/-2/-3（scrcpy 自己保留）
-    u32 x
-    u32 y
-    u16 screen_width
-    u16 screen_height
-    u16 pressure        u16 定点（2^16 = 1.0）：按下 0xffff，抬起 0
-    u32 action_button   手指触控恒 0
-    u32 buttons         手指触控恒 0
-    = 32 字节
-
-多指的事 server 自己管：`Controller.injectTouch` 发现同时有两个以上指针时，会把
-DOWN/UP 改写成 `ACTION_POINTER_DOWN/UP | (index << 8)`。所以客户端只管发
-DOWN/UP/MOVE + 各自的 pointer_id。
-
-连接方式
---------
-用 `tunnel_forward`（server 侧 listen、主机侧 connect），比默认的 `adb reverse`
-少一个"主机监听 + 等 accept"的环节，而且能靠一个哨兵字节确认 server 真的起来了：
-
-.. code-block:: sh
-
-    adb push <scrcpy-server> /data/local/tmp/scrcpy-server.jar
-    adb forward tcp:<port> localabstract:scrcpy_<scid>
-    adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / \\
-        com.genymobile.scrcpy.Server 4.1 scid=<scid> log_level=info \\
-        video=false audio=false tunnel_forward=true
-
-连上以后**先读掉一个字节** —— `DesktopConnection.open()` 在第一个 socket 上写了
-一个 0，就是给客户端用来判断"对面真的在监听"的（`server.c` 的
-`connect_and_read_byte`）。
-
-只开控制通道（`video=false audio=false`）时 server 的 `displayData` 是 null，
-`Controller.getEventPointAndDisplayId` 会走 else 分支**按原始坐标注入**：我们发的
-就是设备像素，不用关心视频尺寸（但 `screen_width/height` 两个字段仍得填）。
+借它的理由：`adb shell input` 慢、单点、带抬起延迟，而 `InputManager.injectInputEvent` 快、
+多点、可精确到帧 —— 后者要 INJECT_EVENTS 权限，scrcpy 的 server 已经走通了，我们只发字节。
 """
+
+# 协议：INJECT_TOUCH_EVENT = 2，32 字节，大端；逐字段的表见 impl.md「为什么借 scrcpy」。
+# 手指触控的 action_button / buttons 恒 0；pointer_id 由我们自己排，别用 -1 / -2 / -3。
 
 from __future__ import annotations
 
@@ -58,7 +15,6 @@ import secrets
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -70,13 +26,10 @@ from algorithms.utils import Touch, TouchEvent
 from .utils import to_pixels
 
 ADB = Path(r"C:\UserData\platform-tools\adb.exe")
-"""adb 可执行文件。项目里其他脚本用的也是这个（scrcpy 自带的那份不掺和）。"""
+"""adb 可执行文件；项目里其他脚本用的也是这一个。"""
 
 SERVER = Path(__file__).resolve().parent / "scrcpy-server-v4.1"
-"""scrcpy 4.1 的 server（就是 release 里那个 `scrcpy-server`，没扩展名）。
-
-放在项目**上一级**目录里 —— 那是用户下载 scrcpy 的位置，不去动它。
-"""
+"""scrcpy 4.1 的 server（release 里那个 `scrcpy-server`，没有扩展名）；就放在本模块旁边。"""
 
 VERSION = "4.1"
 """server 会把第一个参数当版本号比对，必须和 server 本体一致。"""
@@ -91,8 +44,8 @@ TOUCH_MESSAGE = struct.Struct(">BBQIIHHHII")
 _ACTIONS = {Touch.DOWN: 0, Touch.UP: 1, Touch.MOVE: 2, Touch.CANCEL: 3}
 """本项目内部动作 → Android MotionEvent 动作码。
 
-`Touch` 的编号是规划器内部用的（DOWN/MOVE/UP/CANCEL = 0/1/2/3），Android 那边是
-DOWN/UP/MOVE/CANCEL = 0/1/2/3 —— 只有 MOVE 和 UP 对调，所以必须显式映射。
+`Touch` 是 DOWN/MOVE/UP/CANCEL = 0/1/2/3，Android 是 DOWN/UP/MOVE/CANCEL = 0/1/2/3，
+只有 MOVE 和 UP 对调，所以必须显式映射。
 """
 
 _PRESSED = 0xFFFF
@@ -113,9 +66,7 @@ def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
     command += list(args)
     try:
         finished = subprocess.run(
-            # stdin 必须是 DEVNULL，不能让它继承我们的：`adb shell` 会把本地 stdin
-            # 转发给设备端的 shell，于是用户在控制台里敲的那一行会被 adb 半路吃掉 ——
-            # 表现就是"敲了没反应，再敲一条上一条才生效"。adp 一个字节的输入都不需要。
+            # stdin 必须 DEVNULL：`adb shell` 会把本地 stdin 转发给设备端 shell，吃掉控制台的输入
             command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False
         )
     except FileNotFoundError as error:
@@ -130,10 +81,9 @@ def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
 
 
 def screen_size(serial: str | None = None) -> tuple[int, int]:
-    """问设备要屏幕像素尺寸，**横屏**口径。
+    """问设备要屏幕像素尺寸，**横屏**口径（长边当宽）。
 
-    `wm size` 给的是设备自然方向下的物理尺寸（手机就是竖着那个），而 Phigros 只在横屏跑，
-    所以按长边当宽归一 —— 换算坐标要的是游戏实际拿到的那块画面。
+    `wm size` 给的是设备自然方向下的物理尺寸，而 Phigros 只在横屏跑，换算坐标要的是实际画面。
     """
     output = _adb("shell", "wm", "size", serial=serial)
     override = re.search(r"Override size:\s*(\d+)x(\d+)", output)
@@ -152,8 +102,7 @@ class ScrcpyBackend:
         self.serial = serial
         self.screen: Screen | None = None
         self.device = (0, 0)
-        # server 那边是 Integer.parseInt(scid, 16)，**有符号** 32 位；给到 0x80000000
-        # 以上它会 NumberFormatException 直接退出。所以要压在 31 位以内。
+        # server 那边是 Integer.parseInt(scid, 16)，有符号 32 位：给到 0x80000000 以上会直接退出
         self.scid = secrets.randbelow(0x7FFFFFFF)
         self.port = 0
 
@@ -168,7 +117,7 @@ class ScrcpyBackend:
         if not ADB.is_file():
             raise ScrcpyError(f"找不到 adb：{ADB}")
         if not SERVER.is_file():
-            raise ScrcpyError(f"找不到 scrcpy server：{SERVER}（去 scrcpy release 里拿那个 scrcpy-server）")
+            raise ScrcpyError(f"找不到 scrcpy server：{SERVER}")
 
         self.screen = screen
         self.device = screen_size(self.serial)
@@ -265,8 +214,7 @@ class ScrcpyBackend:
         ]
         process = subprocess.Popen(
             command,
-            # 同上：这条 `adb shell` **整局都活着**，stdin 一旦继承，它就是个一直在
-            # 等着抢用户输入的家伙。DEVNULL 一劳永逸。
+            # 同上：这条 `adb shell` 整局都活着，stdin 一继承就是个一直在抢用户输入的家伙
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -314,8 +262,7 @@ class ScrcpyBackend:
                 continue
 
             connection.settimeout(None)
-            # 关掉 Nagle。控制通道是"一小撮字节、一小撮字节"地发，让它攒包会把事件攒晚
-            # 几十毫秒（Windows 上尤其），触控的同步就全废了。
+            # 关掉 Nagle：控制通道一小撮一小撮地发，攒包会把事件攒晚几十毫秒（Windows 上尤其）
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return connection
 
@@ -336,12 +283,11 @@ def available() -> str | None:
 
 
 if __name__ == "__main__":
-    # 直接跑这个文件是不行的（包内相对 import），要这样：
-    #     python -m backends.scrcpy
+    # 直接跑这个文件是不行的（包内相对 import），要 `python -m backends.scrcpy`
     reason = available()
     print(reason or f"scrcpy 后端就绪：adb={ADB} server={SERVER} ({VERSION})")
     if reason is None:
         try:
             print(f"    当前设备屏幕：{screen_size()}")
         except ScrcpyError as error:
-            print(f"    读屏幕尺寸失败（设备没连？）：{error}")
+            print(f"    读屏幕尺寸失败：{error}")

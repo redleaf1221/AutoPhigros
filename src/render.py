@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""规划结果可视化：把 ``.psap`` 渲染成视频。
+"""规划结果可视化：把规划结果渲染成视频。
 
 手指用点表示，运动轨迹用线表示。主要用途是**叠到录屏上做对照**，所以默认输出带 alpha 的
 ``.mov``（QuickTime Animation），能直接拖进 Premiere / AE；不想要透明就 ``--background``
 换个底色（绿幕用 ``chroma``）。
 
-    python src/render.py plans/xxx.psap
-    python src/render.py plans/xxx.psap --size 1280x720 --fps 30
-    python src/render.py plans/xxx.psap --background chroma
-    python src/render.py plans/xxx.psap --no-paths --point-color "#00ff88" --point-radius 10
-    python src/render.py plans/xxx.psap --path-color blue --path-width 5 --path-window 800
+    python src/render.py plans/xxx.npz
+    python src/render.py plans/xxx.npz --size 1280x720 --fps 30
+    python src/render.py plans/xxx.npz --background chroma
+    python src/render.py plans/xxx.npz --no-paths --point-color "#00ff88" --point-radius 10
+    python src/render.py plans/xxx.npz --path-color blue --path-width 5 --path-window 800
 
-关于抗锯齿，有个坑值得写下来：OpenCV 的 ``LINE_AA`` **只有在单通道图上才给出正确的覆盖率**
-（白 255 叠在黑 0 上，结果就是覆盖率本身）。直接往 RGBA 上画是不行的 —— 透明像素会被当成
-黑色参与混合，边缘立刻出现一圈暗边。所以这里是先出覆盖率掩膜（轨迹一张、手指一张），
-再用 numpy 自己做直通 alpha 的合成。
-
-另外，笔画只在各自的包围盒里光栅化与合成：一帧通常只有几个点加几条短线，
+抗锯齿先出**单通道覆盖率掩膜**（OpenCV 的 ``LINE_AA`` 只在单通道图上才给出正确的覆盖率：
+白色 255 叠在黑色 0 上，结果就是覆盖率本身），再用 numpy 做直通 alpha 的合成 —— 直接往
+RGBA 上画会把透明像素当黑色混进去，边缘出现一圈暗边。笔画只在各自的包围盒里光栅化与合成：
 按整屏算 1920x1080 的浮点合成会白白慢上两个数量级。
 """
 
@@ -37,7 +34,7 @@ from tqdm import tqdm
 
 from algorithms.geometry import Screen
 from algorithms.utils import PlanResult, Touch
-from formats.storage import decode_plan
+from formats.storage import load_plan
 
 ROOT = Path(__file__).resolve().parents[1]
 """项目根目录 —— ``src/`` 的上一层。渲染产物落在它下面的 ``renders/``。"""
@@ -155,8 +152,7 @@ class Motion:
                 if items[cursor][1] is Touch.UP:
                     start = cursor + 1
                     break
-            # 手指最后一次动过已经比窗口还早时，bisect 会越过 index，
-            # 但手指现在还在屏幕上，轨迹至少要有它当前所在的那一点
+            # 手指最后一次动过比窗口还早时 bisect 会越过 index，至少留它当前那一点
             start = min(start, index)
             trails.append([items[cursor][2] for cursor in range(start, index + 1)])
 
@@ -339,7 +335,7 @@ def render(
     给了颜色就铺满底色（绿幕抠像用 ``"chroma"``）。
     """
     if not isinstance(plan, PlanResult):
-        plan = decode_plan(Path(plan).read_bytes())
+        plan = load_plan(Path(plan))
 
     output = Path(output) if output is not None else RENDERS_DIR / "plan.mov"
     size = align_size(size)
@@ -383,7 +379,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="render.py", description="auto_phigros 可视化：把规划结果渲染成视频"
     )
-    parser.add_argument("plan", type=Path, help=".psap 文件")
+    parser.add_argument("plan", type=Path, help="规划结果 .npz")
     parser.add_argument("-o", "--output", type=Path, default=None, help="输出文件（默认 renders/<名字>.mov）")
     parser.add_argument("--size", default="1920x1080", help="分辨率（默认 %(default)s）")
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="帧率（默认 %(default)s）")

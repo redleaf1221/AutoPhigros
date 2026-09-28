@@ -15,12 +15,8 @@ from .stubs import Recorder, make_config, make_controller
 def check_liveness() -> list[str]:
     """存活探测自检：``ok`` / ``hang`` / ``dead`` 三种结局都要认得出来。
 
-    没有设备也验得了 —— 会话与脚本本来就是"能 post、能 ping 的对象"，顶掉它们就行。
-    真设备上验这一段要拔线或者杀进程（还得赌上"拔的是哪一根"），而它恰恰是"游戏没了
-    以后别把剩下的排期灌进去"的唯一依据，所以值得在这里钉住。
-
-    另外钉住两件"很难查"的事：收工只收一次（账别报两遍、播放器别停两次），
-    以及收工时别把刚换上的新播放器顺手摘掉（它的排期还在跑，账却再没人收）。
+    没有设备也验得了（顶掉会话与脚本就行）—— 而它是"游戏没了以后别把剩下的排期灌进去"的
+    唯一依据。另外钉住两件难查的事：收工只收一次，收工也不把刚换上的新播放器顺手摘掉。
     """
     import threading
     import time as timing
@@ -89,7 +85,6 @@ def check_liveness() -> list[str]:
     expect(agent.probe(0.5) == "dead", "断开之后还不认成 dead")
 
     # 6) 我们自己正忙的时候，ping 超时**不算**"游戏冻住了"
-    #    （实机踩过：9MB 谱面在通道上传输那两秒被判成进程被冻结，白停一次触控）
     class CountingPlayer:
         def __init__(self) -> None:
             self.stopped = 0
@@ -101,7 +96,7 @@ def check_liveness() -> list[str]:
             return True
 
     def watch(agent) -> tuple[str, list[str], int]:
-        """跑一轮看门狗，拿回 (agent_state, 打出来的话, 播放器被停了几次)。
+        """跑一轮看门狗，拿回（agent_state、打出来的话、播放器被停了几次）。
 
         把 ping 超时临时压到 50ms：这里要的是"超时"这个结局，而不是真等 2 秒。
         """
@@ -168,7 +163,7 @@ def check_liveness() -> list[str]:
     expect(len(reports) == 1, f"账报了 {len(reports)} 次，应当只有一次")
     expect(controller.player is None, "收工之后 player 该是空的")
 
-    # 7) "打完收工"不能顺手把刚换上的新播放器摘掉
+    # 8) "打完收工"不能顺手把刚换上的新播放器摘掉
     controller = make_controller()
     installed = FakePlayer()
     controller.player = installed
@@ -183,27 +178,18 @@ def check_liveness() -> list[str]:
 
 
 def check_shutdown() -> list[str]:
-    """收工自检：``quit`` 与 Ctrl+C 必须是同一条路、同一件事。
+    """收工自检：``quit`` 与 Ctrl+C 必须是同一条路、同一件事，而且只收一次。
 
-    这条路上出错都**不报错**，只表现为"看起来退出来了、其实没有"，所以值得钉住：
-
-    * ``quit`` 只置一个标志、等主干发现 —— 主干卡在启动阶段的长调用里时，屏幕上看不出
-      任何变化，而游戏上还挂着我们的 hook；
-    * Ctrl+C 要按两下：第二下落在拆除中途，把 unload / detach 打断，注入就留在游戏里了；
-    * 闸门还开着就断会话 —— Unity 主线程永远等不到放行，游戏冻在那儿，只能去杀进程；
-    * 收工之后还在规划、还在架播放器 —— 排期会灌进一个我们已经放手的进程。
-
-    全部用替身跑，不需要设备。最后两条走的是**真的** ``main()``：只在外面顶掉
-    ``Controller`` / ``Console``，看两个入口是不是都落到 ``shutdown()`` 上。
+    盯的都是**不报错**的错法：只置标志不当场拆、拆除期间 Ctrl+C 能落进来、闸门还开着就断
+    会话、收工之后还在规划或架播放器 —— 它们只表现为"看起来退出来了、其实没有"。
     """
-    # 这一组要往真线程、真 main() 里跑，中间必然打出一些本来就该出现的日志 —— 全接进
-    # 缓冲里，别把它们混进自检结果（有问题照样从返回值出去）。
+    # 这一组要往真线程、真 main() 里跑，中间必然打出正常的日志：全接进缓冲里，别混进自检结果。
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         return _check_shutdown()
 
 
 def _check_shutdown() -> list[str]:
-    """收工自检的正文 —— 判据与理由见 :func:`check_shutdown`。"""
+    """收工自检的正文：前面用替身，最后跑**真的** ``main()``（只顶掉 Controller / Console）。"""
     import threading
     import time as timing
 
@@ -248,8 +234,7 @@ def _check_shutdown() -> list[str]:
             events.append("player-stop")
 
         def join(self, timeout: float | None = None) -> bool:
-            # 拆除期间 Ctrl+C 必须是屏蔽的：第二下要是能落进来，unload/detach 就会被
-            # 打断 —— 那等于没取消注入。就在这里当场采一下，别只信源码看着对。
+            # 拆除期间 Ctrl+C 必须是屏蔽的（第二下会打断 unload/detach）：就在这里当场采一下。
             handlers.append(signal.getsignal(signal.SIGINT))
             return True
 
@@ -278,8 +263,7 @@ def _check_shutdown() -> list[str]:
         f"拆除期间没有屏蔽 Ctrl+C（采到的处理器是 {handlers}）—— 再按一下就会打断 detach",
     )
 
-    # 2) 闸门还开着：先放行，再断会话。闸门走**真的**那条消息路径（不是手写字段），
-    #    回调故意卡住，模拟"正在规划、游戏停在闸门上"的那一刻。
+    # 2) 闸门还开着：先放行、再断会话（闸门走真的消息路径，回调故意卡住，模拟"正在规划"）。
     events.clear()
     controller, agent, script = build()
     opened = threading.Event()
@@ -378,8 +362,7 @@ def _check_shutdown() -> list[str]:
         touch.Player = original_player  # type: ignore[assignment]
     expect(not built, "收工之后还架了播放器（排期会灌进一个我们已经放手的进程）")
 
-    # 5) 收工只动我们自己的东西：游戏本身一根手指都不碰 —— 即使它是我们 spawn 出来、
-    #    还没放行的那个。"放不放它跑"不是收工该管的事。
+    # 5) 收工只动我们自己的东西：游戏本身一根手指都不碰 —— 即使它是我们 spawn 出来、还没 resume 的那个
     class FakeDevice:
         def __init__(self) -> None:
             self.touched: list[str] = []
@@ -462,14 +445,7 @@ def _check_shutdown() -> list[str]:
     code, calls = run_main(spy, "park")
     expect(code == 0 and calls[-1:] == ["shutdown"], f"控制台自然结束之后没有收工：{calls}")
 
-    # 7) 等不到时钟：**判据是游戏时钟自己**，不是墙上的时间。
-    #    踩过（logs/2026-09-27_21-46-38.log）：原先只看"播放器起来之后过了几秒还没发第一个
-    #    事件"，而播放器是在**闸门放行之前**架好的 —— 闸门一开游戏还得起播、再走到谱面 1.8s，
-    #    加起来轻松超过 3s，于是每一局都误报"这一局很可能一个音符都按不到"，紧接着打出一个
-    #    All Perfect。用墙上的时间量游戏里的事，必然这样。
-    #
-    #    注意这里**只报不改状态** —— "这一局还在不在"由 agent 的暂停/退场 hook 说了算，
-    #    不许拿"多久没样本"去猜（暂停与退出在样本上只差一次抖动那么宽）。
+    # 7) 等不到时钟：判据是**游戏时钟自己**而不是墙上的时间；这里只报不改状态（"还在不在"由 hook 说了算）。
     class IdlePlayer:
         def __init__(self) -> None:
             self.stopped = 0
@@ -489,7 +465,7 @@ def _check_shutdown() -> list[str]:
         held: bool = False,
         playing: bool | None = None,
     ) -> tuple[str, IdlePlayer]:
-        """架一个"一个事件都没发"的现场，返回 (报出来的话, 播放器)。"""
+        """架一个"一个事件都没发"的现场，返回（报出来的话、播放器）。"""
         controller = make_controller()
         controller._report = lambda player: None  # type: ignore[method-assign]
         if playing is not None:
@@ -507,9 +483,9 @@ def _check_shutdown() -> list[str]:
             controller._check_clock_wait()  # noqa: SLF001
         return buffer.getvalue(), player
 
-    # 7a) **这次那个假警报的回归**：时钟在走、只是还没走到第一个事件 —— 等着就是对的
+    # 7a) 时钟在走、只是还没走到第一个事件 —— 等着就是对的
     text, player = waiting(0.00001)
-    expect(not text, f"时钟还没走到第一个事件就报警了（就是那个假警报）：{text!r}")
+    expect(not text, f"时钟还没走到第一个事件就报警了：{text!r}")
     expect(player.stopped == 0, "等时钟不是收工，不该把播放器停掉")
 
     # 7b) 真故障：游戏时钟已经越过第一个事件，却一个事件都没发 —— 必须出声
@@ -517,8 +493,7 @@ def _check_shutdown() -> list[str]:
     expect("越过了首个事件" in text, f"时钟过了第一个事件还没发事件，却一声不吭：{text!r}")
     expect(player.stopped == 0, "报一声就够了，不许顺手把状态改了")
 
-    # 7b') 但"刚过一点点"不算：poll 每 0.2s 一眼、播放器 2ms 醒一次，判据得留余量
-    #      （`CLOCK_LATE_MARGIN`）—— 没余量就会与播放器赛跑，而这条只报一次
+    # 7b') 但"刚过一点点"不算：poll 每 0.2s 一眼、播放器 2ms 醒一次，判据得留余量（CLOCK_LATE_MARGIN）。
     text, _ = waiting(1.600)
     expect(not text, f"才刚过第一个事件就报警（会与播放器赛跑）：{text!r}")
 
@@ -526,7 +501,7 @@ def _check_shutdown() -> list[str]:
     text, _ = waiting(None)
     expect("一个时钟样本都没来" in text, f"一个样本都没有却一声不吭：{text!r}")
     text, _ = waiting(None, elapsed=1.0)
-    expect(not text, f"才等了 1s 就报「一个样本都没来」：{text!r}")
+    expect(not text, f"才等了 1s 就报「一个时钟样本都没来」：{text!r}")
 
     # 8) 暂停不算"等不到"：时钟被我们自己按住、或者游戏说没在走 —— 谁都不该发事件
     text, _ = waiting(2.400, held=True)
@@ -534,9 +509,7 @@ def _check_shutdown() -> list[str]:
     text, _ = waiting(2.400, playing=False)
     expect(not text, f"游戏自己说停着的时候不该报等不到时钟：{text!r}")
 
-    # 9) 游戏自己报的暂停 / 退场：**信号驱动**，不是计时推断
-    #    暂停 = 把按着的手指抬起来（排期停了不等于手抬了），但**不停播放器**（时钟只是钉住，
-    #    恢复后接着从原地走）；退场 = 停播放器 + 清时钟 + 明说一句。
+    # 9) 游戏自己报的暂停 / 退场：**信号驱动** —— 暂停按住时钟 + 抬手但不停播放器；退场停播放器 + 清时钟。
     class CountingPlayer:
         def __init__(self) -> None:
             self.stopped = 0
@@ -619,9 +592,7 @@ def _check_shutdown() -> list[str]:
         controller.detach()
     expect("没在注入" in buffer.getvalue(), f"没 agent 时要说明白：{buffer.getvalue()!r}")
 
-    # 11) `status` 里那句"游戏在不在走"：**没观测到就说不知道**，不许替游戏下结论。
-    #     踩过（logs/2026-09-27_21-46-38.log）：`agent.playing` 原先是个初值 False 的 bool，
-    #     而 `Play` 起播时不响 —— 于是一局 All Perfect 打完，status 从头到尾报"音乐没在走"。
+    # 11) `status` 里那句"游戏在不在走"：**没观测到就说不知道**（playing 的三态：None 不许当成 False）。
     controller = make_controller()
     controller._report = lambda player: None  # type: ignore[method-assign]
     controller.agent_state = "ok"
@@ -641,4 +612,3 @@ def _check_shutdown() -> list[str]:
     expect("没在走" in playing_line(), f"游戏停着时没说对：{playing_line()!r}")
 
     return problems
-

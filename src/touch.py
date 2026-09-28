@@ -3,34 +3,18 @@
 
 `main.py`（frida 主干）每次开谱调它一次；它自己也能单独跑：
 
-    python src/touch.py plans/0002_..._conservative.psap
-    python src/touch.py plans/x.psap --mirror --latency 0.02
-    python src/touch.py plans/x.psap --backend recording     # 不连设备，只跑调度器
+    python src/touch.py plans/0002_..._conservative.npz
+    python src/touch.py plans/x.npz --mirror --latency 0.02
+    python src/touch.py plans/x.npz --backend recording     # 不连设备，只跑调度器
 
-本模块只管三件事：**对表**（`Clock`）、**排事件**（`Player`）、**命令行**。
-"事件怎么送出去"是 `backends/` 那包的事 —— 目前有 scrcpy（真发）与 recording（干跑）。
+本模块只管三件事：**对表**（`Clock`）、**排事件**（`Player`）、**命令行**；怎么把事件送
+出去是 `backends/` 那包的事（scrcpy 真发、recording 干跑）。
 
-同步是怎么做到的
-----------------
-不自己数拍子，而是**跟着游戏的时钟走**。agent 每 100ms 把
-`ProgressControl::Update` 里刚算出来的 `nowTime` 回传一次，本模块用这些样本估计
-"游戏时间 → 主机单调时钟"的映射，然后按它排事件。于是游戏自己的东西全都自动算进去了：
-
-* **延迟设置** —— `nowTime = audioTime − (mainOffset + chart.offset + 用户offset)`，
-  游戏侧的 offset 已经在 `nowTime` 里了，跟着 `nowTime` 走就是跟着它走，
-  **不需要也不能再加一次**（加了就是双份）；
-* 加载、起播前那 3 秒、掉帧、暂停、恢复 —— 时钟停了事件就停，时钟走事件就走。
-
-样本带的是"读到时的值"，而它到主机手上必然晚了一小段。设真实关系是
-`host = game + τ`，样本满足 `h_i − v_i = τ + d_i`（`d_i ≥ 0` 是那一次的传输延迟），
-所以对最近的样本取 `min(h_i − v_i)` 就是 `τ` 的一个**偏晚**的估计 ——
-错也只错在"晚了一点"，不会早。窗口 2 秒，跟着设备与主机的晶振漂移慢慢挪。
-
-剩下的固定偏差（主机→adb→设备→InputManager 这条注入链路的耗时）由 `--latency`
-手工补：正数 = 提前发。这个数只能上设备调，默认 0。
-
-镜像同理只在**执行时**临时改：`.psap` 存的是**规范解**（不镜像、不偏移），
-游戏里开了镜像就 `PlanResult.mirrored()` 翻一下坐标再发，缓存不用重算。
+对表跟着 agent 每 100ms 回传的 `nowTime` 走（`audioTime − mainOffset − chart.offset −
+玩家offset`），游戏侧的延迟已经在里面，不能再加一次。样本满足 `h − v = τ + d`（`d ≥ 0`
+是那一次的传输延迟），所以对最近 2 秒的样本取 `min(h − v)` 就是 τ 的**偏晚**估计 ——
+错也只错在晚一点，不会早。`.npz` 里存的是规范解（不镜像、不偏移），镜像与 `--latency`
+都只在执行时加。
 """
 
 from __future__ import annotations
@@ -47,60 +31,27 @@ import backends
 from algorithms.utils import PlanResult, Touch, TouchEvent
 from backends import Backend, catalog, create
 from runtime.options import Options
-from formats.storage import decode_plan
+from formats.storage import NpzFormatError, load_plan
 
 POLL = 0.002
-"""快到点时重新对表的间隔（秒）。2ms 一小步，既跟得上映射的微调又不至于空转烧 CPU。"""
+"""快到点时重新对表的间隔（秒）：跟得上映射的微调，也不至于空转烧 CPU。"""
 
 COARSE_NAP = 0.05
-"""离得还早就先按这个粒度睡。
-
-**为什么不用 `Event.wait(超时)` 来睡**：Windows 上带超时的锁等待只有系统时钟滴答
-（15.6ms）的精度，实测能把事件拖晚 14ms；`time.sleep` 从 Python 3.11 起走的是高精度
-可等待定时器，同样是睡 2ms 就真能 2ms 醒。代价是 stop 标志只能在每一小步之间看到 ——
-最长 50ms 的延迟，收尾时无所谓。
-"""
+"""离得还早就先按这个粒度睡。用 ``time.sleep`` 而不用 ``Event.wait(超时)``：Windows 上后者
+只有系统时钟滴答（15.6ms）的精度，能把事件拖晚十几毫秒。"""
 
 CLOCK_WINDOW = 2.0
-"""估计时钟偏移时回看多久的样本。太短会被一次抖动带偏，太长跟不上晶振漂移。"""
+"""估计时钟偏移时回看多久的样本（秒）。太短会被一次抖动带偏，太长跟不上晶振漂移。"""
 
 CLOCK_STALL = 0.25
-"""多久没有新样本就认为游戏时钟停住了（暂停 / 音乐还没起）。
-
-采样间隔是 100ms，取 250ms = 两个半样本的余量。不能取太大：暂停一旦短于这个阈值就
-认不出来，恢复之后会把事件**发早**（等于把暂停那段时间丢掉了）；正常播放时 `nowTime`
-是音频时钟，每个样本都在变，所以 250ms 足够把"停住"和"在走"分开。
-"""
+"""多久没看到新的时间值就认为游戏时钟停住了（暂停 / 音乐还没起）：采样间隔 100ms 的两个半。"""
 
 CLOCK_RESUME_RATE = 0.4
-"""兜底放行的判据：在 :data:`CLOCK_RESUME_WINDOW` 那么长的窗口里值走了 0.4 秒以上。
-
-只用于"`Play(true)` 那个信号没送到"的兜底（用到会报警）。为什么看**速率**而不是"总共走了
-多少"：暂停期间 `nowTime` 可能缓慢爬升（每样本几毫秒），攒一分钟也能攒出 1 秒 —— 按总量判
-会在暂停中途误放行，把触控送进还开着暂停菜单的游戏（那可能替人按到按钮）。速率能把"爬升"
-和"真的在跑"分开：真在跑时 1.5 秒里会走满 1.5 秒，远超 0.4。
-"""
+"""兜底放行的速率判据：:data:`CLOCK_RESUME_WINDOW` 那么长的窗口里值走了 0.4 秒以上。
+只看速率不看总量（暂停期间 ``nowTime`` 会缓慢爬升），仅用于 ``Play(true)`` 没送到的兜底。"""
 
 CLOCK_RESUME_WINDOW = 1.5
 """上面那个速率判据的窗口长度（秒）。"""
-
-LEAD_IN = 3.0
-"""单机跑时留的起跑线：`python src/touch.py` 之后你有 3 秒切回游戏窗口。"""
-
-LATE_WARN = 0.02
-"""迟到超过这么多秒就记一笔。
-
-20ms 是"还判得成 Perfect"（窗口 80ms）与"值得追查"之间的一个折中；它是排查 late good
-时唯一能对着游戏看的数字，所以要留名字、要报出来。
-"""
-
-LATE_SKIP = 0.15
-"""已经迟到超过这么多秒的事件就**别发了**。
-
-Good 的窗口是 180ms，越过 150ms 基本等于已经判没了；这时候再补发不但救不回来，
-还会在游戏刚从卡顿里缓过来的时候再灌它一管子输入 —— 而输入管线被灌满正是卡顿的原因。
-所以宁可丢掉，也不要"补发一堆积压"。丢了多少会如实报出来。
-"""
 
 
 class Clock(Protocol):
@@ -153,11 +104,10 @@ class GameClock:
         """兜底判据的窗口起点对应的游戏时间。"""
 
     def reset(self) -> None:
-        """换一局：样本和统计都从头开始。
+        """换一局：样本、统计、按住状态全部从头开始。
 
-        统计也要清 —— 否则一局的账会把上一局的补齐（日志里"采样最大间隔 10300ms"
-        其实是上一局换关时的空档，看着像是本局出了问题）。`_value_host` 一起清成
-        "从没见过样本"，免得新一局拿着上一局的时间戳去判断"停住/还在"。按住的状态也清。
+        统计也要清 —— 跨局留着的 ``max_gap`` 会把上一局换关时的空档算到本局头上。
+        `_value_host` 清成"从没见过样本"，免得拿上一局的时间戳去判断"停住/还在"。
         """
         with self._lock:
             self._samples.clear()
@@ -170,16 +120,11 @@ class GameClock:
             self._probe_at = None
 
     def hold(self) -> None:
-        """游戏说"我停住了"（暂停）。
+        """游戏说"我停住了"（暂停）：一个事件都不发，也不采信样本。
 
-        为什么不能只靠"值多久没变"：那种判据在暂停**期间**就要开始猜了，而这里有一个
-        明确的信号（``Play(false)``）。按住之后：
-
-        * ``host_for`` 一律返回 None —— 暂停期间一个事件都不该发出去（游戏既不判定，
-          我们的排期也没有意义；更要紧的是此时的手指可能正落在暂停菜单的按钮上）；
-        * ``now()`` 返回按住那一刻的值，供人看"停在哪一秒"；
-        * 期间来的样本**全部不采信** —— 它们要么是同一个数，要么（更坏）在缓慢爬升，
-          而"缓慢爬升"正是让 `min(h−v)` 漂到暂停之后、恢复后所有事件都被判迟到的元凶。
+        ``host_for`` 一律返回 None（游戏既不判定，手指还可能正落在暂停菜单的按钮上），
+        ``now()`` 返回按住那一刻的值；期间来的样本要么是同一个数、要么在缓慢爬升，
+        两种都会把 `min(h−v)` 拖偏，所以一律不采信。
         """
         with self._lock:
             if not self._held:
@@ -188,11 +133,10 @@ class GameClock:
             self._probe_at = None  # 兜底判据从这一刻重新起算
 
     def release(self) -> None:
-        """游戏说"我继续了"（恢复）：把手放开，并且**从零重新对表**。
+        """游戏说"我继续了"（恢复）：放开手，并且从零重新对表。
 
-        为什么要清样本而不是接着用：暂停期间的对齐已经不可信（见 :meth:`hold`），而
-        "恢复后所有事件都迟到太多、播放像死了一样"就是这么来的。清掉之后，恢复后的
-        头几个样本会把偏移重新算出来（≤100ms），代价是那一小段里可能有一两个事件偏晚。
+        暂停期间的对齐已经不可信（见 :meth:`hold`）；清掉样本后，恢复后的头几个样本会把
+        偏移重新算出来（≤100ms）。
         """
         with self._lock:
             self._held = False
@@ -206,10 +150,10 @@ class GameClock:
         return self._held
 
     def _looks_running(self, moment: float, game_seconds: float) -> bool:
-        """按住期间的一眼：游戏是真的又在跑了，还是 `nowTime` 只是在缓慢爬升？
+        """按住期间的一眼：游戏是真在跑，还是 `nowTime` 只是在缓慢爬升？
 
-        真的在跑 → 兜底放行（返回 True，并把按住状态清掉、样本清掉重新对表），并由
-        :meth:`take_auto_release` 让调用方报一声。判据是**速率**，见 :data:`CLOCK_RESUME_RATE`。
+        真在跑（速率过了 :data:`CLOCK_RESUME_RATE`）就兜底放行：清掉按住状态与样本、
+        重新对表，并由 :meth:`take_auto_release` 让调用方报一声。
         """
         if self._probe_at is None:
             self._probe_at, self._probe_value = moment, game_seconds
@@ -247,15 +191,8 @@ class GameClock:
                     # 时钟倒着走了：重开了一局
                     self._reanchor(moment, game_seconds)
                 elif game_seconds > game_prev + 1e-4:
-                    # 值往前走了。要作废旧对齐，得先确认它**停过**：上一个值从
-                    # `_value_host` 起一直没变，超过 stall 就算停过。
-                    #
-                    # 这一条能成立，靠的是"暂停时 hook 照常每 100ms 送一次，只是每次
-                    # 都送同一个数"—— 也就是说暂停一定**看得见**，不需要再从"跨了一大段
-                    # 时间却没怎么走"去推断。那条推断试过，是错的：传输打嗝之后补上来的
-                    # 头一笔样本本来就带旧值（400ms 只走了 5ms），和暂停长得一模一样，
-                    # 于是窗口被误清、`origin` 退化成那个样本自己的 h−v —— 它带多少延迟
-                    # 我们就晚发多少，要等窗口重新填满才自愈。表现就是偶发的 late good。
+                    # 值往前走了。作废旧对齐前先确认它**停过**：上一个值从 `_value_host`
+                    # 起一直没变、超过 stall（暂停时 hook 照常每 100ms 送同一个数，看得见）。
                     if host_prev - self._value_host > self._stall:
                         self._reanchor(moment, game_seconds)
                     self._value_host = moment
@@ -274,8 +211,7 @@ class GameClock:
                 return None
             moment = self._now()
             if self._frozen(moment):
-                # 时钟停着（还没开音乐）：已经到点却来不及发的立刻补上，
-                # 还没到点的一律等着 —— 这时候按"主机时钟"硬推会发早。
+                # 时钟停着（还没开音乐）：到点的立刻补上，没到点的一律等着 —— 硬推会发早。
                 return moment if game_seconds <= self._samples[-1][1] else None
             return _origin(self._samples) + game_seconds
 
@@ -305,10 +241,9 @@ class GameClock:
         self._value_host = moment
 
     def _frozen(self, moment: float) -> bool:
-        """时钟停了吗：同一个值到 `stall` 秒以前就没再变过。
+        """时钟停了吗：判据是**值**多久没变，不是多久没收到样本。
 
-        注意判据是"**值**多久没变"，不是"多久没收到样本" —— 暂停时 hook 照常每 100ms
-        送一次，只是每次都送同一个数。
+        暂停时 hook 照常每 100ms 送一次，只是每次都送同一个数。
         """
         return moment - self._value_host > self._stall
 
@@ -321,7 +256,7 @@ def _origin(samples: Iterable[tuple[float, float]]) -> float:
 class LocalClock:
     """单机跑的时钟：不接游戏，从主机时钟自己走，先留一段起跑线。"""
 
-    def __init__(self, *, lead_in: float = LEAD_IN, now: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, lead_in: float, now: Callable[[], float] = time.monotonic) -> None:
         self._now = now
         self._origin = now() + lead_in
 
@@ -341,9 +276,8 @@ class LocalClock:
 class Player:
     """按时钟把规划结果推出去。跑在自己的线程上，不占 frida 的消息线程。
 
-    ``options`` 是**共享的**运行时设置（``options.py``），不是构造时抄一份的副本：
-    延迟改了下一个事件就按新值发、注入开关改了立刻生效。抄一份的话就得在每个改设置
-    的地方都记得同步正在跑的那个播放器 —— 迟早会漏。
+    ``options`` 是**共享的**运行时设置，不是构造时抄一份的副本：延迟改了下一个事件就按
+    新值发、注入开关改了立刻生效。
     """
 
     def __init__(
@@ -355,7 +289,7 @@ class Player:
         mirror: bool = False,
         options: Options | None = None,
     ) -> None:
-        # 镜像只在执行时改：.psap 里存的是规范解
+        # 镜像只在执行时改：规划结果里存的是规范解
         self.plan = plan.mirrored() if mirror else plan
         self.backend = backend
         self.clock = clock
@@ -364,7 +298,7 @@ class Player:
         self.late = 0.0
         """最晚发出去的那一次迟到了多少秒（含发送本身的耗时；负数=早发）。"""
         self.late_count = 0
-        """迟到超过 :data:`LATE_WARN` 的帧数。"""
+        """迟到超过 ``options.late_warn`` 的帧数。"""
         self.worst: list[tuple[float, float]] = []
         """头几个迟到超标的帧 ``(谱面时刻, 迟到秒数)`` —— 直接对着游戏里的 late 看。"""
         self.max_send = 0.0
@@ -387,8 +321,7 @@ class Player:
         self._down: dict[int, tuple[float, float]] = {}
         """**我们真的按下去、还没抬起来**的指针 → 最后一次发出去的位置。
 
-        只记"发出去过的"（注入关着时不记）：抬起事件只能还给真的按下去过的那些指针，
-        否则就是凭空给设备塞不存在的手指。
+        只记"发出去过的"（注入关着时不记）：抬起只能还给真的按下去过的那些指针。
         """
         self.released = 0
         """收尾时补发了几个抬起事件（手指不该留在屏幕上）。"""
@@ -413,7 +346,7 @@ class Player:
 
     def stop(self) -> None:
         self._stop.set()
-        self._wake.set()  # 立刻打断睡眠，别让它带着一排期睡满 COARSE_NAP 才停
+        self._wake.set()  # 立刻打断睡眠，别让它睡满 COARSE_NAP 才停
 
     def join(self, timeout: float | None = None) -> bool:
         self._done.wait(timeout)
@@ -427,15 +360,9 @@ class Player:
     def release_all(self) -> int:
         """把**我们按着的**手指全抬起来，返回补发了几个事件。
 
-        什么时候要它：游戏暂停了、这一局不打了（结算/退出/重开）、收工了。手指是物理按在
-        屏幕上的 —— 排期停了不等于手抬了，而一根留在屏幕上的手指会继续被游戏读成"在位"
-        （暂停时更糟：暂停菜单是按**手指位置**做射线找按钮的，手指停在那儿可能替人把
-        "重开"按了）。
-
-        抬起来的**位置**会记在 :attr:`_lifted` 里，供 :meth:`resume` 按回原位。
-
-        注入关着的时候：那些手指本来就没按下去（`_down` 是空的），所以一发都不发 ——
-        用户的规矩是"收尾这一发要发"，但"发"的前提是"我们真的按过"。
+        暂停、结算、退出、收工都要它：排期停了不等于手抬了，留在屏幕上的手指会被游戏继续
+        读成"在位"（暂停菜单是按手指位置做射线找按钮的）。抬起来的位置记进 :attr:`_lifted`
+        供 :meth:`resume` 按回原位；注入关着时 `_down` 是空的，一发都不发。
         """
         with self._lock:
             pending = list(self._down.items())
@@ -456,17 +383,12 @@ class Player:
         return len(events)
 
     def resume(self) -> None:
-        """游戏说"我继续了"：把暂停时抬掉的指针**按回原位**（在播放器线程里立刻发）。
+        """游戏说"我继续了"：把暂停时抬掉的指针**按回原位**，在播放器线程里立刻发。
 
-        为什么按回**原位**，而不是把计划里紧接着那个 `MOVE` 改写成 `DOWN`：flick 判的就是
-        "按下之后有没有那一下位移"。直接按在目标位置上，游戏看到的是一个不动的按下，
-        `isNewFlick` 永远不会点亮 —— 那一下 flick 就废了（实测踩过：恢复之后有些 flick
-        划不出来）。按回原位，计划里那一跳仍然是"从 A 到 B 的移动"。
-
-        这件事必须**立刻**做（不能等下一个事件到点）：hold 的主体只有约 67ms 的缺席容忍
-        （`_safeFrame = 2`），等一个 500ms 之后的事件再顺手按下去，hold 已经断了。所以这里
-        只是设个旗子并把播放器叫醒（它每次循环都会看一眼），发送本身在播放器线程里做 ——
-        后端（一条 scrcpy 连接）只能有一个线程写。
+        按回原位，而不是把计划里紧接着那个 `MOVE` 改写成 `DOWN`：flick 判的就是"按下之后
+        有没有那一下位移"，按在目标位置上不动，`isNewFlick` 永远不会点亮。只设旗子并叫醒
+        播放器线程 —— hold 主体只有约 67ms 的容忍（`_safeFrame = 2`），而发送只能在播放器
+        线程里做（后端只允许一个线程写）。
         """
         with self._lock:
             self._resume = True
@@ -477,9 +399,8 @@ class Player:
     def _repress(self) -> int:
         """把暂停时抬掉的指针按回原位。返回补了几个按下（0 = 没什么要做的）。
 
-        在播放器线程里做（后端只能一个线程写）。有一个例外不补：计划里紧接着的那一帧本来
-        就有同一个指针的 `DOWN` —— 那就让计划自己按，同一个 pointer 连按两次是不合法的
-        输入序列。
+        在播放器线程里做（后端只能一个线程写）。例外：计划里紧接着的那一帧本来就有同一个
+        指针的 `DOWN` 就不补 —— 同一个 pointer 连按两次是不合法的输入序列。
         """
         with self._lock:
             if not self._resume:
@@ -536,9 +457,8 @@ class Player:
                     self._wake.clear()
                     continue
 
-                if -remaining > LATE_SKIP:
-                    # 已经晚到救不回来了。补发只会把积压一次性灌进设备 —— 而输入管线
-                    # 被灌爆正是当初卡顿的原因，等于火上浇油。丢掉，并且如实记账。
+                if -remaining > self.options.late_skip:
+                    # 已经晚到救不回来了：补发会把积压一次性灌进设备，丢掉并记账。
                     self.skipped += len(events)
                     index += 1
                     continue
@@ -548,8 +468,7 @@ class Player:
                     self.backend.send(events)
                     self._remember(events)
                 else:
-                    # 注入关着：照样按排期走到这里、照样记迟到，只是不碰设备。
-                    # 于是"关掉注入"仍然是一次完整的调度演练，而不是另一种后端。
+                    # 注入关着：照样按排期走、照样记迟到，只是不碰设备（仍是一次调度演练）。
                     self.muted += len(events)
                 cost = time.monotonic() - started
                 self.max_send = max(self.max_send, cost)
@@ -558,7 +477,7 @@ class Player:
                 # 迟到的量要算上发送本身的耗时：真正"发出去"是在 send 返回之后
                 lateness = cost - remaining
                 self.late = max(self.late, lateness)
-                if lateness > LATE_WARN:
+                if lateness > self.options.late_warn:
                     self.late_count += 1
                     if len(self.worst) < 5:
                         self.worst.append((seconds, lateness))
@@ -585,9 +504,9 @@ class Player:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="touch.py", description="auto_phigros 触控模块：把 .psap 发到设备上"
+        prog="touch.py", description="auto_phigros 触控模块：把规划结果发到设备上"
     )
-    parser.add_argument("plan", type=Path, help="规划结果 .psap")
+    parser.add_argument("plan", type=Path, help="规划结果 .npz")
     parser.add_argument(
         "--backend",
         default=backends.DEFAULT_BACKEND,
@@ -601,14 +520,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--latency", type=float, default=0.0, help="注入链路的手工补偿（秒），正数=提前发"
     )
+    parser.add_argument("--lead-in", type=float, default=3.0, help="几秒后开始发（默认 %(default)s）")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        plan = decode_plan(args.plan.read_bytes())
-    except (OSError, ValueError) as error:
+        plan = load_plan(args.plan)
+    except (OSError, NpzFormatError) as error:
         print(f"[touch] 读不了 {args.plan}：{error}", file=sys.stderr)
         return 2
 
@@ -628,10 +548,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[touch] 后端起不来：{error}", file=sys.stderr)
         return 1
 
-    player = Player(
-        plan, backend, LocalClock(), mirror=args.mirror, options=Options(latency=args.latency)
-    )
-    print(f"[touch] {LEAD_IN:.0f} 秒后开始{'（已镜像）' if args.mirror else ''}")
+    options = Options(latency=args.latency, lead_in=args.lead_in)
+    player = Player(plan, backend, LocalClock(lead_in=options.lead_in), mirror=args.mirror, options=options)
+    print(f"[touch] {options.lead_in:.0f} 秒后开始{'（已镜像）' if args.mirror else ''}")
     try:
         player.start()
         player.join()

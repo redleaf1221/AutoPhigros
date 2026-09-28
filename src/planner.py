@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""规划模块：把一份官谱 JSON 变成一串触控事件。
+"""规划模块：把一份官谱变成一串触控事件。
 
 ``main.py``（frida 主干）拿到谱面就调它；它自己也能单独跑：
 
-    python src/planner.py charts/0002_Glaciaxion.SunsetRay.0_HD_93215ea2.json
-    python src/planner.py Chart.json --no-cache         # 不吃也不写缓存
-    python src/planner.py Chart.json --planner radical
-    python src/planner.py Chart.json -o /tmp/out
+    python src/planner.py charts/Glaciaxion.SunsetRay.0_HD_93215ea2.npz
+    python src/planner.py Chart.npz --planner radical --set flick_repeats=1
+    python src/planner.py Chart.npz --options            # 看这个规划器能调什么
+    python src/planner.py Chart.npz -o /tmp/out --no-cache
 
-单独跑时会先找同目录下的 ``<名字>.meta.json``（采集时留下的那份），从里面恢复序号、
-来源上下文与内容哈希；找不到就退回用文件名当来源、现算哈希。
+输入的谱面是 ``charts/`` 里那种 npz，原文与来源都在里面 —— 规划结果的文件名要靠它。
 
-**落盘的规划结果就是缓存**（默认打开）：一张谱面 + 一个规划器对应一个 ``.psap``，
-下次同样的组合直接读回来；算法源码动过自动失效（见 :func:`cache_key`）。
+**落盘的规划结果就是缓存**：一张谱面 + 一个规划器对应一个文件，命中与否看它 meta 里的
+``cache_key``（算法源码 + 规划器名 + 这一套参数）。**换了参数就是另一份结果**，同一张
+谱面同一个规划器换了参数会重算并覆盖同一个文件；文件名里不带参数，免得变成一坨。
 镜像、延迟这类运行时设置不进缓存，执行时由 ``touch.py`` 临时改。
 """
 
@@ -23,13 +23,28 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 from tqdm import tqdm
 
-from algorithms import DEFAULT_PLANNER, catalog, create
+from algorithms import (
+    DEFAULT_PLANNER,
+    catalog,
+    create,
+    options_from_args,
+    parameters,
+)
 from algorithms.chart import Chart
 from algorithms.utils import PlanResult, Progress, SilentProgress
-from formats.storage import ChartRef, decode_plan, load_plan_meta, plan_path, plan_path_for, save_plan
+from formats.storage import (
+    ChartRef,
+    NpzFormatError,
+    load_chart,
+    load_plan,
+    plan_meta,
+    plan_path_for,
+    save_plan,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 """项目根目录 —— ``src/`` 的上一层。规划缓存 ``plans/`` 在它下面。"""
@@ -50,6 +65,7 @@ def plan(
     text: str,
     *,
     planner: str = DEFAULT_PLANNER,
+    options: Mapping[str, Any] | None = None,
     ref: ChartRef | None = None,
     cache: bool = True,
     directory: Path = PLANS_DIR,
@@ -57,70 +73,63 @@ def plan(
 ) -> PlanResult:
     """规划一份谱面 —— 落盘的规划结果同时就是缓存。
 
-    规划结果是**谱面的纯函数**：一张谱面 + 一个规划器 ⟺ 一个 ``.psap`` 文件
-    （``storage.plan_path_for`` 拼出来的那个名字）。所以 ``cache=True`` 时先看这个文件
-    在不在、是不是这一版算法算出来的（meta 里的 ``cache_key``）：在就直接读回来，
-    不在就算一遍并写下去。没有第二份"缓存格式"。
-
-    镜像、延迟这些**运行时**的东西一概不进缓存：``.psap`` 存的是规范解（不镜像、不偏移），
-    执行时由 ``touch.Player`` 临时改。于是一张谱面的缓存在任何局面下都能用，
-    也不用为"开着镜像再存一份"。
-
-    ``cache=False`` = 既不用也不写（只想要一份临时结果时用）。
+    规划结果是**谱面 + 规划器 + 参数**的纯函数，三者一起决定那份 ``.npz`` 里的内容。
+    ``cache=True`` 时先看文件在不在、``cache_key`` 对不对（源码 / 规划器 / 参数都算进去了），
+    不对就算一遍并覆盖写下去。镜像、延迟这些运行时设置一概不进缓存：存的是规范解，
+    执行时由 ``touch.Player`` 临时改。``cache=False`` = 既不用也不写。
     """
     ref = ref or ChartRef()
+    key = cache_key(planner, options)
     if cache:
-        cached = load_cached(ref, planner, directory)
+        cached = load_cached(ref, planner, options, directory, key=key)
         if cached is not None:
             cached.stats["cached"] = True
             return cached
 
     chart = Chart.parse(text)
-    result = create(planner).plan(chart, progress or SilentProgress())
+    result = create(planner, options).plan(chart, progress or SilentProgress())
     result.stats["cached"] = False
     if cache:
-        save_plan(result, ref, directory, cache_key=cache_key())
+        save_plan(result, ref, directory, cache_key=key)
     return result
 
 
-def cache_key() -> str:
-    """规划管线的指纹：算法源码动过，缓存就该失效。
+def cache_key(planner_name: str, options: Mapping[str, Any] | None = None) -> str:
+    """这份结果由"哪一版算法 + 哪一套参数"算出来的。
 
-    覆盖 ``algorithms/`` 下所有 ``.py`` 与本模块自己 —— 改了算法、改了谱面解析、
-    改了坐标换算，算出来的东西都可能不一样，宁可重算一遍。
+    覆盖 ``algorithms/`` 下所有 ``.py`` 与本模块自己，再加上规划器名和参数 —— 参数是用户
+    随时会改的东西，不写进指纹的话换了参数会悄悄命中旧结果。
     """
     digest = hashlib.sha1()
     for path in sorted((SOURCE_ROOT / "algorithms").rglob("*.py")) + [Path(__file__).resolve()]:
         digest.update(path.read_bytes())
+    digest.update(json.dumps([planner_name, dict(options or {})], sort_keys=True).encode("utf-8"))
     return digest.hexdigest()[:16]
 
 
 def load_cached(
-    ref: ChartRef, planner_name: str, directory: Path = PLANS_DIR
+    ref: ChartRef,
+    planner_name: str,
+    options: Mapping[str, Any] | None = None,
+    directory: Path = PLANS_DIR,
+    *,
+    key: str | None = None,
 ) -> PlanResult | None:
     """命中就返回规划结果，否则 None。
 
-    **统计与警告要从 meta 里补回来**：``.psap`` 是二进制，里面只有事件流（那是规划的本体）；
-    ``stats`` / ``warnings`` 存在旁边的 ``.meta.json``。不补的话，缓存命中时
-    ``stats["notes"]`` 就是 None —— 主机会拿它跟游戏报的音符数核对，于是打出
-    "游戏 372，JSON None -> 不一致！"这种假警报（真踩过）。
+    先只读 meta 那一小段：名字与指纹不对就没必要把事件流解出来。
     """
-    meta = load_plan_meta(ref, planner_name, directory)
-    if meta is None or meta.get("planner") != planner_name:
+    path = plan_path_for(ref, planner_name, directory)
+    try:
+        meta = plan_meta(path)
+    except (OSError, NpzFormatError):
         return None
-    if meta.get("cache_key") != cache_key():
+    if meta.get("planner") != planner_name or meta.get("cache_key") != (key or cache_key(planner_name, options)):
         return None
     try:
-        result = decode_plan(plan_path_for(ref, planner_name, directory).read_bytes())
-    except (OSError, ValueError):
+        return load_plan(path)
+    except (OSError, NpzFormatError):
         return None
-    stats = meta.get("stats")
-    if isinstance(stats, dict):
-        result.stats.update(stats)
-    warnings = meta.get("warnings")
-    if isinstance(warnings, list):
-        result.warnings = [str(item) for item in warnings]
-    return result
 
 
 def describe(name: str) -> str:
@@ -131,6 +140,11 @@ def describe(name: str) -> str:
     return name
 
 
+def parameters_text(name: str) -> list[str]:
+    """某个规划器的参数表：名字、默认值、说明。"""
+    return [f"  {item.name:<22} {item.default!r:<8} {item.help}" for item in parameters(name)]
+
+
 def summary(result: PlanResult) -> str:
     return (
         f"{result.planner}: {len(result.frames)} 帧 / {result.event_count} 个事件 / "
@@ -138,34 +152,24 @@ def summary(result: PlanResult) -> str:
     )
 
 
-def ref_from_path(path: Path, text: str) -> ChartRef:
-    """尽量恢复这张谱面的来源。"""
-    sidecar = path.with_suffix(".meta.json")
-    if sidecar.is_file():
-        try:
-            meta = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = {}
-        if meta:
-            return ChartRef(
-                seq=int(meta.get("seq") or 0),
-                context=meta.get("context") or {},
-                digest=str(meta.get("hash") or "") or "unknown",
-            )
-    return ChartRef.of_text(text, context={"songsId": path.stem})
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="planner.py", description="auto_phigros 规划模块：官谱 JSON -> 触控事件序列"
+        prog="planner.py", description="auto_phigros 规划模块：官谱 -> 触控事件序列"
     )
-    parser.add_argument("chart", type=Path, help="官谱 JSON 文件")
+    parser.add_argument("chart", type=Path, help="采集下来的谱面 .npz")
     parser.add_argument(
         "--planner",
         default=DEFAULT_PLANNER,
         choices=[info.name for info in catalog()],
         help="用哪个规划器（默认 %(default)s）",
     )
+    parser.add_argument(
+        "--set",
+        action="append",
+        metavar="名字=值",
+        help="改一个规划器参数（可重复）；不带值打 --options 看清单",
+    )
+    parser.add_argument("--options", action="store_true", help="列出这个规划器的参数与默认值")
     parser.add_argument("-o", "--out", type=Path, default=PLANS_DIR, help="输出目录（默认 %(default)s）")
     parser.add_argument(
         "--no-cache",
@@ -177,20 +181,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.options:
+        print(f"[planner] {describe(args.planner)} 的参数：")
+        print("\n".join(parameters_text(args.planner)))
+        return 0
+
     try:
-        text = args.chart.read_text(encoding="utf-8")
-    except OSError as error:
+        options = options_from_args(args.set)
+        text, ref = load_chart(args.chart)
+    except (OSError, NpzFormatError, ValueError) as error:
         print(f"[planner] 读不了 {args.chart}：{error}", file=sys.stderr)
         return 2
 
-    ref = ref_from_path(args.chart, text)
-
     print(f"[planner] {args.chart.name}  ({ref.stem})")
-    print(f"[planner] 用 {describe(args.planner)}")
+    print(f"[planner] 用 {describe(args.planner)}" + (f"，参数 {options}" if options else ""))
     try:
         result = plan(
             text,
             planner=args.planner,
+            options=options,
             ref=ref,
             cache=not args.no_cache,
             directory=args.out,
@@ -209,9 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_cache:
         pass
     elif cached:
-        print(f"[planner] 用的就是 {plan_path(result, ref, args.out)}")
+        print(f"[planner] 用的就是 {plan_path_for(ref, result.planner, args.out)}")
     else:
-        print(f"[planner] 已保存 {plan_path(result, ref, args.out)}")
+        print(f"[planner] 已保存 {plan_path_for(ref, result.planner, args.out)}")
     return 0
 
 

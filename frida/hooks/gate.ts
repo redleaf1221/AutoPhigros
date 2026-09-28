@@ -1,5 +1,8 @@
 /* =============================================================================
- * hook 3 / 4：关卡来源上下文，以及"游戏在这里停住等人"的闸门
+ * hook 3 / 4：关卡来源上下文（SongsItem），以及在这里把游戏闸住的闸门
+ * -----------------------------------------------------------------------------
+ * 闸门实现体跑在 Unity 主线程上（``LevelControl::Start`` 是协程）：在里面阻塞收信就能让
+ * 整局停住。调用原实现用 ``this.method<名字>(参数个数).invoke(原参数)``，内部是 NativeFunction。
  * ========================================================================== */
 
 import { findClass, readBoolMethod, readNumberField, readObjectField, readStaticNumberField, readStringField } from "../bridge";
@@ -14,7 +17,7 @@ import { resetForLevel, state } from "../state";
 
 /* ==================== hook 3：关卡上下文 ==================== */
 
-/** 把 ``SongsItem::GetLevelStartInfo`` 读到的歌名 / 难度 / 资源 key 记下来。 */
+/** hook 3：``SongsItem::GetLevelStartInfo(Int32)``（0x1c9bd80）—— 记下歌名 / 难度 / 资源 key。 */
 export function installLevelContextHook(): void {
     const SongsItem = findClass(SONGS_ITEM_TYPE);
     if (SongsItem === null) {
@@ -68,27 +71,13 @@ function gameInformationMain(): Il2Cpp.Object | null {
     }
 }
 
-/**
- * 采集"开谱前一刻"的现场：一个镜像开关 + 一组延迟。
- *
- * 谱面正文已经由 hook 1（FromJson）在**镜像之前**抓走了，主机就对着那份原文规划；
- * 镜像不必重算，把规划结果整体水平翻过来就是镜像后谱面的解（见 ``PlanResult.mirrored``）。
- * 所以这里不回读谱面，只报"运行时才知道、而且规划用不上但同步必须知道"的东西。
- *
- * 延迟的构成（``LevelControl::_Start_d__46::MoveNext`` 里那一行，汇编 @ 0x1d27e28）：
- *
- *     ``levelInformation.offset = mainOffset + chart.offset + gameInformation.offset``
- *                                （设备音频补偿）  （谱面自带）   （玩家在设置里的延迟）
- *
- * 三个都报，是因为"到底是哪个旋钮偏了"对不上账的时候很有用；``total`` 是游戏真正用的那个。
- * 触控模块跟着 ``nowTime`` 走，``nowTime`` 里已经含了 ``total``，所以它**不需要也不能**
- * 再加一次 —— 这几个数在这里是给对账用的。
- *
- * ``mainOffset`` 是个**静态字段**（``GameInformation`` 的静态区 ``+0x10``），元数据里有名字，
- * 所以直接读、不用拿 ``total − chart − user`` 反推 —— 主机就能顺手核对三项之和等不等于 ``total``。
- *
- * 读不到就是 null，主机据此不镜像 / 不偏移并报警告。
+/* 延迟构成（``LevelControl::_Start_d__46::MoveNext`` @ 0x1d27e28）：
+ *   levelInformation.offset = GameInformation.mainOffset + chart.offset + gameInformation.offset
+ *   字段：LevelInformation +0x20 / Chart +0x14 / GameInformation +0xac / mainOffset 静态 +0x10
  */
+
+/** 采集"开谱前一刻"的现场：一个镜像开关 + 一组延迟。谱面正文已由 hook 1 在镜像之前抓走，镜像
+ * 不必重算；三个延迟都报是为了对账（``total`` 才是游戏真正用的），``nowTime`` 里已含 ``total``。 */
 function collectLevelStart(levelControl: Il2Cpp.Object, gate: number): LevelStartEvent {
     const main = gameInformationMain();
     const startInfo = readObjectField(main, "levelStartInfo");
@@ -113,16 +102,8 @@ function collectLevelStart(levelControl: Il2Cpp.Object, gate: number): LevelStar
     };
 }
 
-/**
- * 架好一次性放行接收者，**先注册、再执行 announce、最后阻塞**。
- *
- * 顺序不能反：``recv()`` 是一次性的，先发数据后注册的话，主机回得足够快时放行
- * 消息就会落在没有接收者的空档里，游戏永远卡住。反过来则绝对安全 —— 即使主机在
- * ``op.wait()`` 之前就回了，消息也会立刻投递给已注册的接收者，``wait()`` 直接返回。
- *
- * 放行消息带 seq。对不上的（上一关残留、手工误发）不算数，重新注册接着等，
- * 免得把下一关悄悄放走。不带 seq 的放行一律认，方便手工操作。
- */
+/** 一次性放行接收者：**先注册 recv()、再 announce、最后阻塞 wait()**。顺序反了，主机回得足够
+ * 快时放行消息会落在没有接收者的空档里，游戏永远卡住。带 seq 的只认本关，不带 seq 的一律认。 */
 function waitForRelease(gate: number, announce: () => void): void {
     let announced = false;
     for (;;) {
@@ -147,13 +128,8 @@ function waitForRelease(gate: number, announce: () => void): void {
     }
 }
 
-/**
- * 通知主机"游戏已经停在闸门上了"，并附上现场。
- *
- * 无论如何都要发出一条 ``level-start``：主机就是靠它才知道该放行的，采集失败就换成
- * 一条"什么也没读到"的 level-start（``mirror`` / ``offset`` 全是 null）外加一条 warn。
- * 少了那条 level-start，游戏会永远停在闸门上。
- */
+/** 通知主机"游戏已经停在闸门上了"并附上现场。无论如何都要发出一条 ``level-start``（采集失败就
+ * 发一条 mirror / offset 全 null 的）：主机就是靠它才知道该放行的。 */
 function announceLevelStart(levelControl: Il2Cpp.Object, gate: number): void {
     try {
         const message: LevelStartEvent = collectLevelStart(levelControl, gate);
@@ -171,67 +147,9 @@ function announceLevelStart(levelControl: Il2Cpp.Object, gate: number): void {
     }
 }
 
-/**
- * 闸门：``LevelControl::SortForNoteWithFloorPosition()``。
- *
- * 为什么选它
- * -----------------------------------------------------------------------------
- * 谱面镜像（``Chart::Mirror``）在整个 libil2cpp.so 里**只有一个调用者**：
- * ``LevelControl::_Start_d__46::MoveNext``，也就是 ``LevelControl::Start`` 那个协程。
- * 顺着它就能看到关卡启动的全部顺序：
- *
- *     Get<TextAsset>(chartAddressableKey)
- *     JsonUtility::FromJson<Chart>(text)      <- hook 1 在这里
- *     levelControl.chart = chart
- *     if (levelStartInfo.mirror) Chart::Mirror(chart)     <- 镜像在这里生效
- *     DoppelgangerLevelEffect::TryStripHdUnlockNote(...)
- *     ... 填 LevelInformation（offset / noteScale / numOfNotes / speed ...）
- *     LevelControl::SortForNoteWithFloorPosition()        <- 闸门在这里
- *     LevelControl::SetCodeForNote()                      <- 音符表在这里
- *     LevelControl::SetInformation()
- *     LevelControl::SortForAllNoteWithTime()
- *     ... 逐个 Instantiate 判定线 -> 建音符 -> 起音乐（ProgressControl::Play）
- *
- * 选最前面那一个的理由：
- *
- * * 它由启动协程**无条件调用且每关只调用一次**（XrefsTo 只有 0x1d27ef0 一处）；
- * * 此刻 Chart 已经解析完、镜像已经应用完、LevelInformation 已经填好，
- *   但判定线和音符的 GameObject 一个都还没 Instantiate，音乐也还没开始 ——
- *   卡在这里，游戏就是"万事俱备，只欠东风"；
- * * 镜像开关在这一刻已经定下来（``Chart::Mirror`` 就在它前面几十行），所以主机
- *   能拿到"这一局到底镜像没镜像"，据此把规划结果翻过来。
- *
- * 闸门只负责**同步**与**报开关**，不负责搬数据：谱面正文 hook 1 已经给过了，
- * 运行参数（speed / noteScale / offset …）规划根本用不上。少读一遍就少一个
- * "到底该信哪一份"的判断，也就少一处能出错的地方。
- *
- * 闸门是怎么闸住的
- * -----------------------------------------------------------------------------
- * ``LevelControl::Start`` 是 Unity 协程，跑在**主线程**上；闸门的实现体也就跑在主线程上。
- * 于是只要在实现体里"停住不返回"，主线程就不动了：渲染停帧、协程不再推进、音乐不会开始、
- * 判定线一根都不会生成。这正是"main 说话之前，游戏不能开"。
- *
- * 停住用的是 Frida 官方的阻塞式收信（frida_docs/messages.md，"Blocking receives in the
- * target process"），方子就是官方那个例子：
- *
- *     const op = recv("release", () => {});
- *     op.wait();          // 主线程在此挂起，直到主机 script.post()
- *
- * 附带的风险：主线程被按住太久，Android 可能弹 ANR。规划一张谱面要几秒，忍了；
- * 主机侧一律用 try/finally 保证"无论规划成功与否都放行"。
- *
- * 关于"替换实现后如何调用原方法"
- * -----------------------------------------------------------------------------
- * 在 method.implementation 的实现体内，通过
- *     ``this.method<...>("名字").invoke(原参数...)``
- * 同步调用原实现即可拿到原返回值，再原样 return。依据 Frida 官方文档
- * （frida_docs/javascript-api.md, Interceptor.replace 一节）：
- *     "If you want to chain to the original implementation you can
- *      synchronously call `target` through a NativeFunction inside your
- *      implementation, which will bypass and go directly to the original
- *      implementation."
- * 而 ``Il2Cpp.Method.invoke`` 内部正是 ``new NativeFunction(this.virtualAddress, ...)``。
- */
+/** hook 4：闸门架在 ``LevelControl::SortForNoteWithFloorPosition()``（0x1d25350）。开谱协程
+ * **无条件调用、每关一次**（XrefsTo 只有 0x1d27ef0）：谱面已解析、镜像已应用、参数已填，而判定线
+ * 与音符的 GameObject 一个都没 Instantiate、音乐也没起 —— 停在这里游戏一步都走不了。 */
 export function installLevelStartHook(LevelControl: Il2Cpp.Class): void {
     const sortForNote = LevelControl.method<void>(LEVEL_START_METHOD, 0);
     const address = sortForNote.virtualAddress;

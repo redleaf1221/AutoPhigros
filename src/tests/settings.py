@@ -1,9 +1,8 @@
 """配置自检：`config.json` 的读写、修复、以及"落盘的边界"。
 
-这一组盯的是"**删掉 config.json 就该回到刚 clone 的状态**"这条规矩：读不出来的文件要
-备份重来而不是炸掉、不认识的字段要吭声、代码里的默认值要真的当默认值。另外顺手钉住另一头：
-`inject` / `verbose` **不许**出现在落盘字段里 —— 一个持久化的 `inject off` 会让人下一次
-以为在打歌、其实一根手指都没发出去。
+规矩是"删掉 config.json 就该回到刚 clone 的状态"：读不出来的先备份成 `.bak` 再重建、
+不认识的字段忽略而认识的照收。另一头：`inject` / `verbose` **不许**落盘
+（持久化的 `inject off` 会让人下一次以为在打歌、其实一根手指都没发出去）。
 """
 
 from __future__ import annotations
@@ -46,9 +45,19 @@ def check_config() -> list[str]:
         fresh.latency = 0.02
         fresh.cache = False
         fresh.hosts = ["192.168.1.10:27042"]
+        fresh.planner_options = {"radical": {"flick_repeats": 1}}
         fresh.save()
         again = settings.Config.load()
-        for name in ("device", "latency", "cache", "hosts", "planner", "backend", "save_chart"):
+        for name in (
+            "device",
+            "latency",
+            "cache",
+            "hosts",
+            "planner",
+            "planner_options",
+            "backend",
+            "save_chart",
+        ):
             expect(
                 getattr(again, name) == getattr(fresh, name),
                 f"{name} 往返之后变了：{getattr(again, name)!r} != {getattr(fresh, name)!r}",

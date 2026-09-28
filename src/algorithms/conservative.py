@@ -1,79 +1,52 @@
 """保守算法（吸收自 phisap 的"保守算法"）。
 
-思路：把每个 note 当作不可分割的整体，需要几押就分配几根手指；flick 与 hold 被拆成
-"起始 + 若干中间采样 + 结束"，同一根手指从头按到尾。宁可多占手指，也绝不合并不同
-note 的判定区 —— 所以它的结果最稳，代价是谱面难到十指不够时会直接失败。
-
-与 phisap 版本的差别：指针数量由谱面实际需要的最大押数决定（而不是写死十根），
-进度与告警改为通过注入的 ``Progress`` / ``PlanResult.warnings`` 汇报，规划器自身不打印。
+每个 note 当不可分割的整体，需要几押就分配几根手指；flick / hold 拆成"起始 + 若干中间
+采样 + 结束"，同一根手指从头按到尾。绝不合并不同 note 的判定区 —— 最稳，代价是难谱吃手指。
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Iterator, NamedTuple
+from typing import Any, Iterator, Mapping, NamedTuple
 
 from .chart import Chart, NoteType
 from .geometry import Screen, place_note
 from .track import EventTrack
 from .utils import (
     MIN_DWELL_MS,
+    WARNING_LIMIT,
     PlanResult,
     PlanningError,
     Position,
     Progress,
     Touch,
     Vector,
+    build_options,
 )
-
-WARNING_LIMIT = 20
 
 
 @dataclass(slots=True)
 class ConservativeConfig:
-    flick_start: int = -17
-    """滑键手势相对判定时刻的起点偏移（毫秒，负值表示提前起手）。"""
-    flick_end: int = 17
-    """滑键手势的终点偏移（毫秒）。"""
-    sample_delay: int = 8
-    """手势中间采样间隔（毫秒），8ms = 125Hz。
+    """保守算法的参数（控制台 ``option`` 或 config.json 的 ``planner_options`` 都能改）。"""
 
-    别往小里调。这个数直接决定**发到设备上的事件数**：hold 全程、flick 全程都按它采样，
-    而每一个采样到了设备上都是一次完整的输入事件（INJECT → 输入分发 → 应用输入队列）。
-    取 1ms 时实测密集段每毫秒一个事件、平均 362 个/秒，足以把 adb/scrcpy 那条注入链和
-    游戏主线程一起拖住 —— 主线程一停，游戏时钟的采样就断，触控跟着停，恢复时
-    ``nowTime`` 按音频往前跳一大截，整个时间轴就和谱面错开了。
+    flick_start: int = field(
+        default=-17, metadata={"help": "滑键手势相对判定时刻的起点偏移（毫秒）"}
+    )
+    flick_end: int = field(default=17, metadata={"help": "滑键手势的终点偏移（毫秒）"})
+    sample_delay: int = field(
+        default=8, metadata={"help": "手势中间采样间隔（毫秒）；8ms = 125Hz"}
+    )
+    flick_direction: int = field(
+        default=0, metadata={"help": "0 = 垂直判定线滑动，1 = 平行判定线滑动"}
+    )
+    flick_repeats: int = field(default=2, metadata={"help": "一次滑键手势重复划几下"})
+    max_pointers: int = field(default=10, metadata={"help": "最多几根手指"})
 
-    8ms 不是拍脑袋：``geometric`` 一直用 8ms 的 tick，过的是同一个覆盖率自检，
-    48 个事件/秒就把 393 个音符全覆盖了。设备那边一帧最多消费一个位置，比 125Hz 更密
-    只是白灌。
-    """
-    flick_direction: int = 0
-    """0 = 垂直于判定线滑动，1 = 平行于判定线滑动。"""
-    flick_repeats: int = 2
-    """一次滑键手势重复划几下。**别调回 1。**
 
-    游戏判 flick 用的是 ``JudgeControl::CheckFlick``（``0x1d21828``）：只有手指那一帧带
-    ``Fingers.isNewFlick``（一次"新起手"，由 ``FingerManagement::Update`` 按手指的瞬时
-    速度算出来，阈值 ``flickJudgeSpeed`` 在 ``Start`` 里按 dpi 归一）时它才跑；跑的时候在
-    ``nowTime ± 0.14s`` 里挑**时刻最早**的那个还没判过的 flick，只要
-    ``|positionX − fingerPositionX| < 2.1`` 就把它标记成已划中。也就是说：**一次"新起手"
-    只能点亮一个音符**，而且会被窗口里更早的音符抢走。
-
-    原先每个 flick 只划一下（一个来回），于是那个音符的命全押在**唯一那一次**起手上：
-    实测 70 个 flick 里随机漏掉一个，每次漏的还不一样（抢不抢得着取决于那一帧落在哪儿）。
-    重复两下就是给每个音符两次独立的机会：前面被抢了，后面还有。
-
-    取 2 是量出来的，不是拍的：离线按游戏那套规则模拟"哪些 flick 会被点亮"，只划一下时
-    Dlyrotz HD 上有 **7 个 flick 永远点不亮**（`CheckFlick` 的窗口被更早的音符抢走），
-    划两下之后**所有谱面都归零**。三下能再多一点余量，但峰值注入率从 167 涨到 197 个/秒
-    （Eradication Catastrophe IN），而注入链的承受力正是这条链上最紧的一环 —— 划两下够用，
-    真碰上偶发漏音再往上调。
-    """
-    max_pointers: int = 10
+CONFIG = ConservativeConfig
 
 
 class SemiKind(IntEnum):
@@ -104,20 +77,9 @@ class _Record:
 
 
 class PointerPool:
-    """几押就备几根指针。
-
-    指针用完后不立刻抬起，而是先"晾"在屏幕上（``released``），随时可以被下一个
-    note 征用 —— 复用一根已经在屏幕上的手指只需一条 MOVE，比先 UP 再 DOWN 更省事，
-    也更不容易丢判定。
-
-    有一条**必须守住的规矩**（见 :data:`~algorithms.utils.MIN_DWELL_MS`）：一根手指摆到
-    一个位置之后，别在它还没被游戏看见的时候就把它挪走。游戏逐帧读手指位置，摆放下
-    一毫秒就走，等于这个位置只在时间轴上占了一个点 —— drag 的 ±0.1s 窗口里能不能撞上
-    一帧纯看运气。所以：
-
-    * 抬起排在**最后一刻**（重新按下之前的那一毫秒），而不是"用完的下一毫秒"；
-    * 征用别人时优先挑已经摆够一帧的。
-    """
+    """几押就备几根指针：用完不立刻抬起，先"晾"在屏幕上（``released``）等下一个 note 征用
+    —— 复用一根已经在屏幕上的手指只要一条 MOVE，比先 UP 再 DOWN 更省事。规矩是别在手指
+    还没被游戏看见时就挪走它（游戏逐帧读位置，见 :data:`~algorithms.utils.MIN_DWELL_MS`）。"""
 
     def __init__(self, count: int, base: int = 1000) -> None:
         self.idle: set[int] = set(range(base, base + count))
@@ -159,12 +121,8 @@ class PointerPool:
         raise PlanningError("需要同时按下的音符超过了十指上限")
 
     def _nearest(self, position: Position) -> _Record:
-        """挑一根回收来的手指。
-
-        优先挑**已经摆够一帧**的（见 :data:`~algorithms.utils.MIN_DWELL_MS`）：手指摆在哪
-        儿就是判定依据，刚摆下去就被征走，等于把它在原来那个位置上的覆盖砍到不足一帧。
-        全都还没摆够就只好按距离挑最近的那根 —— 位置总得摆对。
-        """
+        """挑一根回收来的手指：优先挑**已经摆够一帧**的（见 :data:`~algorithms.utils.MIN_DWELL_MS`），
+        刚摆下去就被征走等于把它在原来那个位置的覆盖砍到不足一帧；都没摆够就按距离挑最近的。"""
         return min(
             self.released.values(),
             key=lambda record: (
@@ -196,20 +154,16 @@ class PointerPool:
         yield from self.in_use.values()
 
     def lift_at(self) -> int:
-        """这一帧要补发的抬起事件排在哪个时刻。
-
-        尽量晚 —— 压在这一帧的前一毫秒，也就是"再不发就赶不上重新按下"的那一刻。
-        早抬一毫秒，等于把那根手指上一个位置的覆盖时间砍掉一毫秒：那个位置就只剩
-        一个时间点，而游戏是逐帧读位置的。
-        """
+        """这一帧要补发的抬起事件排在哪个时刻：压在这一帧的前一毫秒（再不发就赶不上重新按下），
+        早抬一毫秒就等于把上一个位置的覆盖砍掉一毫秒，而游戏是逐帧读位置的。"""
         return self.now - 1
 
 
 class ConservativePlanner:
     name = "conservative"
 
-    def __init__(self, config: ConservativeConfig | None = None) -> None:
-        self.config = config or ConservativeConfig()
+    def __init__(self, options: Mapping[str, Any] | None = None) -> None:
+        self.config = build_options(ConservativeConfig, options)
 
     def plan(self, chart: Chart, progress: Progress) -> PlanResult:
         config = self.config
@@ -339,10 +293,7 @@ class ConservativePlanner:
                             SemiNote(SemiKind.DRAG, screen.remap(position, rotation), note_id)
                         )
                     case NoteType.FLICK:
-                        # 同一次手势划几下（见 ConservativeConfig.flick_repeats）：
-                        # 每一下都从 +半径**跳**回 +半径一侧再划到 -半径，于是每一下
-                        # 都是一次"新起手"，游戏那边就是一次独立的判定机会。
-                        # 整段关于判定时刻对称；只有最后一下收手（其它几下中途就跳回去）。
+                        # 每一下都从 +半径跳回再划到 −半径，那个跳变就是一次"新起手"（见 flick_repeats）
                         first = -(config.flick_repeats * duration) // 2
                         for repeat in range(config.flick_repeats):
                             base = timestamp + first + repeat * duration
@@ -413,11 +364,8 @@ def _sway(
     flick_start: int,
     duration: int,
 ) -> Position:
-    """滑键手势在**这一段划动**第 ``offset`` 毫秒时的触点：沿 ``sway`` 从 +半径划到 -半径。
-
-    ``offset`` 是这一段内的相对时刻（0 = 起手、``duration`` = 收尾），所以 ``rate`` 从 +1
-    线性走到 -1。**下一段又从 +1 开始** —— 那个跳变就是游戏要找的"新起手"。
-    """
+    """滑键手势在**这一段划动**第 ``offset`` 毫秒时的触点：``rate`` 从 +1 线性走到 −1，即沿
+    ``sway`` 从 +半径划到 −半径；下一段又从 +1 开始，那个跳变就是游戏要找的"新起手"。"""
     rate = 1 - 2 * (offset - flick_start) / duration
     return screen.remap(position + rotation * sway * screen.flick_radius * rate, rotation)
 

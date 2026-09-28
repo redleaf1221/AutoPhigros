@@ -7,10 +7,7 @@
 
     // Environment Settings
     // See also https://aka.ms/tsconfig/module
-    //
-    // agent 的源码是**由 esbuild 打包**进 target/_.js 的 ES 模块（frida 的运行时不是
-    // Node，没有 CJS 那套解析规则），所以这里按"有打包器"来配：esnext + bundler，
-    // 相对导入不必写扩展名。若改成 nodenext，就得给每个 import 都补上 .js。
+    // agent 由 esbuild 打包（不是 Node 的 CJS 解析），按"有打包器"配：esnext + bundler。
     "module": "esnext",
     "moduleResolution": "bundler",
     "target": "esnext",
