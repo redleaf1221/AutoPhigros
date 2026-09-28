@@ -105,6 +105,67 @@ def check_judge() -> list[str]:
     return problems
 
 
+def check_device_log() -> list[str]:
+    """``judge.py --compare`` 读日志那一层：判定行认不认得出、账目取哪一份，以及**没开
+    ``verbose`` 的日志**里"没记到 = Perfect"这条推断。
+
+    判定流水默认只打 Miss / Good / Bad（`Agent._on_judge`），Perfect 一条都不打。要是把
+    "日志里没有"当成"设备没判"，一份 1152P 的日志会跟裁判比出满屏假的不一致 —— 这条盯着它。
+    """
+    problems: list[str] = []
+    try:
+        from runtime import agent as agent_module
+    except ImportError as error:  # noqa: BLE001 - frida 没装也不该让整份自检跑不起来
+        return [f"导入 agent 失败，跳过日志对账自检：{error}"]
+
+    from tools import device_log
+
+    def expect(condition: bool, complaint: str) -> None:
+        if not condition:
+            problems.append(complaint)
+
+    head = {"code": 4000000, "type": 1, "time": 12.500, "x": 8.0, "hold": 0.0, "line": 4,
+            "above": True, "index": 0}
+    good = dict(head, code=4000010, time=13.000, index=1)
+
+    def record(*, verbose: bool) -> str:
+        """样本用**真的** agent 写出来 —— 判据里的日志格式不许手抄。"""
+        agent = agent_module.Agent(Path("unused.js"))
+        agent.options.verbose = verbose
+        agent.level_label = "SelfTest [IN]"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            agent._on_judge({"kind": "Perfect", "delta": 0.012, "noteCode": head["code"],
+                             "note": dict(head), "time": 12.512})  # noqa: SLF001
+            agent._on_judge({"kind": "Good", "delta": 0.032, "noteCode": good["code"],
+                             "note": dict(good), "time": 13.032})  # noqa: SLF001
+            agent._on_result({"event": "result", "seq": 1, "score": 951099.0, "percent": 99.77,
+                              "perfect": 1152, "good": 2, "bad": 1, "miss": 1, "maxCombo": 615,
+                              "allPerfect": False, "fullCombo": False})  # noqa: SLF001
+        return buffer.getvalue()
+
+    quiet_text = record(verbose=False)
+    quiet = device_log.parse(quiet_text)
+    expect("[judge] Perfect" not in quiet_text, "verbose 关着不该打 Perfect 的判定行")
+    expect(quiet.perfects_hidden, "只打了非 Perfect 的日志该被认出来")
+    expect(quiet.verdict_for((4, True, 1)) == "Good", "记下来的那一条要原样读回来")
+    expect(quiet.verdict_for((4, True, 0)) == "Perfect", "没记到的音符在精简日志里就是 Perfect")
+    expect(quiet.account == "1152P  2G  1B  1M", f"账目要取设备自己报的那份：{quiet.account}")
+    expect(quiet.counts["Perfect"] == 0, "精简日志的判定行统计不到 Perfect，不能拿它当账目")
+
+    loud = device_log.parse(record(verbose=True))
+    expect(not loud.perfects_hidden, "打了 Perfect 的日志不算精简")
+    expect(loud.verdict_for((4, True, 0)) == "Perfect", "完整日志里记下的那一条要读回来")
+    expect(loud.verdict_for((9, True, 0)) is None, "完整日志里没记到就是真没记，不许瞎补")
+
+    truncated = quiet_text.split("[result")[0]
+    expect(
+        not device_log.parse(truncated).perfects_hidden,
+        "没有 [result] 那份账目时不敢推断（宁可按「真没记」处理）",
+    )
+    return problems
+
+
 def check_calibration() -> list[str]:
     """延迟自校准：拿这一局 Perfect 的中位数调手工补偿，四条规矩都得是硬的。
 

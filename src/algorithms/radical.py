@@ -16,6 +16,7 @@ from .chart import Chart, NoteType
 from .geometry import Screen, place_note
 from .track import EventTrack
 from .utils import (
+    MIN_DWELL_MS,
     WARNING_LIMIT,
     PlanResult,
     PlanningError,
@@ -41,7 +42,11 @@ class RadicalConfig:
         default=2, metadata={"help": "滑键手势里隔多少毫秒补一个触点"}
     )
     flick_direction: int = field(
-        default=1, metadata={"help": "0 = 垂直判定线滑动，1 = 平行判定线滑动"}
+        default=0,
+        metadata={
+            "help": "0 = 垂直判定线滑动（横向不变，判定线动了也不会甩出容差），"
+            "1 = 平行判定线滑动（甩出去那一下的横向偏差就是半径）"
+        },
     )
     recycle_scope_ratio: float = field(
         default=0.05, metadata={"help": "可以顺手征用的手指与目标的横向距离阈值（占对角线比例）"}
@@ -164,7 +169,9 @@ class PointerAllocator:
         candidates = [
             pointer
             for pointer in self.pointers
-            if pointer.note is None or pointer.age > 0  # 空闲的，或者歇了一会儿的
+            # 空闲的，或者**已经摆够一帧**的（见 MIN_DWELL_MS）：刚摆下去就征走，
+            # 等于把它在原来那个位置的覆盖砍成不到一帧
+            if pointer.note is None or pointer.age >= MIN_DWELL_MS
         ]
         if not candidates:
             raise PlanningError(f"{self.now}ms 处没有可用手指")
@@ -187,7 +194,8 @@ class PointerAllocator:
             # 抬起排在最后一刻（这一帧的前一毫秒）：早抬就把上一个音符的覆盖砍成一个时间点（见 MIN_DWELL_MS）
             self._insert(self.now - 1, pointer.note.position, Touch.UP, pointer.id)
         pointer.note = note
-        pointer.age = 0
+        # 按下至少停一帧：这根手指接着可能被 drag 征用，也可能被当成"覆盖了某个 drag"来用
+        pointer.age = -MIN_DWELL_MS
         self._insert(self.now, note.position, Touch.DOWN, pointer.id)
 
     def _flick(self, pointer: Pointer, note: PlainNote) -> None:

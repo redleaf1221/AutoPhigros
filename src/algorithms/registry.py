@@ -39,6 +39,11 @@ _BUILTIN: tuple[PlannerInfo, ...] = (
         module="algorithms.geometric",
         summary="几何算法：125Hz 帧，按判定区求交合并，最省手指",
     ),
+    PlannerInfo(
+        name="geometric_pure",
+        module="algorithms.geometric_pure",
+        summary="几何算法（纯版）：落点在交集内部选，能吸附到判定线就吸附上去",
+    ),
 )
 
 DEFAULT_PLANNER = "conservative"

@@ -86,6 +86,36 @@ class DeviceRun:
         return table
 
     @property
+    def perfects_hidden(self) -> bool:
+        """这份日志是不是"只记非 Perfect"（``verbose`` 没开）：判定流水默认只打
+        Miss / Good / Bad，而 ``[result]`` 那份账目说这局有 Perfect、判定行里却一条都没有。"""
+        return self.counts["Perfect"] == 0 and int(self.result.get("perfect", 0)) > 0
+
+    def verdict_for(self, key: tuple[int, bool, int]) -> str | None:
+        """设备对这个音符的判决（``None`` = 这份日志里真的没记它）。
+
+        精简流水里"没记到"就是 **Perfect** —— Miss / Good / Bad 一律会打出来，所以对账时
+        不能把没出现的音符当成"设备没判"（那会报出满屏假的不一致）。没有结算账目时不敢推断。
+        """
+        judge = self.judges.get(key)
+        if judge is not None:
+            return judge.kind
+        return "Perfect" if self.perfects_hidden else None
+
+    @property
+    def account(self) -> str:
+        """设备**自己报**的账目（``[result]`` 那一行的四个计数）；日志里没有就退回判定行的统计。"""
+        if "perfect" not in self.result:
+            return self.label
+        table = {
+            name: int(self.result.get(name, 0))
+            for name in ("perfect", "good", "bad", "miss")
+        }
+        return (
+            f"{table['perfect']}P  {table['good']}G  {table['bad']}B  {table['miss']}M"
+        )
+
+    @property
     def label(self) -> str:
         table = self.counts
         return (

@@ -13,13 +13,16 @@ from algorithms.geometry import Screen, place_note
 from algorithms.judging import (
     DRAG_TOLERANCE,
     DRAG_WINDOW,
-    FLICK_JUMP,
     FLICK_WINDOW,
     FRAME_MS,
     HOLD_GRACE_MS,
     HOLD_SAMPLE_MS,
     RUN_STEP_MS,
     TAP_TOLERANCE as TOLERANCE,
+    flick_candidate,
+    flick_edges,
+    lit_flicks,
+    note_table,
 )
 from algorithms.judging import Fingers as Tracks
 from algorithms.judging import deviation as _deviation
@@ -199,61 +202,26 @@ def check_dwell() -> list[str]:
 
 
 def check_flick(chart: Chart, result: PlanResult) -> list[str]:
-    """滑键手势自检：每个 flick 在 `CheckFlick` 那套规则下都得**点得亮**。
+    """滑键手势自检：每个 flick 都得点得亮。
 
-    `CheckFlick` 只在手指 `isNewFlick`（一次新起手）那一帧跑，在 `nowTime ± 0.14s` 里按时间顺序
-    挑第一个还没判过、横向 < 2.1 的 flick 点亮；一次起手只点亮一个，只划一下就必然漏。
+    模型只有一份，在 `algorithms/judging.py`（`flick_edges` + `lit_flicks`）：`CheckFlick`
+    只在手指 `isNewFlick` 那一帧跑，在 `nowTime ± 0.14s` 里挑第一个还没判过、横向 < 2.1 的
+    flick 点亮，一次起手只点亮一个 —— 只划一下就必然漏。这里只报"谁没被点亮"。
     """
-    flicks = sorted(
-        (
-            (note.seconds, index, note, line)
-            for index, line in enumerate(chart.lines)
-            for note in line.notes
-            if note.kind is NoteType.FLICK
-        ),
-        key=lambda item: item[0],
-    )
+    flicks = [slot for slot in note_table(chart) if slot.kind is NoteType.FLICK]
     if not flicks:
         return []
 
-    # 每一次"新起手"：手指位置的一次跳变（同一根手指、相邻两个事件之间）
-    edges: list[tuple[int, complex]] = []
-    for items in Tracks(result).items.values():
-        previous = None
-        for timestamp, action, position in items:
-            if previous is not None and action is not Touch.UP and abs(position - previous) >= FLICK_JUMP:
-                edges.append((timestamp, position))
-            previous = position
-    edges.sort(key=lambda edge: edge[0])
-
-    # 照 CheckFlick 的规则点亮：窗口里时刻最早的那个
-    marked: set[int] = set()
-    for timestamp, position in edges:
-        chosen = None
-        for seconds, index, note, line in flicks:
-            if id(note) in marked or abs(seconds * 1000 - timestamp) > FLICK_WINDOW_MS:
-                continue
-            if _deviation(line, note, position, timestamp / 1000.0) >= DRAG_TOLERANCE:
-                continue
-            if chosen is None or seconds < chosen[0]:
-                chosen = (seconds, index, note)
-        if chosen is not None:
-            marked.add(id(chosen[2]))
-
-    missing = [item for item in flicks if id(item[2]) not in marked]
+    edges = flick_edges(result)
+    lit = lit_flicks(flicks, edges)
+    missing = [slot for slot in flicks if slot.index not in lit]
     if not missing:
         return []
     chances = min(
-        sum(
-            1
-            for timestamp, position in edges
-            if abs(seconds * 1000 - timestamp) <= FLICK_WINDOW_MS
-            and _deviation(line, note, position, timestamp / 1000.0) < DRAG_TOLERANCE
-        )
-        for seconds, _, note, line in missing
+        sum(1 for moment, position in edges if flick_candidate(slot, moment, position))
+        for slot in missing
     )
-    problems = [
+    return [
         f"有 {len(missing)} 个 flick 点不亮（最少的那个只有 {chances} 次起手机会）："
-        + "、".join(f"{seconds:.3f}s" for seconds, _, _, _ in missing[:5])
+        + "、".join(f"{slot.seconds:.3f}s" for slot in missing[:5])
     ]
-    return problems

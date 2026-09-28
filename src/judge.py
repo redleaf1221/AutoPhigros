@@ -26,7 +26,7 @@ from typing import Any, Mapping
 import planner
 from algorithms import catalog, options_from_args
 from algorithms.chart import Chart
-from algorithms.judging import Report, Verdict, simulate
+from algorithms.judging import Judgement, Report, Verdict, simulate
 from formats.storage import (
     CHART_SUFFIX,
     ChartRef,
@@ -191,7 +191,12 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
     from tools import device_log
 
     run = device_log.read(log_path)
-    print(f"{log_path.name}：{len(run.judges)} 条判定，设备自己的账目是 {run.label}")
+    print(f"{log_path.name}：记下 {len(run.judges)} 条判定，设备自己的账目是 {run.account}")
+    if run.perfects_hidden:
+        # 判定流水默认只打 Miss / Good / Bad（`verbose` 没开），Perfect 一条都不记
+        print(
+            f"  这份日志没开 verbose（判定行里只有 {run.label}）：**没记到的音符按 Perfect 算**"
+        )
     if run.latency is not None:
         # 用这一局真实的送达补偿重放：补偿没抵掉处理延迟时，计划里的落点本身就是偏的
         import algorithms.judging as judging
@@ -231,26 +236,32 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
         if device_score is not None
         else "（日志里没有 result 行）"
     )
-    print(f"  设备（日志）：{run.label:<24} {device_text}  最大连击 {run.result.get('maxCombo', '?')}")
+    print(
+        f"  设备（日志）：{run.account:<24} {device_text}  "
+        f"最大连击 {run.result.get('maxCombo', '?')}"
+    )
     print(f"  裁判（本机）：{mine_text:<24} {score:.0f} 分 / {percent:.2f}%  最大连击 {report.max_combo}")
 
-    # 逐音符对。设备那边可能少几条（比如日志被截断），少的那边不算"不一致"但要报出来
-    pairs: list[tuple[str, object, object]] = []
+    # 逐音符对：精简日志里"没记到"就是 Perfect（见 DeviceRun.verdict_for），补上的那些要报出来
+    pairs: list[tuple[str, Judgement]] = []
     compared = 0
+    inferred = 0
     only_mine = 0
     for judgement in report.judgements:
-        device = run.judges.get(judgement.key)
+        device = run.verdict_for(judgement.key)
         if device is None:
             only_mine += 1
             continue
         compared += 1
-        if device.kind != judgement.verdict.label:
-            pairs.append(("不同", judgement, device))
+        if judgement.key not in run.judges:
+            inferred += 1
+        if device != judgement.verdict.label:
+            pairs.append((device, judgement))
     only_device = len(set(run.judges) - {judgement.key for judgement in report.judgements})
 
     print(
-        f"  逐音符比出 {compared} 条：一致 {compared - len(pairs)}，"
-        f"不一致 {len(pairs)}"
+        f"  逐音符比出 {compared} 条：一致 {compared - len(pairs)}，不一致 {len(pairs)}"
+        + (f"，其中 {inferred} 条按「没记到 = Perfect」算" if inferred else "")
         + (f"，裁判多出 {only_mine} 条" if only_mine else "")
         + (f"，设备多出 {only_device} 条" if only_device else "")
     )
@@ -259,8 +270,8 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
 
     # 先把"哪一类不一致"归堆：同类问题会成片出现，归堆之后一眼看出是不是一个模型错误
     summary: dict[str, int] = {}
-    for _, judgement, device in pairs:
-        key = f"设备 {device.kind} / 裁判 {judgement.verdict.label}"
+    for device, judgement in pairs:
+        key = f"设备 {device} / 裁判 {judgement.verdict.label}"
         summary[key] = summary.get(key, 0) + 1
     print("  ── 不一致的类别 ──")
     for key, count in sorted(summary.items(), key=lambda item: -item[1]):
@@ -268,18 +279,17 @@ def compare(log_path: Path, *, verbose: bool, limit: int = 40) -> int:
 
     print("  ── 逐条（按时间）──")
     pairs.sort(key=lambda item: item[1].seconds)
-    for _, judgement, device in pairs[:limit]:
+    shown = pairs if verbose else pairs[:limit]
+    for device, judgement in shown:
         note = judgement.note
         mine_note = (
             f"{note.kind.name:<4} {judgement.seconds:8.3f}s "
             f"（线 {judgement.line} {'上' if judgement.above else '下'} 第 {judgement.index}）"
         )
         graze = "（裁判记成蹭键）" if judgement.grazed else ""
-        print(f"     {mine_note}：设备 {device.kind:<7} 裁判 {judgement.verdict.label}{graze}")
-    if len(pairs) > limit:
-        print(f"     … 还有 {len(pairs) - limit} 条（-v 看全部）")
-    if verbose:
-        _ = verbose
+        print(f"     {mine_note}：设备 {device:<7} 裁判 {judgement.verdict.label}{graze}")
+    if len(shown) < len(pairs):
+        print(f"     … 还有 {len(pairs) - len(shown)} 条（-v 看全部）")
     return 1 if pairs else 0
 
 

@@ -802,7 +802,13 @@ while (endIndex >= 1) {
 this->startIndex = endIndex;
 ```
 
-每帧只扫描 `realTime ∈ (nowTime − 0.18, nowTime + 0.22)` 的音符。`JudgeControl.startIndex` / `endIndex` 是跨帧保留的增量游标（单调推进，不回头）。
+每帧只扫描 `realTime ∈ (nowTime − 0.18, nowTime + 0.22)` 的音符。下界取 `GoodTimeRange`、
+上界取 `BadTimeRange`，**两端都严格**（`>= now+0.22` 与 `<= now−0.18` 都 break）。
+
+> **勘误（2026-09-28 对着 IDA 复核）。** 本报告早先说 `startIndex` / `endIndex` 是"跨帧保留的
+> 增量游标（单调推进，不回头）"—— 反编译里每次调用都先 `this->endIndex = -1;` 再从表头重扫
+> （所以是 O(全表前缀) 每手指每帧，性能上很难看）。**判定语义不受影响**：候选范围就是上面那个
+> 区间，跨帧状态只有 `minDeltaTime` / `touchPos` / `badTime` 这几个"当下值"。
 
 ### 6.3 垂直判定：X 轴容差与"边缘放宽"
 
@@ -861,6 +867,17 @@ if (note->realTime - nowTime > this->badTime) goto skip;
   ```
   取度量较小的那个（`v55 = 2.2` 是 Y 方向的归一化系数）。
   注意：这个**挑最近候选**的度量里 `|Δy|` 是参与的，但那只用来在多押里选一个，不构成判据。
+
+- **候选怎么挑，度量只是其中一半**（2026-09-28 对着 IDA 复核）：四类音符都进候选（Flick 只挑
+  不判），按时间序扫，每个候选过 `isJudged` / `横向 >= 1.9` / `badTime` 三道门之后：
+  * 还没有 best → **直接接受**；
+  * best 是 Drag / Flick → 下一个过门的候选**无条件**顶掉它；
+  * best 是 Tap / Hold → 候选也得是 Tap / Hold、且两者 `realTime` 差 `≤ 10ms`，才比上面的度量；
+  * 每次接受都把 `minDeltaTime` 记成 `|realTime − nowTime|`，之后
+    `realTime − nowTime >= minDeltaTime + 0.01` 的候选**直接跳过**。
+
+  所以"一次按下只判一个"背后还有一句：**一次按下的命中范围是"离它最近的那一簇"**，
+  不是整个 ±0.18/±0.22 窗口。`CheckFlick`（`0x1d21828`）用的是同一套挑法。
 
 ### 6.4 Flick 的独立窗口
 
@@ -922,8 +939,8 @@ if (this->isJudged) {                                // 已被触摸标记
     return true;
 }
 // 未被触摸：
-if (v5 >= -JudgeControl.BadTimeRange)   return false;   // v5 >= -0.22，继续等待
-ScoreControl::Miss(note->noteCode);                     // 迟到 > 0.22s → Miss
+if (v5 >= -JudgeControl.GoodTimeRange)  return false;   // v5 >= -0.18，继续等待
+ScoreControl::Miss(note->noteCode);                     // 迟到 > 0.18s → Miss
 judgeLine->notesAbove[note->noteIndex].isJudged = true;
 return true;
 ```
@@ -987,9 +1004,11 @@ if (v5 < 0.005 && v6) {
     return true;
 }
 ...
-if (v5 >= -JudgeControl.BadTimeRange) return false;
+if (v5 >= JudgeControl.PerfectTimeRange * -1.75) return false;   // -0.14
 ScoreControl::Miss(note->noteCode);
 ```
+> `FlickControl::Judge` 读的静态字段是 `+4` = `PerfectTimeRange`（0.08），乘 `−1.75` 得 −0.14；
+> **不是** `BadTimeRange`（本报告早先写成 −0.22，2026-09-28 对着 IDA 复核改掉）。
 
 > **Flick 也只有 Perfect 或 Miss。** 候选窗口已在 `CheckFlick` 收窄到 ±0.14 s。
 
@@ -1255,13 +1274,14 @@ bool get_Passed()           { return _IntScore_k__BackingField > 699999; }   // 
 ## 9. 尚未确认 / 存疑
 
 1. ~~**`JudgeControl.minDeltaTime`（+0xac）与 `touchPos`（+0xb8）的初值来源。**~~
-   **已解决。** 它不是"允许多早"的输入参数，而是**输出**：`CheckNote` @ `0x1d21104` 第 124 行
-   每次调用开头都写 `*(_QWORD *)&this->minDeltaTime = -3118710784LL;`，低 32 位
-   `0x461C4000` = **10000.0f**（高 32 位 `0xFFFFFFFF` 是相邻字段 `touchPos`/`badTime` 的哨兵），
-   于是第 186 行那条 `if (realTime - nowTime >= minDeltaTime + 0.01) goto skip;` 的守卫
-   **永远为假**（死代码）；而第 425 行 `this->minDeltaTime = fabsf(note->realTime - nowTime);`
-   才写出真值 —— 刚判掉的那个音符差多少，供命中特效/统计读。
-   **推论：硬编码那条 `+0.01` 守卫会让"早判"凭空少掉 220ms 的余量，别照它写。**
+   **已解决，但早先的结论是错的（2026-09-28 对着 IDA 复核）。** `CheckNote` @ `0x1d21104` 第 124 行
+   确实每次调用开头都写 `minDeltaTime = 10000.0f`（`0x461C4000`，高 32 位哨兵属相邻字段），
+   但第 425 行 `this->minDeltaTime = fabsf(note->realTime - nowTime);` 在**每接受一个候选之后**
+   都会重写它 —— 所以第 186 行那条守卫对第一个候选为假、往后都要跟"当前 best 离现在多远"比：
+   `realTime - nowTime >= minDeltaTime + 0.01` 的候选（远过 10ms）**看都不看**。
+   **它不是死代码，是挑选的主体**；同一条 10ms 还管着"best 是 Tap/Hold 时，候选也得是
+   Tap/Hold 且两者 realTime 差 ≤ 10ms 才比度量"。按"全局取度量最小"实现，会多报一批
+   "早 200ms 被抢"的幻影（`auto_phigros` 实测 21 张谱 12 处）。
 2. **`JudgeLineControl.lastProductIndexAbove/Below` 的初值。**
    按 `for (i = last + 1; i <= now; ++i)` 的写法，若初值为 0 则下标 0 的音符永远不会被创建。合理推测预制体里序列化为 `-1`，但未经证实。
 3. **`GetFingerPosition` 的坐标换算细节**（是否用到 `theta` 做旋转逆变换、是否有额外的 DPI/宽高比补偿）未逐行核对。

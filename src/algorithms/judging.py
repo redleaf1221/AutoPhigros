@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import math
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -38,21 +38,32 @@ DRAG_TOLERANCE = 2.1 * CHART_TO_SCREEN
 PERFECT_TIME = 0.08
 GOOD_TIME = 0.18
 BAD_TIME = 0.22
-"""Tap 的三档窗口（报告 §6.7）：|Δ| < 0.08 → Perfect，< 0.18 → Good，否则 Bad。"""
+"""Tap 的三档窗口（`ClickControl::Judge` 0x1d3060c）：|Δ| < 0.08 → Perfect，< 0.18 → Good，
+否则 Bad。三个数就是 `JudgeControl` 静态字段里的 `PerfectTimeRange` / `GoodTimeRange` /
+`BadTimeRange`，**别的判定也读它们**。"""
 
 SCAN_BACK = 0.18
 SCAN_AHEAD = 0.22
-"""判定扫描窗（报告 §6.3）：每帧只看 `realTime ∈ (nowTime − 0.18, nowTime + 0.22)` 的音符，
-一次按下能碰到的 Δ = nowTime − realTime ∈ (−0.22, +0.18)：**早 220ms、晚 180ms，不对称**。"""
+"""判定扫描窗（`CheckNote` 0x1d21104 第 68-126 行）：每帧只看
+`realTime ∈ (nowTime − 0.18, nowTime + 0.22)` 的音符 —— 下界取 `GoodTimeRange`、上界取
+`BadTimeRange`，两端都严格。反过来 Δ = nowTime − realTime ∈ (−0.22, +0.18)：**早 220ms、
+晚 180ms，不对称**。"""
+
+NEAR_TIME = 0.01
+"""`CheckNote` / `CheckFlick` 里那条 10ms：`minDeltaTime` 守卫（`>= minDeltaTime + 0.01`）与
+"只有 10ms 内的候选才比度量"（`fabsf(realTime 差) > 0.01`）用的是同一个数。"""
+
+FUTURE = 10000.0
+"""那两个函数开头把 `minDeltaTime` 写成 `10000.0f`（`0x461C4000`）—— 初值只为了让**第一个**
+过门的候选无条件通过；每接受一个候选就把它改成那个候选的 `|realTime − nowTime|`。"""
 
 DRAG_WINDOW = 0.10
-"""Drag 的判定窗：`|realTime − nowTime| <= 0.1` 时逐帧比手指（报告 §6.5）。"""
+"""Drag 的判定窗（`DragControl::Judge` 0x1d313f0）：`|realTime − nowTime| <= 0.1` 时逐帧比手指；
+Miss 也在这条线上（`Δ < −0.1`）。"""
 
 FLICK_WINDOW = 0.14
-"""Flick 的候选窗：`CheckFlick` 用 `PerfectTimeRange × 1.75 = ±0.14s` 挑音符（报告 §6.6）。"""
-
-FLICK_MISS = 0.22
-"""Flick 迟到这么久还是没被点亮就是 Miss。"""
+"""Flick 的候选窗与 Miss 线：`CheckFlick` 0x1d21828 用 `PerfectTimeRange × 1.75` 挑音符，
+`FlickControl::Judge` 0x1d319e4 也用它判 Miss（`Δ < −0.14`）。"""
 
 HOLD_SETTLE_LEAD = 0.22
 """Hold 在 `realTime + holdTime − 0.22` 就结算（报告 §6.6）—— 手指可以**早走 220ms**。"""
@@ -68,9 +79,6 @@ PROCESS_DELAY = 0.029
 DELIVERED_LATENCY = PROCESS_DELAY
 """裁判重放时假设的送达补偿（秒），播放器那边就是 `options.latency`；计划里的落点是音符
 自己那一时刻的判定点，所以按"送达准时"重放时它必须正好抵掉 PROCESS_DELAY。"""
-
-HOLD_TIMEOUT = 0.25
-"""Hold 的兜底超时：按住结束之后再过 0.25s 还没判就是 Miss。"""
 
 HOLD_GRACE_FRAMES = 3
 """Hold 主体允许连续落空几帧：`_safeFrame = 2`，第 4 帧才判 Miss（报告 §6.6）。"""
@@ -201,12 +209,25 @@ class Fingers:
         ]
 
 
+def spine_offset(position: complex, spine: complex, rotation: Vector) -> float:
+    """`position` 相对"过 `spine`、沿 `rotation` 的那条无限长的线"的**横向**偏移。
+
+    `deviation` 量的是同一个东西（`(手指 − 判定线原点)·朝向 − 音符偏移`），只是那条线的原点
+    取判定线自己的原点；规划器手上只有"判定点"没有判定线对象，就直说这个量 —— "够不够得着"
+    全用它，别再写第二份。
+    """
+    return ((position - spine) * rotation.conjugate()).real
+
+
 def deviation(line, note: Note, position: complex, seconds: float) -> float:
     """一根手指 `position` 在 `seconds` 那一刻对 `note` 的横向偏差（虚拟屏单位）：Phigros 的
     垂直判定就是 `(手指 − 判定线原点)·判定线朝向 − note.offset`。**不要绕 `Screen.remap`**
     （判定线跑到屏幕外时它退化成屏幕中心，横向信息就没了），且手指与判定线必须同刻、取精确秒数。"""
-    lateral = ((position - line.position_at(seconds)) * line.rotation_at(seconds).conjugate()).real
-    return abs(lateral - note.offset)
+    return abs(
+        spine_offset(
+            position, line.point_at(seconds, note.offset), line.rotation_at(seconds)
+        )
+    )
 
 
 # --------------------------------------------------------------- 裁判
@@ -425,33 +446,59 @@ def normal_offset(line, position: complex, seconds: float) -> float:
 
 
 def selection_metric(slot: Slot, position: complex, seconds: float) -> float:
-    """游戏在多押里挑"最近候选"用的度量（报告 §6.3 末尾）：`|Δx| + |Δy| / 2.2`，`|Δx|` 是
-    `deviation()` 的横向偏差、`|Δy|` 是到判定线的法向距离（见 :func:`normal_offset`）。
-    它只用来选一个、不构成判定条件；并列时 `judge_taps` 按时间序取值，时刻最早的胜出。"""
+    """在候选之间挑"最近的那个"用的度量（`CheckNote` 第 405-409 行）：`|Δx| + |Δy| / 2.2`，
+    `|Δx|` 是 :func:`deviation` 的横向偏差、`|Δy|` 是到判定线的法向距离（:func:`normal_offset`）。
+    它只在"时间上挨着（差 ≤ 10ms）、类型也允许"的候选之间比 —— 不是全局最小，
+    见 :func:`judge_taps` 与 :func:`lit_flicks`。"""
     return deviation(slot.geometry, slot.note, position, seconds) + normal_offset(
         slot.geometry, position, seconds
     ) / 2.2
 
 
+def candidates_in_window(
+    ordered: list[Slot], moments: list[float], moment: float, *, back: float, ahead: float
+) -> list[Slot]:
+    """`CheckNote` / `CheckFlick` 开头那两段游标扫出来的候选：`realTime ∈ (now − back, now + ahead)`。
+
+    两端都是**严格**的（反编译里是 `if (realTime >= now + ahead) break` / `<= now − back`），
+    所以 `ahead` 那一侧用 `bisect_left` 把相等剔掉。
+    """
+    lo = bisect_right(moments, moment - back)
+    hi = bisect_left(moments, moment + ahead)
+    return ordered[lo:hi]
+
+
 def judge_taps(
-    chart: Chart,
-    result: PlanResult,
     slots: list[Slot],
     *,
+    drags: list[Judgement],
+    lit: dict[int, float],
     fingers: Fingers,
     heads: dict[int, "HoldHead"],
 ) -> tuple[list[Judgement], list[Graze], set[int]]:
-    """Tap 与 Hold 的头判：**逐次按下**判，一次按下只判**一个**音符：`CheckNote` 在每个手指
-    `phase == Began` 那一帧、于候选里挑 `selection_metric` 最小的那个（报告 §6.2/§6.3），
-    候选须未判过、`Δ ∈ (−0.22, +0.18)`、横向 < 1.9（谱面单位）；Hold 只挂号，窄窗外算蹭键。"""
-    scan, moments = scan_order(
-        [slot for slot in slots if slot.kind in (NoteType.TAP, NoteType.HOLD)]
-    )
+    """Tap 与 Hold 的头判：**逐次按下**判，一次按下只判**一个**音符。
+
+    `CheckNote`（0x1d21104）的挑法比"取度量最小"绕得多，四类音符都进候选（Flick 只挑不判）：
+
+    * 每个候选过三道门：已判过 / 横向 `>= 1.9` / 早侧收窄的 `badTime`（见 :func:`tap_window`）；
+    * 还没有 best 就**直接接受**；
+    * best 是 Drag / Flick → 下一个过门的候选**无条件**顶掉它；
+    * best 是 Tap / Hold → 候选也得是 Tap / Hold、且两者 `realTime` 差 `<= 10ms`，才比度量
+      （度量严格更小才顶替）；
+    * 每次接受都把 `minDeltaTime` 写成 `|realTime − nowTime|`，往后 `realTime − nowTime >=
+      minDeltaTime + 0.01` 的候选**看都不看** —— 这才是"一次按下够不到太远的音符"的真正原因。
+
+    Hold 只挂号、当场不算分（`HoldControl::Judge`）；`|Δ| >= 0.18` 时游戏会把标记清掉继续等。
+    """
+    ordered, moments = scan_order(slots)
+    lit_drags = {judgement.index: judgement.at for judgement in drags if judgement.verdict is Verdict.PERFECT}
 
     # 计划"本来按对了"的音符：窄窗里有一次横向够得着的按下（与覆盖率判据同一套窗口）
     proper: set[int] = set()
     down_times = [timestamp / 1000.0 for timestamp, _, _ in fingers.downs]
-    for slot in scan:
+    for slot in ordered:
+        if slot.kind not in (NoteType.TAP, NoteType.HOLD):
+            continue
         lo = bisect_right(down_times, slot.seconds + HEAD_WINDOW[0] - 0.001)
         hi = bisect_right(down_times, slot.seconds + HEAD_WINDOW[1] + 0.001)
         for index in range(lo, hi):
@@ -469,87 +516,86 @@ def judge_taps(
     for timestamp, pointer, position in fingers.downs:
         # 判定发生在游戏处理这一下按下的那一帧；播放器按 latency 提前发，正好抵掉（见 DELIVERED_LATENCY）
         moment = timestamp / 1000.0 + PROCESS_DELAY - DELIVERED_LATENCY
-        best: tuple[float, Slot, Judgement] | None = None
-        lo = bisect_right(moments, moment - SCAN_BACK)
-        hi = bisect_right(moments, moment + SCAN_AHEAD)
-        for offset in range(lo, hi):
-            slot = scan[offset]
+        best: Slot | None = None
+        best_metric = 0.0
+        min_delta = FUTURE
+        for slot in candidates_in_window(
+            ordered, moments, moment, back=SCAN_BACK, ahead=SCAN_AHEAD
+        ):
             if slot.index in judged:
+                continue
+            if slot.kind is NoteType.DRAG and lit_drags.get(slot.index, math.inf) <= moment:
+                continue  # drag 的位置判据已经把它点亮了（组件 +0x28）
+            if slot.kind is NoteType.FLICK and lit.get(slot.index, math.inf) <= moment:
+                continue  # flick 已被 CheckFlick 点亮
+            if slot.seconds - moment >= min_delta + NEAR_TIME:
                 continue
             delta = moment - slot.seconds
             lateral = deviation(slot.geometry, slot.note, position, moment)
             # 三条过滤全在这里（含边缘收窄的 badTime）：见 tap_window 的反编译引用
             if not tap_window(delta, lateral / CHART_TO_SCREEN):
                 continue
-            if slot.kind is NoteType.HOLD and abs(delta) >= GOOD_TIME:
-                # Hold 头判 |Δ| >= 0.18 不判档、清掉 isJudged 继续等（`HoldControl::Judge` 0x1d32668）
-                continue
-            verdict = verdict_of(delta)
             metric = selection_metric(slot, position, moment)
-            if best is not None and metric >= best[0] - METRIC_EPSILON:
-                # 差在容差以内算平局 → 保留**先遇到的**（时间序在前）那个，见 METRIC_EPSILON
-                continue
-            best = (
-                metric,
-                slot,
-                Judgement(
-                    line=slot.line,
-                    note=slot.note,
-                    seconds=slot.seconds,
-                    verdict=verdict,
+            if best is not None:
+                if best.kind not in (NoteType.DRAG, NoteType.FLICK):
+                    if slot.kind not in (NoteType.TAP, NoteType.HOLD):
+                        continue  # best 是 Tap / Hold 时，Drag / Flick 顶不掉它
+                    if abs(best.seconds - slot.seconds) > NEAR_TIME:
+                        continue  # 也只在 10ms 内才比度量
+                    if metric >= best_metric - METRIC_EPSILON:
+                        # 差在容差以内算平局 → 保留**先遇到的**（时间序在前）那个，见 METRIC_EPSILON
+                        continue
+            best, best_metric = slot, metric
+            min_delta = abs(slot.seconds - moment)
+
+        if best is None or best.kind is NoteType.FLICK:
+            continue  # Flick 由 CheckFlick 点灯，CheckNote 挑到它也不标
+        delta = moment - best.seconds
+        if best.kind is NoteType.DRAG:
+            judged.add(best.index)  # 标在 drag 组件上（它由逐帧位置自己判档）
+            continue
+        if best.kind is NoteType.HOLD and abs(delta) >= GOOD_TIME:
+            # 头判 |Δ| >= 0.18：HoldControl::Judge 会把标记清掉继续等，下一次按下还能判它
+            continue
+        judged.add(best.index)
+        aimed = HEAD_WINDOW[0] <= delta <= HEAD_WINDOW[1]
+        judgement = Judgement(
+            line=best.line,
+            note=best.note,
+            seconds=best.seconds,
+            verdict=verdict_of(delta),
+            at=moment,
+            delta=delta,
+            pointer=pointer,
+            above=best.above,
+            index=best.side_index,
+        )
+        if best.kind is NoteType.HOLD:
+            # Hold 头判当场不算分，只挂号；记下头判的 Δ —— 收尾报的就是它（`this->_judgeTime`，第 180 行）
+            heads[best.index] = HoldHead(
+                slot=best,
+                at=moment,
+                delta=delta,
+                pointer=pointer,
+                is_perfect=abs(delta) < PERFECT_TIME,
+                aimed=aimed,
+            )
+        else:
+            judgement.grazed = not aimed
+            judgements.append(judgement)
+        if not aimed:
+            grazes.append(
+                Graze(
+                    line=best.line,
+                    note=best.note,
+                    verdict=judgement.verdict,
                     at=moment,
                     delta=delta,
                     pointer=pointer,
-                    above=slot.above,
-                    index=slot.side_index,
-                ),
-            )
-
-        if best is None:
-            continue
-        _, slot, judgement = best
-        judged.add(slot.index)
-        if slot.kind is NoteType.HOLD:
-            # Hold 头判当场不算分，只挂号；记下头判的 Δ —— 收尾报的就是它（`this->_judgeTime`，第 180 行）
-            heads[slot.index] = HoldHead(
-                slot=slot,
-                at=judgement.at,
-                delta=judgement.delta,
-                pointer=pointer,
-                is_perfect=abs(judgement.delta) < PERFECT_TIME,
-                aimed=HEAD_WINDOW[0] <= judgement.delta <= HEAD_WINDOW[1],
-            )
-            if not heads[slot.index].aimed:
-                grazes.append(
-                    Graze(
-                        line=slot.line,
-                        note=slot.note,
-                        verdict=judgement.verdict,
-                        at=judgement.at,
-                        delta=judgement.delta,
-                        pointer=pointer,
-                        stolen=slot.index in proper,
-                        dwell_ms=fingers.dwell_ms(pointer, timestamp),
-                    )
+                    stolen=best.index in proper,
+                    dwell_ms=fingers.dwell_ms(pointer, timestamp),
                 )
-            continue
-        aimed = HEAD_WINDOW[0] <= judgement.delta <= HEAD_WINDOW[1]
-        judgement.grazed = not aimed
-        judgements.append(judgement)
-        if aimed:
-            continue
-        grazes.append(
-            Graze(
-                line=slot.line,
-                note=slot.note,
-                verdict=judgement.verdict,
-                at=judgement.at,
-                delta=judgement.delta,
-                pointer=pointer,
-                stolen=slot.index in proper,
-                dwell_ms=fingers.dwell_ms(pointer, timestamp),
             )
-        )
 
     return judgements, grazes, judged
 
@@ -568,15 +614,16 @@ def judge_holds(
             continue
         head = heads.get(slot.index)
         if head is None:
-            # 头部从没被任何按下选中 —— 走头部那条 Miss（比 realTime 晚 0.22，不会早）
+            # 头部从没被任何按下选中 —— 走头部那条 Miss：`HoldControl::Judge` 读的是静态字段
+            # +8（`GoodTimeRange`），所以是 realTime + 0.18，不是 +0.22
             judgements.append(
                 Judgement(
                     line=slot.line,
                     note=slot.note,
                     seconds=slot.seconds,
                     verdict=Verdict.MISS,
-                    at=slot.seconds + BAD_TIME,
-                    delta=BAD_TIME,
+                    at=slot.seconds + GOOD_TIME,
+                    delta=GOOD_TIME,
                     pointer=-1,
                     above=slot.above,
                     index=slot.side_index,
@@ -633,18 +680,86 @@ def judge_holds(
     return judgements
 
 
-def judge_drags_and_flicks(result: PlanResult, slots: list[Slot]) -> list[Judgement]:
-    """Drag / Flick：逐帧（`FRAME_RATE`）比位置，够到一次就算 Perfect，否则 Miss。
-    帧相位是假设（设备帧率可能是 60 或 120），所以只报 Miss 与"什么时候够到的"；与相位
-    无关的严格判据在 `tests/coverage.py`。"""
+def flick_edges(result: PlanResult) -> list[tuple[float, complex]]:
+    """每一次"新起手"（`Fingers.isNewFlick`）：同一根手指相邻两个事件之间的一次位置跳变。
+
+    `FingerManagement::Update` 是按瞬时速度算的（`|nowMove| / deltaTime` 过
+    `flickJudgeSpeed × 5`），阈值随 dpi 归一、拿不到，所以只认**跳变**（`FLICK_JUMP`）——
+    跳变才一定够快。手指从上次抬起的旧位置"出现在"新位置也算一次，这也是悲观的那一侧。
+    """
+    edges: list[tuple[float, complex]] = []
+    for items in Fingers(result).items.values():
+        previous: complex | None = None
+        for timestamp, action, position in items:
+            if (
+                previous is not None
+                and action is not Touch.UP
+                and abs(position - previous) >= FLICK_JUMP
+            ):
+                edges.append((timestamp / 1000.0, position))
+            previous = position
+    edges.sort(key=lambda edge: edge[0])
+    return edges
+
+
+def flick_candidate(slot: Slot, moment: float, position: complex) -> bool:
+    """这一次"新起手"够不够得着这个 flick：`CheckFlick` 的候选判据 —— 时间在
+    `nowTime ± 0.14s` 里（两端严格）、横向 < 2.1（谱面单位）。"""
+    return (
+        abs(moment - slot.seconds) < FLICK_WINDOW
+        and deviation(slot.geometry, slot.note, position, moment) < DRAG_TOLERANCE
+    )
+
+
+def lit_flicks(slots: list[Slot], edges: list[tuple[float, complex]]) -> dict[int, float]:
+    """`CheckFlick`（0x1d21828）点亮了哪些 flick。
+
+    候选只有 Flick（`type != 4` 直接跳过），窗口 `realTime ∈ (now − 0.14, now + 0.14)` 两端严格、
+    已点亮的跳过；挑法与 `CheckNote` 同源：第一个过门的直接接受，之后每次接受都把
+    `minDeltaTime` 记成 `|realTime − now|`（后面的候选远过 10ms 就不看），有 best 时还要
+    `|两者 realTime 差| <= 10ms` 且度量严格更小才顶替。每次起手只点亮一个，点完清 `isNewFlick`。
+    """
+    flicks, moments = scan_order([slot for slot in slots if slot.kind is NoteType.FLICK])
+    lit: dict[int, float] = {}
+    for moment, position in edges:
+        best: Slot | None = None
+        best_metric = 0.0
+        min_delta = FUTURE
+        for slot in candidates_in_window(
+            flicks, moments, moment, back=FLICK_WINDOW, ahead=FLICK_WINDOW
+        ):
+            if slot.index in lit:
+                continue
+            if slot.seconds - moment >= min_delta + NEAR_TIME:
+                continue
+            lateral = deviation(slot.geometry, slot.note, position, moment)
+            if lateral >= DRAG_TOLERANCE:
+                continue
+            metric = selection_metric(slot, position, moment)
+            if best is not None:
+                if abs(best.seconds - slot.seconds) > NEAR_TIME:
+                    continue
+                if metric >= best_metric - METRIC_EPSILON:
+                    continue
+            best, best_metric = slot, metric
+            min_delta = abs(slot.seconds - moment)
+        if best is not None:
+            lit[best.index] = moment
+    return lit
+
+
+def judge_drags(slots: list[Slot], result: PlanResult) -> list[Judgement]:
+    """Drag：逐帧（`FRAME_RATE`）比位置，够到一次就算 Perfect，否则 Miss。不看手指的
+    `phase`（`DragControl::Judge` 读的是每帧的位置）。帧相位是假设（设备帧率可能是 60 或
+    120），所以只报 Miss 与"什么时候够到的"；与相位无关的严格判据在 `tests/coverage.py`。"""
     fingers = Fingers(result)
     timer = Timer(result)
     judgements: list[Judgement] = []
 
     for slot in slots:
-        if slot.kind not in (NoteType.DRAG, NoteType.FLICK):
+        if slot.kind is not NoteType.DRAG:
             continue
-        window = DRAG_WINDOW if slot.kind is NoteType.DRAG else FLICK_WINDOW
+        window = DRAG_WINDOW
         verdict = Verdict.MISS
         at = slot.seconds + window
         delta = window
@@ -674,6 +789,31 @@ def judge_drags_and_flicks(result: PlanResult, slots: list[Slot]) -> list[Judgem
     return judgements
 
 
+def judge_flicks(slots: list[Slot], lit: dict[int, float]) -> list[Judgement]:
+    """Flick：光"摆在那儿"不算 —— 得有一次新起手把它点亮（`CheckFlick`）。点亮了就是
+    Perfect（`at` 取点亮那一刻），没点亮就是 Miss（`FlickControl::Judge` 迟到 `FLICK_WINDOW`
+    就判 Miss）。"""
+    judgements: list[Judgement] = []
+    for slot in slots:
+        if slot.kind is not NoteType.FLICK:
+            continue
+        moment = lit.get(slot.index)
+        judgements.append(
+            Judgement(
+                line=slot.line,
+                note=slot.note,
+                seconds=slot.seconds,
+                verdict=Verdict.PERFECT if moment is not None else Verdict.MISS,
+                at=moment if moment is not None else slot.seconds + FLICK_WINDOW,
+                delta=moment - slot.seconds if moment is not None else FLICK_WINDOW,
+                pointer=-1,
+                above=slot.above,
+                index=slot.side_index,
+            )
+        )
+    return judgements
+
+
 class Timer:
     """按帧率给出一段窗口里的采样时刻。"""
 
@@ -690,27 +830,34 @@ class Timer:
 
 def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: str = "") -> Report:
     """把一份规划完整重放一遍：Tap / Hold 头判逐次按下判（一个音符只判一次、先到先得，
-    与帧率无关）、Hold 身体与收尾（`judge_holds`）、Drag / Flick 逐帧比位置；
-    没被任何判定碰到的音符算 Miss（`lost`）。"""
+    与帧率无关）、Hold 身体与收尾（`judge_holds`）、Drag 逐帧比位置、Flick 看有没有被
+    新起手点亮；没被任何判定碰到的音符算 Miss（`lost`）。
+
+    顺序有讲究：`CheckNote` 挑候选时要知道某根 drag 有没有已经被**位置判据**点亮、
+    某个 flick 有没有已经被**起手**点亮，所以 drag / flick 先算。
+    """
     slots = note_table(chart)
     fingers = Fingers(result)
+    drags = judge_drags(slots, result)
+    lit = lit_flicks(slots, flick_edges(result))
     heads: dict[int, HoldHead] = {}
     taps, grazes, judged = judge_taps(
-        chart, result, slots, fingers=fingers, heads=heads
+        slots, drags=drags, lit=lit, fingers=fingers, heads=heads
     )
     holds = judge_holds(slots, heads, fingers)
-    others = judge_drags_and_flicks(result, slots)
+    others = drags + judge_flicks(slots, lit)
     judged |= {slot.index for slot in slots if slot.kind in (NoteType.DRAG, NoteType.FLICK)}
     judged |= {slot.index for slot in slots if slot.kind is NoteType.HOLD}
 
     missed = [
+        # 只剩 Tap 会走到这里：它的 Miss 线也是 `GoodTimeRange`（`ClickControl::Judge`）
         Judgement(
             line=slot.line,
             note=slot.note,
             seconds=slot.seconds,
             verdict=Verdict.MISS,
-            at=slot.seconds + FLICK_MISS,
-            delta=FLICK_MISS,
+            at=slot.seconds + GOOD_TIME,
+            delta=GOOD_TIME,
             pointer=-1,
             above=slot.above,
             index=slot.side_index,

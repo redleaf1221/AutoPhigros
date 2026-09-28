@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import shapely
 from shapely.geometry import LinearRing, LineString, Point, Polygon, box
+from shapely.ops import nearest_points, unary_union
 
 from .utils import Position, Vector
 
@@ -140,7 +141,11 @@ class JudgeAreaBuilder:
         self.half_width = screen.width * JUDGE_AREA_WIDTH_RATIO / 2
         self._box = screen.bounds
 
-    def band(self, position: Position, rotation: Vector) -> Polygon | None:
+    def band(
+        self, position: Position, rotation: Vector, half_width: float | None = None
+    ) -> Polygon | None:
+        """`position` 处、垂直于判定线的窄带；`half_width` 不给就是规划用的经验值，
+        给 `TAP_TOLERANCE` 就得到"游戏真正判得到的区域"（用来避开会蹭键的落点）。"""
         direction = rotation * 1j
         if direction == 0:
             return None
@@ -150,13 +155,48 @@ class JudgeAreaBuilder:
         start = position - direction * reach
         end = position + direction * reach
         spine = LineString([(start.real, start.imag), (end.real, end.imag)])
-        clipped = spine.buffer(self.half_width, cap_style="flat").intersection(self._box)
+        width = self.half_width if half_width is None else half_width
+        clipped = spine.buffer(width, cap_style="flat").intersection(self._box)
         if clipped.is_empty or clipped.area <= 0:
             return None
         return clipped
 
 
-def centre_of(geometry: Polygon | LineString) -> Position:
-    """几何体的重心，作为触点位置。"""
-    point = shapely.centroid(geometry)
+SAFE_MARGIN = 0.05
+"""从补集里取落脚点时，把容差带往外扩这么多再扣：最近点本来会落在**边界上**
+（横向正好 1.71），浮点误差一抖就又进带子里去了。"""
+
+
+def outside(strips: list[Polygon], target: Position, screen: Screen) -> Position:
+    """离 `target` 最近的、**不在任何一条 strip 里**的屏幕上的位置；一条不剩就退回 `target`。
+
+    用来给"这一下按下不该按在这儿"找落脚点：整屏扣掉所有容差带（各外扩 `SAFE_MARGIN`），
+    取离目标最近的那个点。
+    """
+    if not strips:
+        return target
+    blocked = unary_union(strips).buffer(SAFE_MARGIN)
+    remain = screen.bounds.difference(blocked)
+    if remain.is_empty:
+        return target
+    here, _ = nearest_points(remain, Point(target.real, target.imag))
+    return Position(here.x, here.y)
+
+
+def clear_of(area: Polygon, strips: list[Polygon], screen: Screen) -> Polygon:
+    """`area` 扣掉所有 strip（各外扩 `SAFE_MARGIN`）之后剩下的部分。
+
+    扣没了就把 `area` 原样还回去 —— 宁可蹭一下，也不能没有落点。用来把"会蹭键的部分"从
+    落点候选区域里切掉（见 impl.md「按下落在哪儿」）。
+    """
+    if not strips:
+        return area
+    remain = area.difference(unary_union(strips).buffer(SAFE_MARGIN))
+    return area if remain.is_empty else remain
+
+
+def interior_of(geometry: Polygon) -> Position:
+    """几何体**内部**的一点，作为触点位置：重心可能落在凹形区域**外面**，那样就够不着
+    同一组里的其他成员了（判定区求交出来的形状经常是凹的）。`point_on_surface` 保证落在面上。"""
+    point = shapely.point_on_surface(geometry)
     return Position(point.x, point.y)

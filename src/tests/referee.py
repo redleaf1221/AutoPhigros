@@ -1,15 +1,16 @@
 """裁判自检：`algorithms/judging.simulate` 那套"游戏会怎么判"的模型。
 
-四条判据：候选按**时间序**扫（不按线号）、挑选度量里的 |Δy| 是"指尖到判定线的法向距离"
-且在按下那一帧算、一次按下只判一个音符、Hold 身体可以**早于** realTime 判 Miss。
-这些都用合成谱钉住 —— 合成谱能精确控制"位置相同、时刻不同"这类构造。
+五条判据：候选按**时间序**扫（不按线号）、挑选度量里的 |Δy| 是"指尖到判定线的法向距离"
+且在按下那一帧算、一次按下只判一个音符、Hold 身体可以**早于** realTime 判 Miss、flick
+光摆在那儿不算（要有一次"新起手"把它点亮）。这些都用合成谱钉住 —— 合成谱能精确控制
+"位置相同、时刻不同"这类构造。
 """
 
 from __future__ import annotations
 
 from algorithms.chart import Chart, JudgeLine, Note, NoteType, Track
 from algorithms.geometry import Screen
-from algorithms.judging import Verdict, simulate
+from algorithms.judging import FLICK_WINDOW, GOOD_TIME, Verdict, simulate
 from algorithms.utils import PlanResult, Touch, TouchEvent
 
 SCREEN = Screen(16.0, 9.0)
@@ -181,5 +182,179 @@ def check_referee() -> list[str]:
             f"度量并列时该各按各的（都是 Perfect），实际 {order} —— "
             f"千分之几的法向差不该推翻扫描顺序"
         )
+
+    # 6) Flick 光"摆在那儿"不算：`CheckFlick` 只在那帧手指带 `isNewFlick`（一次位置跳变）时才跑。
+    solo = Note(NoteType.FLICK, 5.0, 0.0, 0.0)
+    flick_chart = Chart(3, 0.0, SCREEN, [_line(TAP_X, 2.0, [solo])])
+
+    def flick_verdict(frames) -> Verdict:
+        report = simulate(flick_chart, PlanResult(planner="stub", screen=SCREEN, frames=frames))
+        return next(j for j in report.judgements if j.note.kind is NoteType.FLICK).verdict
+
+    # 6a) 每步 0.2 地**走**进判定区：一次跳变都没有 → 点不亮 → Miss
+    walked = [
+        (
+            4800 + step * 8,
+            (TouchEvent(1000, Touch.DOWN if step == 0 else Touch.MOVE, 4.0 + step * 0.2, 4.5),),
+        )
+        for step in range(20)
+    ]
+    walked.append((5100, (TouchEvent(1000, Touch.UP, 7.8, 4.5),)))
+    verdict = flick_verdict(walked)
+    expect(
+        verdict is Verdict.MISS,
+        f"慢慢走进判定区（没有一次新起手）不该点亮 flick，实际 {verdict.label} —— "
+        f"裁判只看位置就把 flick 判成 Perfect 了",
+    )
+
+    # 6b) 角落按下 + 一次跳变跳到判定点上：这才是"新起手"，点亮 → Perfect
+    verdict = flick_verdict(
+        [
+            (4800, (TouchEvent(1000, Touch.DOWN, 0.0, 8.0),)),
+            (4960, (TouchEvent(1000, Touch.MOVE, TAP_X, PRESS_Y),)),
+            (5100, (TouchEvent(1000, Touch.UP, TAP_X, PRESS_Y),)),
+        ]
+    )
+    expect(verdict is Verdict.PERFECT, f"角落按下再跳变到判定点该点亮 flick，实际 {verdict.label}")
+
+    # 6c) 一次起手只点亮一个：相邻 86ms 的两个 flick 都在窗口里，点亮的是**时刻最早**的那个
+    twins = [Note(NoteType.FLICK, 20.000, 0.0, 0.0), Note(NoteType.FLICK, 20.086, 0.0, 0.0)]
+    report = simulate(
+        Chart(3, 0.0, SCREEN, [_line(TAP_X, 2.0, twins)]),
+        PlanResult(
+            planner="stub",
+            screen=SCREEN,
+            frames=[
+                (19440, (TouchEvent(1000, Touch.DOWN, 0.0, 8.0),)),
+                (20040, (TouchEvent(1000, Touch.MOVE, TAP_X, PRESS_Y),)),
+                (20200, (TouchEvent(1000, Touch.UP, TAP_X, PRESS_Y),)),
+            ],
+        ),
+    )
+    lit = [
+        j
+        for j in report.judgements
+        if j.note.kind is NoteType.FLICK and j.verdict is Verdict.PERFECT
+    ]
+    expect(
+        len(lit) == 1 and abs(lit[0].seconds - 20.000) < 1e-9,
+        f"一次起手只该点亮一个 flick（时刻最早的那个），实际点亮 {[round(j.seconds, 3) for j in lit]}",
+    )
+
+    # 7) `CheckNote` / `CheckFlick` 的挑选：四类音符都进候选、minDeltaTime 守卫、类型优先级、
+    #    10ms 才比度量。每一条都做成"把守卫摘掉就红"。
+    def one_press(moment: float, x: float, y: float) -> PlanResult:
+        stamp = int(round(moment * 1000))
+        return PlanResult(
+            planner="stub",
+            screen=SCREEN,
+            frames=[
+                (stamp, (TouchEvent(1000, Touch.DOWN, x, y),)),
+                (stamp + 150, (TouchEvent(1000, Touch.UP, x, y),)),
+            ],
+        )
+
+    def verdict_of_note(report, kind: NoteType, seconds: float):
+        """按音符身份取判定（不是按列表顺序 —— 列表顺序会随"判到谁"变，判据就抓不住东西）。"""
+        return next(
+            (
+                j
+                for j in report.judgements
+                if j.note.kind is kind and abs(j.seconds - seconds) < 1e-9
+            ),
+            None,
+        )
+
+    def label(judgement) -> str:
+        return "Miss" if judgement is None else judgement.verdict.label
+
+    # 7a) minDeltaTime 守卫：先接受了一个 5ms 之后的 Flick，再远 10ms 的 TAP 就不看了
+    chart = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [
+            _line(
+                TAP_X,
+                2.0,
+                [Note(NoteType.FLICK, 10.005, 0.0, 0.0), Note(NoteType.TAP, 10.060, 0.0, 0.0)],
+            )
+        ],
+    )
+    report = simulate(chart, one_press(10.000, TAP_X, PRESS_Y))
+    judgement = verdict_of_note(report, NoteType.TAP, 10.060)
+    expect(
+        judgement is not None and judgement.verdict is Verdict.MISS,
+        f"第一个候选把 minDeltaTime 记成 5ms 之后，60ms 外的 TAP 就该看都不看，实际 "
+        f"{label(judgement)}",
+    )
+
+    # 7b) 类型优先级：best 是 Tap 时，度量更小的 Flick 也顶不掉它
+    chart = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [
+            _line(TAP_X, 2.0, [Note(NoteType.TAP, 10.000, 0.0, 0.0)]),
+            _line(TAP_X, 4.0, [Note(NoteType.FLICK, 10.005, 0.0, 0.0)]),
+        ],
+    )
+    report = simulate(chart, one_press(10.000, TAP_X, PRESS_Y - 0.5))
+    judgement = verdict_of_note(report, NoteType.TAP, 10.000)
+    expect(
+        judgement is not None and judgement.verdict is Verdict.PERFECT,
+        f"best 是 Tap 时 Flick 顶不掉它（试按的 Flick 度量更小），实际 TAP {label(judgement)}",
+    )
+
+    # 7c) 10ms 才比度量：晚 20ms 的那个 TAP 度量更小也不顶替（更远的 100ms 那个被守卫挡掉）
+    chart = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [
+            _line(
+                TAP_X,
+                2.0,
+                [Note(NoteType.TAP, 10.000, 0.0, 0.0), Note(NoteType.TAP, 10.020, 0.0, 0.6)],
+            )
+        ],
+    )
+    report = simulate(chart, one_press(10.150, TAP_X + 0.6, PRESS_Y))
+    first = verdict_of_note(report, NoteType.TAP, 10.000)
+    later = verdict_of_note(report, NoteType.TAP, 10.020)
+    expect(
+        first is not None
+        and first.verdict is Verdict.GOOD
+        and (later is None or later.verdict is Verdict.MISS),
+        f"晚 20ms 的 TAP 不该顶掉先遇到的（它的度量更小也没用），实际 "
+        f"10.000s {label(first)} / 10.020s {label(later)}",
+    )
+
+    # 7d) Miss 线：Tap 与 Hold 头读的是 GoodTimeRange（+0.18），Flick 是 PerfectTimeRange×1.75（+0.14）
+    chart = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [
+            _line(TAP_X, 2.0, [Note(NoteType.TAP, 3.0, 0.0, 0.0), Note(NoteType.HOLD, 5.0, 1.0, 0.0)]),
+            _line(TAP_X, 4.0, [Note(NoteType.FLICK, 7.0, 0.0, 0.0)]),
+        ],
+    )
+    report = simulate(chart, PlanResult(planner="stub", screen=SCREEN, frames=[]))
+    for kind, seconds, deadline in (
+        (NoteType.TAP, 3.0, GOOD_TIME),
+        (NoteType.HOLD, 5.0, GOOD_TIME),
+        (NoteType.FLICK, 7.0, FLICK_WINDOW),
+    ):
+        judgement = verdict_of_note(report, kind, seconds)
+        if (
+            judgement is None
+            or judgement.verdict is not Verdict.MISS
+            or abs(judgement.at - (seconds + deadline)) > 1e-9
+        ):
+            problems.append(
+                f"{kind.name} 没人碰时该在 +{deadline:.2f}s 判 Miss，实际 "
+                f"{label(judgement)} @ {getattr(judgement, 'at', float('nan')):.3f}s"
+            )
 
     return problems

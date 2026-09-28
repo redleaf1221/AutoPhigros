@@ -21,11 +21,12 @@ from algorithms import catalog
 
 from formats.storage import CHART_SUFFIX, load_chart
 from . import ROOT
-from .accounting import check_calibration, check_judge, check_result
+from .accounting import check_calibration, check_device_log, check_judge, check_result
 from .attach import check_attach
 from .console import check_console
 from .coverage import TOLERANCE, check_dwell
 from .liveness import check_liveness, check_shutdown
+from .planner import check_planner
 from .referee import check_referee
 from .pipeline import check_cache, check_clock, check_gate, check_log_file, check_pixels, check_player
 from .settings import check_config
@@ -65,7 +66,9 @@ def main() -> int:
         ("结算自检", check_result()),
         ("延迟自校准自检", check_calibration()),
         ("判定对账自检", check_judge()),
+        ("日志对账自检", check_device_log()),
         ("裁判自检", check_referee()),
+        ("规划器自检", check_planner()),
         ("在位时长自检", check_dwell()),
         ("配置自检", check_config()),
         ("日志自检", check_log_file()),
