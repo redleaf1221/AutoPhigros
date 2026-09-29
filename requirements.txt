@@ -7,3 +7,4 @@ numpy==2.5.3
 tqdm==4.70.1
 opencv-python==5.0.0.93
 imageio-ffmpeg==0.6.0
+cryptography==50.0.1
