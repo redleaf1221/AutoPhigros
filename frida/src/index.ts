@@ -53,6 +53,22 @@ const INSTALLED_HOOKS: ReadonlyArray<{ type: string; method: string; parameters:
     { type: SCORE_CONTROL_TYPE, method: LEVEL_RESULT_METHOD, parameters: 0 }
 ];
 
+const sigactionPtr = Process.getModuleByName("libc.so").findExportByName("sigaction");
+if (sigactionPtr) {
+    Interceptor.attach(sigactionPtr, {
+        onEnter(args) {
+            const sig = args[0].toInt32();
+            if (sig === 11 /* SIGSEGV */ || sig === 7 /* SIGBUS */ || sig === 6 /* SIGABRT */) {
+                // 将想要注册的 handler 强制改为 SIG_DFL (0)，让系统 debuggerd 直接接管
+                const newAct = args[1];
+                if (!newAct.isNull()) {
+                    newAct.writePointer(ptr(0)); // sa_handler = SIG_DFL
+                }
+            }
+        }
+    });
+}
+
 function install(): void {
     const JsonUtility = findClass(JSON_UTILITY_TYPE);
     if (JsonUtility === null) {
@@ -130,6 +146,7 @@ rpc.exports = {
             lastChartSeq: state.lastChartSeq,
             lastContext: state.lastContext,
             gateSeq: state.gateSeq,
+            gateEnabled: state.gateEnabled,
             releasedCount: state.releasedCount,
             notesIndexed: state.noteIndex.size,
             lastResultSeq: state.lastResultSeq

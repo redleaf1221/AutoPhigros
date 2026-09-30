@@ -25,6 +25,7 @@ from .accounting import check_calibration, check_device_log, check_judge, check_
 from .attach import check_attach
 from .console import check_console
 from .coverage import TOLERANCE, check_dwell
+from .device import check_device
 from .liveness import check_liveness, check_shutdown
 from .planner import check_planner
 from .referee import check_referee
@@ -60,6 +61,7 @@ def main() -> int:
         ("坐标换算自检", check_pixels()),
         ("播放器自检", check_player()),
         ("控制台自检", check_console()),
+        ("设备自检", check_device()),
         ("附加目标自检", check_attach()),
         ("存活探测自检", check_liveness()),
         ("收工自检", check_shutdown()),

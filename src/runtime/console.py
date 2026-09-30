@@ -277,6 +277,18 @@ def _inject(controller: Controller, argv: list[str]) -> None:
     log(f"触控注入 -> {'开' if value else '关（照常排期与计时，不碰设备）'}")
 
 
+def _gate(controller: Controller, argv: list[str]) -> None:
+    """开关"开谱时把游戏拦住等我们规划完"（只在这次会话里有效，立即生效）。"""
+    value = _switch(argv)
+    if value is None:
+        log(f"闸门现在是 {'开' if controller.options.gate else '关'}；用法：gate on|off")
+        return
+    controller.set_gate(value)
+    log(
+        f"闸门 -> {'开（开谱时拦住游戏，等我们规划完）' if value else '关（不拦，游戏一秒都不停）'}"
+    )
+
+
 def _verbose(controller: Controller, argv: list[str]) -> None:
     """开关"是否把每一个 Perfect 也打出来"（只在这次会话里有效）。"""
     value = _switch(argv)
@@ -322,6 +334,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("log", "log on|off", "把输出抄一份到 logs/", _log),
     Command("host", "host add <地址>", "加 / 看远程 frida-server", _host),
     Command("inject", "inject on|off", "是否真的把触控发给设备（仅本次会话）", _inject),
+    Command("gate", "gate on|off", "开谱时是否拦住游戏等规划完（仅本次会话）", _gate),
     Command("verbose", "verbose on|off", "是否把每一个 Perfect 也打出来（仅本次会话）", _verbose),
     Command("help", "help", "列出这些命令", lambda controller, argv: _help()),
     Command("quit", "quit", "收工：断开注入并退出（等同 Ctrl+C）", _quit),

@@ -65,6 +65,10 @@ def check_console() -> list[str]:
             self.calls.append(f"host:{host}")
             return True
 
+        def set_gate(self, enabled: bool) -> None:
+            self.calls.append(f"gate:{enabled}")
+            self.options.gate = enabled
+
     problems: list[str] = []
     fake = FakeController()
     console = Console(fake)
@@ -103,9 +107,18 @@ def check_console() -> list[str]:
     run("inject on")
     run("verbose on")
     expect(fake.options.verbose, "verbose on 没生效")
+    run("gate on")
+    expect(fake.options.gate, "gate on 没生效")
+    run("gate 说不清")
+    expect(fake.options.gate, "看不懂的 gate 参数不该改动设置")
+    run("gate")
+    expect(fake.options.gate, "gate 不带参数不该改动设置")
+    run("gate off")
+    expect(not fake.options.gate, "gate off 没生效")
+    expect("gate:False" in fake.calls, f"gate off 没走到主干：{fake.calls}")
     expect(
         fake.persists == before,
-        "inject / verbose 不该落盘：一个持久化的 inject off 会让人下次以为在打歌",
+        "inject / verbose / gate 不该落盘：一个持久化的 inject off 会让人下次以为在打歌",
     )
 
     # 规划器：认识的要换（并落盘）、不认识的原样不动
@@ -211,8 +224,8 @@ def check_console() -> list[str]:
 
     # 每一条命令都要说话 —— 包括"看不懂"的。空回显是最难查的一种"没反应"。
     for line in (
-        "没这个命令", "latency 说不清", "inject 说不清", "verbose", "planner 没有这个", "status",
-        "devices", "device", "backend", "backend 没有这个", "cache", "save-chart", "host",
+        "没这个命令", "latency 说不清", "inject 说不清", "gate 说不清", "verbose", "planner 没有这个",
+        "status", "devices", "device", "backend", "backend 没有这个", "cache", "save-chart", "host",
     ):
         if not run(line).strip():
             problems.append(f"{line!r} 一个字都没回")

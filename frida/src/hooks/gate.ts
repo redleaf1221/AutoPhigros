@@ -7,6 +7,7 @@
 
 import { findClass, readBoolMethod, readNumberField, readObjectField, readStaticNumberField, readStringField } from "../bridge";
 import {
+    GATE_MESSAGE,
     LEVEL_START_METHOD,
     MIRROR_METHOD,
     RELEASE_MESSAGE,
@@ -154,13 +155,27 @@ export function installLevelStartHook(LevelControl: Il2Cpp.Class): void {
     const sortForNote = LevelControl.method<void>(LEVEL_START_METHOD, 0);
     const address = sortForNote.virtualAddress;
 
+    // 主机可以随时开关闸门：关掉之后开谱现场照报，但**不阻塞** Unity 主线程
+    recv(GATE_MESSAGE, message => {
+        const payload = (message as { payload?: { enabled?: boolean } } | null)?.payload;
+        if (typeof payload?.enabled === "boolean") {
+            state.gateEnabled = payload.enabled;
+            send({ event: "warn", reason: `闸门 -> ${payload.enabled ? "开" : "关"}` });
+        }
+    });
+
     sortForNote.implementation = function (): void {
         const levelControl = this as Il2Cpp.Object;
         const gate = ++state.gateSeq;
         // 上一关的音符表从这一刻起作废；新的那张由 hook 5 在放行之后重建
         resetForLevel();
 
-        waitForRelease(gate, () => announceLevelStart(levelControl, gate));
+        if (state.gateEnabled) {
+            waitForRelease(gate, () => announceLevelStart(levelControl, gate));
+        } else {
+            // 不拦：先把现场报出去（镜像与延迟还得用），然后立刻让游戏往下走
+            announceLevelStart(levelControl, gate);
+        }
 
         state.releasedCount++;
         const released: ReleasedEvent = { event: "level-start-released", seq: gate, at: Date.now() };

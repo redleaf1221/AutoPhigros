@@ -290,6 +290,12 @@ class Agent:
             return
         self._script.post({"type": "release", "payload": {"seq": seq}})
 
+    def set_gate(self, enabled: bool) -> None:
+        """开关闸门：关掉之后开谱不再阻塞 Unity 主线程（开谱现场照报）。"""
+        if self._script is None:
+            return
+        self._script.post({"type": "gate", "payload": {"enabled": enabled}})
+
     # ------------------------------------------------------------ 探活
 
     def probe(self, timeout: float = PING_TIMEOUT) -> str:

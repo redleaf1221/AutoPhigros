@@ -38,6 +38,13 @@ class Options:
     inject: bool = True
     """是否真的把触控发给设备。关掉 = 照常排期、照常记迟到，只是不碰设备。"""
 
+    gate: bool = True
+    """开谱时要不要把游戏**拦在闸门上**等我们规划完（agent 侧阻塞 Unity 主线程）。
+
+    拦着的好处是这一局从第一个音符起就按我们的排期走；关掉的好处是游戏主线程一秒都不停 ——
+    查"游戏在某个时刻卡住"这类问题时先关它，谱面有缓存时关掉也照样满分。**立即生效**。
+    """
+
     verbose: bool = False
     """是否把每一个 Perfect 也打出来。默认关：一局几百条，只在查判定时才要。"""
 
@@ -45,5 +52,6 @@ class Options:
         return (
             f"规划器 {self.planner}，手工补偿 {self.latency * 1000:+.0f}ms，"
             f"触控注入 {'开' if self.inject else '关'}"
+            f"{'，闸门关' if not self.gate else ''}"
             f"{'，判定流水（含 Perfect）开' if self.verbose else ''}"
         )

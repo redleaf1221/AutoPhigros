@@ -290,6 +290,44 @@ def _check_shutdown() -> list[str]:
     feed.join(2.0)
     expect(script.released == [7], f"放行了不止一次：{script.released}")
 
+    # 2b) 闸门开着的时候把它关掉：必须**先放行**这一道，再把开关打给 agent
+    events.clear()
+    controller, agent, script = build()
+    opened = threading.Event()
+    finish = threading.Event()
+
+    def slow_work(_start: object) -> None:
+        opened.set()
+        finish.wait(2.0)
+
+    agent.on_level_start = slow_work
+    feed = threading.Thread(
+        target=lambda: agent._on_level_start(  # noqa: SLF001 - 自检就是往里喂消息
+            {"seq": 9, "chartSeq": 3, "mirror": False, "offset": {}}
+        ),
+        name="selftest-gate-off",
+    )
+    feed.start()
+    opened.wait(2.0)
+    controller.set_gate(False)  # 游戏此刻正卡在闸门上
+    expect(
+        script.released == [9],
+        f"关掉闸门却没放行正卡着的那一道（游戏会一直停在开谱那儿）：{script.posted}",
+    )
+    expect(script.gates == [False], f"闸门开关没打给 agent：{script.posted}")
+    expect(not controller.options.gate, "关掉闸门之后 options.gate 该是 False")
+    finish.set()
+    feed.join(2.0)
+    controller.set_gate(True)
+    expect(script.gates == [False, True], f"再开回来没打给 agent：{script.posted}")
+
+    # 2c) 刚起来的 agent 会收到"这一把的设置"：闸门关着的会话，接上去就不该拦游戏
+    events.clear()
+    controller, agent, script = build()
+    controller.options.gate = False
+    controller._bind_agent(agent)  # noqa: SLF001 - 自检就是要单独走这一步
+    expect(script.gates == [False], f"接上 agent 时没把闸门开关打过去：{script.posted}")
+
     # 3) 拆除只做一次，而且后到的那个必须等它做完
     events.clear()
     controller, _, _ = build()

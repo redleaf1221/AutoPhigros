@@ -23,7 +23,19 @@ class Recorder:
 
     @property
     def released(self) -> list[int]:
-        return [int(message.get("payload", {}).get("seq", 0)) for message in self.posted]
+        return [
+            int(message.get("payload", {}).get("seq", 0))
+            for message in self.posted
+            if message.get("type") == "release"
+        ]
+
+    @property
+    def gates(self) -> list[bool]:
+        return [
+            bool(message.get("payload", {}).get("enabled"))
+            for message in self.posted
+            if message.get("type") == "gate"
+        ]
 
 
 def make_config(**overrides: object) -> Config:

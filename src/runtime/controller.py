@@ -16,6 +16,7 @@ import frida
 import backends
 import planner
 import touch
+from backends.scrcpy import ADB, start_adb_server
 from .agent import Agent, LevelStart, MIN_LATENCY_SAMPLES, PING_TIMEOUT, READY_TIMEOUT, TESTED_FRIDA
 from algorithms.chart import OFFICIAL_SCREEN
 from algorithms.utils import PlanResult
@@ -48,6 +49,15 @@ SHUTDOWN_WAIT = 6.0
 
 REANCHOR_WARN = 0.02
 """时钟重锚挪动超过这么多秒就报警：重锚会让接下来一小段的事件整体偏晚，"最大迟到"看不见它。"""
+
+
+def _ensure_adb() -> bool:
+    """设备枚举之前先保证 adb server 在跑，返回这一趟成不成。
+
+    冷启动时它没起来，frida 走 USB 一台设备都看不到 —— 列表空着，人只会以为线没插好。
+    失败不在这里报：列表非空时它无关紧要，空的时候 :meth:`Controller.list_devices` 一起说。
+    """
+    return start_adb_server()
 
 
 class Controller:
@@ -154,7 +164,6 @@ class Controller:
 
     def detach(self) -> None:
         """断开注入：把 agent 拆掉（放行闸门、unload、detach），**设备与触控后端都留着**。
-
         与 `quit` 的区别就是后端留不留 —— 留着的话 `attach` / `spawn` 接回来时不用重开连接。
         """
         if self.agent is None:
@@ -172,6 +181,7 @@ class Controller:
         滤掉 ``local`` / ``socket`` / ``barebone``：跟 Phigros 没关系却永远存在（Windows 上都报
         ``remote``），留着的话"只有一台就自动选中"永远不会触发；远程 server 用加进去时返回的认。
         """
+        adb = _ensure_adb()
         manager = frida.get_device_manager()
         found: dict[str, frida.core.Device] = {}
         for host in self.config.hosts:
@@ -184,6 +194,8 @@ class Controller:
         for device in manager.enumerate_devices():
             if device.type == "usb":
                 found[device.id] = device
+        if not found and not adb:
+            log(f"[main] 一台设备都没有，而且 adb start-server 没成功（{ADB}）", file=sys.stderr)
         return list(found.values())
 
     def add_host(self, host: str) -> bool:
@@ -204,6 +216,7 @@ class Controller:
 
     def select_device(self, identifier: str) -> bool:
         """选中一台设备并连上。"""
+        _ensure_adb()
         try:
             device = frida.get_device(identifier, timeout=5)
         except frida.InvalidArgumentError:
@@ -394,7 +407,12 @@ class Controller:
         agent.on_play_state = self.handle_play_state
         agent.on_level_gone = self.handle_level_gone
         agent.on_result = self.handle_result
+        self._bind_agent(agent)
         self.agent_state = "ok"
+
+    def _bind_agent(self, agent: Agent) -> None:
+        """把"这一把的设置"打给刚起来的 agent：目前只有闸门开关一项。"""
+        agent.set_gate(self.options.gate)
 
     def _await_ready(self, agent: Agent) -> None:
         """等 agent 报 ready —— **按片等**，收工了就不再等。
@@ -409,6 +427,21 @@ class Controller:
                 log("[main] 还在等 agent 握手就收到了收工，不等了", file=sys.stderr)
                 return
         log(f"[main] 警告：{READY_TIMEOUT:.0f}s 内未收到 agent 的 ready 消息", file=sys.stderr)
+
+    def set_gate(self, enabled: bool) -> None:
+        """开关闸门（开谱时要不要把游戏拦住等我们规划完），立即生效。
+
+        关掉的时候如果**游戏正卡在某道闸门上**，顺手把它放行 —— 否则这一关会一直停在那儿。
+        """
+        self.options.gate = enabled
+        agent = self.agent
+        if agent is None:
+            return
+        if not enabled and agent.gate_open is not None:
+            seq = agent.gate_open
+            agent.release(seq)
+            log(f"[gate #{seq:04d}] 闸门关掉了，先放行这一道")
+        agent.set_gate(enabled)
 
     def open_backend(self, name: str | None = None) -> None:
         """把触控后端架起来；架不起来就降级成"只采集不打"，不影响谱面和缓存。

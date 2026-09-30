@@ -26,7 +26,7 @@
  * agent -> 主机：hooked / ready / chart / chart-parsed / level-context / level-start /
  *   level-start-released / note-index / progress / play-state / level-gone /
  *   judge / result / warn（含 fatal、chart-error）
- * 主机 -> agent：{ type: "release", payload: { seq } }
+ * 主机 -> agent：{ type: "release", payload: { seq } } / { type: "gate", payload: { enabled } }
  * 谱面总是回传，没有尺寸或开关限制；存不存由主机决定。
  */
 
@@ -100,6 +100,9 @@ export const PROGRESS_INTERVAL_MS = 100;
 
 /** 主机放行闸门的消息类型。 */
 export const RELEASE_MESSAGE = "release";
+
+/** 主机开关闸门的消息类型：``{ enabled: boolean }``。关了就不阻塞主线程，只报开谱现场。 */
+export const GATE_MESSAGE = "gate";
 
 /* ============================== 载荷 ============================== */
 

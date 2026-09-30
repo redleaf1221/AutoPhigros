@@ -19,6 +19,9 @@ export const state = {
     gateSeq: 0,
     /** 已经放行了多少道闸门。 */
     releasedCount: 0,
+    /** 闸门开着吗：主机可以随时关掉它（``{"type": "gate"}``），关了就不阻塞 Unity 主线程，
+     * 只把开谱现场照报 —— 主机会在"游戏不等我"的情况下照常接管（谱面没缓存时必然迟到）。 */
+    gateEnabled: true,
 
     /** 上一次回传游戏时钟的墙上时间，用来节流。 */
     lastProgressSent: 0,

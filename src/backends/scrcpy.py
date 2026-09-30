@@ -80,6 +80,35 @@ def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
     return finished.stdout.decode("utf-8", "replace")
 
 
+_ADB_SERVER_READY = threading.Event()
+"""adb server 拉起来**成功过**没有：成功之后这个进程就不用再试了（失败不记账，下次还试）。"""
+
+
+def start_adb_server() -> bool:
+    """确保 adb server 在跑，返回这一趟成不成。
+
+    冷启动时 server 还没起来，frida 的 USB 枚举会**一台设备都看不到**（`adb devices` 自己会
+    顺手把 server 拉起来，所以先替它做一遍）。失败既不抛异常也不记账 —— 可能是 adb 不在，也
+    可能只是这一下超时，交回调用方去说。
+    """
+    if _ADB_SERVER_READY.is_set():
+        return True
+    try:
+        finished = subprocess.run(
+            [str(ADB), "start-server"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if finished.returncode != 0:
+        return False
+    _ADB_SERVER_READY.set()
+    return True
+
+
 def screen_size(serial: str | None = None) -> tuple[int, int]:
     """问设备要屏幕像素尺寸，**横屏**口径（长边当宽）。
 
