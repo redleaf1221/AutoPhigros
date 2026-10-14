@@ -27,6 +27,7 @@ from .console import check_console
 from .coverage import TOLERANCE, check_dwell
 from .device import check_device
 from .liveness import check_liveness, check_shutdown
+from .noise import check_noise
 from .planner import check_planner
 from .referee import check_referee
 from .pipeline import check_cache, check_clock, check_gate, check_log_file, check_pixels, check_player
@@ -70,6 +71,7 @@ def main() -> int:
         ("判定对账自检", check_judge()),
         ("日志对账自检", check_device_log()),
         ("裁判自检", check_referee()),
+        ("噪域自检", check_noise()),
         ("规划器自检", check_planner()),
         ("在位时长自检", check_dwell()),
         ("配置自检", check_config()),

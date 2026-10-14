@@ -135,42 +135,4 @@ def check_planner() -> list[str]:
             "（多半是两块判定区没有真的只擦个边）"
         )
 
-    # `geometric_pure` 的"吸附 + 顺手判掉"：一个 drag 的容差区够得着同刻那个 tap 的判定点，
-    # 一发按下就该判两个 —— 按下次数必须比 `geometric` 少
-    from algorithms import registry
-    from algorithms.utils import Touch as Action
-
-    def downs(result) -> int:
-        return sum(
-            1
-            for _, events in result.frames
-            for event in events
-            if event.action is Action.DOWN
-        )
-
-    pair = Chart(
-        3,
-        0.0,
-        SCREEN,
-        [
-            _line(
-                2.0,
-                [
-                    Note(NoteType.TAP, 10.000, 0.0, 0.0),
-                    Note(NoteType.DRAG, 10.000, 0.0, 1.0),
-                ],
-            )
-        ],
-    )
-    plain = registry.create("geometric").plan(pair, _Quiet())
-    pure = registry.create("geometric_pure").plan(pair, _Quiet())
-    if downs(pure) >= downs(plain):
-        problems.append(
-            f"geometric_pure 没省下手指：它按了 {downs(pure)} 次、geometric 按了 {downs(plain)} 次"
-            "（落点没吸附到那个 tap 的判定点上，或者吸附了却没敢省掉它那一次按下）"
-        )
-    _, pure_misses, _ = check_coverage(pair, pure)
-    if pure_misses:
-        problems.append(f"geometric_pure 省手指却把覆盖省掉了：{pure_misses[0]}")
-
     return problems

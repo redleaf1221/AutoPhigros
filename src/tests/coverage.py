@@ -70,7 +70,7 @@ def _lateral(tracks, line, note, seconds: float) -> float:
 
 
 def check_coverage(chart: Chart, result) -> tuple[int, list[str], float]:
-    tracks = Tracks(result)
+    tracks = Tracks(result, chart.noise_field())
     screen = chart.screen
     misses: list[str] = []
     worst = 0.0
@@ -212,7 +212,7 @@ def check_flick(chart: Chart, result: PlanResult) -> list[str]:
     if not flicks:
         return []
 
-    edges = flick_edges(result)
+    edges = flick_edges(result, chart.noise_field())
     lit = lit_flicks(flicks, edges)
     missing = [slot for slot in flicks if slot.index not in lit]
     if not missing:

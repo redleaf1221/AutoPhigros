@@ -15,6 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+from .blocks import NoiseField, exposure
 from .chart import Chart, Note, NoteType
 from .geometry import place_note
 from .utils import PlanResult, Touch
@@ -161,24 +162,43 @@ def score(perfect: int, good: int, notes: int, max_combo: int) -> tuple[int, flo
 class Fingers:
     """把事件流按指针拆开，回答"某时刻哪些手指在屏幕上、在哪"：`down_at(t)` 取每根手指
     在 t 之前最后一次事件的位置，只要那一次不是 UP 就算还按着（手指在两次事件之间不动，
-    判定线却在动，所以横向偏差是逐帧漂的）。"""
+    判定线却在动，所以横向偏差是逐帧漂的）。
 
-    def __init__(self, result: PlanResult) -> None:
+    **噪域（4.0.1）**：`JudgeControl::CheckBlocks` 在判音符**之前**把落进生效噪域的手指从
+    `FingerManagement.fingers` 里摘掉，而 `blockedFingerIds` 只在手指**抬起**时才清
+    （`SyncFingers` 的 `RemoveWhere` 判据是"这个 id 已经不在当前 touches 里了"）。于是这里
+    按同一条规则算一段**死亡区间**：第一次踩到噪域那一刻起，一直废到抬起 —— 中途挪出去
+    也不算数。`field` 为 None（4.0.0 的谱面、或者不关心的调用方）时一切照旧。
+    """
+
+    def __init__(self, result: PlanResult, field: NoiseField | None = None) -> None:
         raw: dict[int, list[tuple[int, Touch, complex]]] = defaultdict(list)
-        self.downs: list[tuple[int, int, complex]] = []
+        downs: list[tuple[int, int, complex]] = []
         for timestamp, events in result.frames:
             for event in events:
                 position = complex(event.x, event.y)
                 raw[event.pointer].append((timestamp, event.action, position))
                 if event.action is Touch.DOWN:
-                    self.downs.append((timestamp, event.pointer, position))
+                    downs.append((timestamp, event.pointer, position))
         self.items = raw
         self.timestamps = {pointer: [item[0] for item in items] for pointer, items in raw.items()}
+        self.field = field
+        self.dead: dict[int, list[tuple[int, int]]] = (
+            exposure(result, field) if field is not None and field else {}
+        )
+        # 死在噪域里的那一次按下根本没进过游戏的判定位表，逐次按下的裁判不许看见它
+        self.downs = [item for item in downs if not self.dead_at(item[1], item[0])]
+
+    def dead_at(self, pointer: int, moment: int) -> bool:
+        """这一刻这根手指是不是已经废了（在被噪域吃掉的区间里）。"""
+        return any(begin <= moment < end for begin, end in self.dead.get(pointer, ()))
 
     def down_at(self, moment: int) -> list[complex]:
-        """`moment`（毫秒）那一刻屏幕上的手指位置。"""
+        """`moment`（毫秒）那一刻屏幕上的手指位置（已经废掉的不算）。"""
         positions: list[complex] = []
         for pointer, items in self.items.items():
+            if self.dead_at(pointer, moment):
+                continue
             index = bisect_right(self.timestamps[pointer], moment) - 1
             if index < 0:
                 continue
@@ -207,6 +227,17 @@ class Fingers:
             for timestamp, _, position in self.downs
             if lo_ms <= timestamp <= hi_ms
         ]
+
+
+def blocked_fingers(
+    result: PlanResult, field: NoiseField, step_ms: float = FRAME_MS
+) -> dict[int, list[tuple[int, int]]]:
+    """这份规划里被噪域吃掉的手指（指针 → ``[开始, 抬起)`` 毫秒）。
+
+    规划器写完事件流之后拿它自查（"有没有把手指划进噪域"），裁判报账时也读同一份 ——
+    模型只有一份，别在规划器里再写一遍。
+    """
+    return Fingers(result, field).dead
 
 
 def spine_offset(position: complex, spine: complex, rotation: Vector) -> float:
@@ -323,6 +354,8 @@ class Report:
     notes: int
     judgements: list[Judgement] = field(default_factory=list)
     grazes: list[Graze] = field(default_factory=list)
+    blocked: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    """被噪域吃掉的手指：指针 → 一串 ``[开始, 抬起)``（毫秒）。4.0.0 的谱面永远是空的。"""
 
     @property
     def counts(self) -> dict[Verdict, int]:
@@ -680,20 +713,23 @@ def judge_holds(
     return judgements
 
 
-def flick_edges(result: PlanResult) -> list[tuple[float, complex]]:
+def flick_edges(result: PlanResult, field: NoiseField | None = None) -> list[tuple[float, complex]]:
     """每一次"新起手"（`Fingers.isNewFlick`）：同一根手指相邻两个事件之间的一次位置跳变。
 
     `FingerManagement::Update` 是按瞬时速度算的（`|nowMove| / deltaTime` 过
     `flickJudgeSpeed × 5`），阈值随 dpi 归一、拿不到，所以只认**跳变**（`FLICK_JUMP`）——
     跳变才一定够快。手指从上次抬起的旧位置"出现在"新位置也算一次，这也是悲观的那一侧。
+    已经废在噪域里的手指不产生新起手 —— 它根本不在 `fingers` 里。
     """
+    fingers = Fingers(result, field)
     edges: list[tuple[float, complex]] = []
-    for items in Fingers(result).items.values():
+    for pointer, items in fingers.items.items():
         previous: complex | None = None
         for timestamp, action, position in items:
             if (
                 previous is not None
                 and action is not Touch.UP
+                and not fingers.dead_at(pointer, timestamp)
                 and abs(position - previous) >= FLICK_JUMP
             ):
                 edges.append((timestamp / 1000.0, position))
@@ -748,11 +784,13 @@ def lit_flicks(slots: list[Slot], edges: list[tuple[float, complex]]) -> dict[in
     return lit
 
 
-def judge_drags(slots: list[Slot], result: PlanResult) -> list[Judgement]:
+def judge_drags(
+    slots: list[Slot], result: PlanResult, field: NoiseField | None = None
+) -> list[Judgement]:
     """Drag：逐帧（`FRAME_RATE`）比位置，够到一次就算 Perfect，否则 Miss。不看手指的
     `phase`（`DragControl::Judge` 读的是每帧的位置）。帧相位是假设（设备帧率可能是 60 或
     120），所以只报 Miss 与"什么时候够到的"；与相位无关的严格判据在 `tests/coverage.py`。"""
-    fingers = Fingers(result)
+    fingers = Fingers(result, field)
     timer = Timer(result)
     judgements: list[Judgement] = []
 
@@ -828,18 +866,29 @@ class Timer:
         return [lo + i * self.step for i in range(max(0, count))]
 
 
-def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: str = "") -> Report:
+def simulate(
+    chart: Chart,
+    result: PlanResult,
+    *,
+    plan: str = "",
+    chart_name: str = "",
+    field: NoiseField | None = None,
+) -> Report:
     """把一份规划完整重放一遍：Tap / Hold 头判逐次按下判（一个音符只判一次、先到先得，
     与帧率无关）、Hold 身体与收尾（`judge_holds`）、Drag 逐帧比位置、Flick 看有没有被
     新起手点亮；没被任何判定碰到的音符算 Miss（`lost`）。
 
     顺序有讲究：`CheckNote` 挑候选时要知道某根 drag 有没有已经被**位置判据**点亮、
     某个 flick 有没有已经被**起手**点亮，所以 drag / flick 先算。
+
+    ``field`` 不给就从谱面自己造一个（4.0.0 的谱面 `blockAreaList` 是空的 → 等于没有噪域）。
     """
     slots = note_table(chart)
-    fingers = Fingers(result)
-    drags = judge_drags(slots, result)
-    lit = lit_flicks(slots, flick_edges(result))
+    if field is None:
+        field = chart.noise_field()
+    fingers = Fingers(result, field)
+    drags = judge_drags(slots, result, field)
+    lit = lit_flicks(slots, flick_edges(result, field))
     heads: dict[int, HoldHead] = {}
     taps, grazes, judged = judge_taps(
         slots, drags=drags, lit=lit, fingers=fingers, heads=heads
@@ -872,4 +921,5 @@ def simulate(chart: Chart, result: PlanResult, *, plan: str = "", chart_name: st
         notes=len(slots),
         judgements=taps + holds + others + missed,
         grazes=grazes,
+        blocked=dict(fingers.dead),
     )

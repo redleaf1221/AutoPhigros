@@ -494,6 +494,145 @@ world_y = (raw_y − 0.5) × 10
 > 这个坑值得记一笔：`../src/algorithms/chart.py` 最初就是从 phisap 照抄过来的，
 > 结果渲染出来所有点都挤在画面上半部分。 **判定依据是 `(raw − 0.5) × 10`，不是 `5 − raw × 10`。**
 
+## 噪域（4.0.1）
+
+4.0.1 的判定多了**噪域**（`blockAreaList`；逆向细节见
+[Phigros4.0-音游内核逆向报告.md](Phigros4.0-音游内核逆向报告.md) §11）。整套实现的
+唯一出处是 [`../src/algorithms/blocks.py`](../src/algorithms/blocks.py)，这里只说几个决定：
+
+### 一条规则：**进噪域的手指废到抬起来为止**
+
+`JudgeControl::Update` 每帧先 `CheckBlocks()` 再判音符：落进生效噪域的触点会被从
+`FingerManagement.fingers` 里**整条删掉**（不是判成 Bad —— 是这只手当帧起就不存在），
+而 `blockedFingerIds` 只在**手指抬起**时清（`SyncFingers` 里的 `RemoveWhere`）。
+所以判定重放里：一根手指在 `[第一次踩进去, 抬起)` 这一段里一个音符都判不到，
+**中途挪出去也不算数**。
+
+实现上这件事只有一份：`blocks.exposure(result, field)` 按"两次事件之间手指不动"逐段问
+`NoiseField.hits`（与游戏同一个 `blocking` 谓词），给出每根手指的死亡区间；判定的四个
+消费点（`Fingers.down_at`、`Fingers.downs`、`flick_edges`、`judge_drags`）都从它过滤。
+两次事件之间位置不变，所以按事件分段问一次就够，比按帧扫更准，也不必猜帧相位。
+
+### 机制一份、策略四份（2026-10-14 拆开）
+
+> 想从"游戏怎么判"读起的话，先看 [判定机制.md](判定机制.md)：TL;DR（四类音符 + 噪域各是怎么判的）
+> 与底层细节（容差、窗口、地址）都在那儿；这一节只讲工程上怎么分工。
+
+噪域这条链上只有**游戏机制**是共用的，都在 `blocks.py`：
+
+* `BlockArea`：两个百分比角点 + 四个时刻 + `isSubtract` + 三组键帧（scale → rotate → move）、
+  缓动表、`Mirror`，以及 `local` / `contains_original` / `contains_touch`（含 inset）；
+* `NoiseField`：`blocking`（照抄 `TryGetBlockingBlock` 的两道奇偶门）、`hits`、`blocks_at`、
+  `active_near` / `active_windows`、`mirrored`；
+* `exposure`：把机制套在一条事件流上，算"哪根手指哪一段死了"（判定侧也在用）。
+
+**"遇到噪域怎么办"不是机制，是规划** —— 禁区算多保守、手指往哪挪、将死的要不要提前松、
+收尾怎么补按，都跟本规划器的时间栅格与手指表绑在一起。所以这一段归四个规划器**各自所有**：
+`geometric.py` / `geometric_pure.py` / `radical.py` / `conservative.py` 里各有一个自己的
+`NoiseGuard`（`forbidden` / `clear` / `doomed` / `area` / `place`）和 `finish_noise` /
+`repair_noise`。四份**初始内容逐字相同**（都是从 `blocks.py` 原样搬过来的），但从此各改各的。
+
+拆开的代价是同一个改动要改四处、四份也可能各自漂移。兜住它的是两条流水线：`tests/noise.py`
+里凡是对**策略**的判据都挨个跑四个规划器（`_policies(...)`），`break_noise.py` 也把策略类
+破坏对四份挨个来一遍（22 条改法 → 40 次破坏，必须全红）。
+
+### 规划器：沿**法向**挪，不损失判定
+
+垂直判定下唯一进判定的是**横向**偏差（`spine_offset`，见「垂直判定」），而沿判定线的
+**法向**平移一点都不会改变它 —— 这是白拿的自由度。所以按下点落进噪域时，各规划器自己的
+`NoiseGuard.clear` 沿法向找最近的一个干净点（还在屏上就行），判定完全不受影响。
+比"另找一个落点"便宜，也比"换个手指"可控。
+
+### 规划器：兜底那一遍 `finish_noise`
+
+规划阶段没法预知每一处：手指可能"歇"在屏幕上等着被征用，而噪域在它**按住期间**扫过来；
+或者一个 long hold / 长 drag 正好横穿过去。所以四个规划器收尾各调自己的 `finish_noise`
+（四份内容一样，实现各一份）：用精确谓词找出"会死"的手指，**在死之前补一条 UP、出来之后
+再补一条 DOWN** —— `blockedFingerIds` 是抬起时清的，于是这根手指又活了。安全性在于：手指在
+`[死, 抬起)` 本来什么都判不到，提前松开不会丢掉**本来能判到**的东西（只可能多出一条按下，
+蹭不蹭键交给裁判看）。只在"重新按下去的那一点是干净的"时才动手，改完再验一遍。
+
+### 保守禁区 vs 精确谓词：两套，各管一段
+
+* **规划器**用自己那份 `NoiseGuard.forbidden`：把每块在时间窗里的**原矩形**并起来、再外扩
+  本规划器的 `noise_margin`，`isSubtract` 的块**照样并进去**。这一侧不猜奇偶，宁可多绕；而且
+  它**天然是真命中集的超集**：`TryGetBlockingBlock` 的第一道门 `(v24 ^ v23) & 1 != 0` 要求
+  这一点落在某个块的**原矩形**里（`v24 = 0` 时得 `v23` 为奇数，那也已经在某个 subtract 的
+  原矩形里），所以真命中集 ⊆ 原矩形的并集，跟 inset 无关（非 subtract 的块还会往里收一圈）。
+* **裁判**用 `NoiseField.blocking`：逐字照抄 `TryGetBlockingBlock` 的两道奇偶门与
+  `v25 ?? v53` 的取值，`isSubtract` 的伸缩方向按符号来。跟游戏一模一样才算数。
+
+参数（控制台 `option` / `config.json` 的 `planner_options`）：`avoid_noise`（默认开）、
+`noise_margin`（默认 0.3 虚拟屏单位，**保险**而非必需：inset 的真值已经有了 —— 0.05 / 0.25，
+见 `blocks.INSET_RATIO` / `INSET_CAP` —— 这一圈只用来盖住 60Hz 采样步长和几何误差）。
+
+### 实测与还没验的
+
+实机之外能验的都验了：`tests/noise.py` 一组判据（缓动表、百分比映射、两个时间窗、
+inset 的伸缩、奇偶抵消与"扩出来那一圈不吃"、键帧几何、镜像对称、"进噪域→废到抬起→
+抬起复活"的四段时序、规划器沿法向躲避、flick 划动那一段也得干净、**保守禁区 ⊇ 真命中集的
+网格对拍**（`margin=0` 一个点都不许漏）、`repair_noise`/`finish_noise` 单元（四份各跑一遍）），
+22 条改法 × 四份策略 = **40 次破坏全红**。真谱面（`TrueHomeTrueWorldRework.816ThreeNumbers.0` IN，
+1142 音符 / 23 块噪域）上：
+
+| 规划器 | 4.0.1 C9S | 4.0.0 DESTRUCTION 3,2,1（1532 音符 / 0 块） |
+|---|---|---|
+| `geometric` | **1142 Perfect（100%）** | 1532 Perfect |
+| `geometric_pure` | **1142 Perfect（100%）** | 1532 Perfect |
+| `radical` | **1142 Perfect（100%）** | 1532 Perfect |
+| `conservative` | 1140（丢 2） | 1532 Perfect |
+
+四个规划器都在按下时沿法向躲（各自那份 `NoiseGuard.place`；flick 还会检查划动那一段），收尾都过
+各自的 `finish_noise`（`radical` 靠它救回十几段手指）。4.0.0 那张（`blockAreaList` 为空）四个规划器
+都是 1532/1532，一点没退步。
+
+两个 inset 常量已经**有真值**了：`JudgeControl::JudgeControl`（`0x1d73e88`，
+`_ZN12JudgeControlC1Ev`）里一句 8 字节写
+
+```c
+*(_QWORD *)&this->blockTouchInsetScreenHeightRatio = 0x3E8000003D4CCCCDLL;
+```
+
+低 32 位 `0x3D4CCCCD` = **0.05** 给 `blockTouchInsetScreenHeightRatio`，高 32 位 `0x3E800000`
+= **0.25** 给紧挨着的 `maxBlockTouchInsetLocal`：两个字段相邻，编译器把两次 4 字节写合并成了
+一次，所以第二个字段在反编译里**看不到自己的赋值** —— 一开始就是被这一点骗了，跑去资源里找了
+一轮。于是 `half = 0.5 ± min(0.05 × 屏高 / |lossyScale|, 0.25)`，`blocks.INSET_RATIO` /
+`INSET_CAP` 就是这两个数。
+
+顺带修掉一处**判定侧的真错**：inset 除的是**当前**的 `lossyScale`（键帧缩放算完之后的世界
+尺寸），不是基础矩形的 `Δp` —— 早先按 `Δp` 算，只在倍率为 1 时才对得上（自检里补了"0.5 倍缩放"
+那条判据，改回基础矩形就红）。
+
+> **要读进程里的活状态，就挂在函数入口，别去枚举实例**（2026-10-14 实机踩过）：当时为了拿
+> `JudgeControl` 的实例用了 `Il2Cpp.gc.choose(JudgeControl)` —— 那是**一次 stop-the-world 的
+> GC 活跃性计算**，在 Unity 2022.3 上直接把主线程挂死（屏幕上出现噪域时卡死、`agent 超过 2s
+> 没应答`、收工都断不干净），而且它返回的还是 0 个实例。这两个常量本来就不用读进程（构造函数
+> 里就有）；真要读运行时状态（哪块噪域正在拦哪根手指），就 hook `TryGetBlockingBlock` /
+> `TryGetBlockTouchHalfSize` 这种入口 —— `this` 是参数白送的，不用找实例。那条 `noise` 指令
+> 已经删掉，不留后患。
+
+**y 方向**（0 = 下边缘）不用再等截图了，静态就能定：`PreviewBlockControl::UpdateBlocksTransform`
+（`0x1cdb5b0`）和 `GetBlockGeometry`（`0x1cdbb38`）都把百分比按 ``(p − 0.5) ⊙ (screenWidth,
+screenHeight)`` 换成世界坐标（`AnchorToWorld` 也是这个式子）—— 和音符、判定线**共用一个空间**：
+`p.y` 越大越靠上、`0.5` 是画面中线。我的虚屏是 0 基准（0 = 下边缘），方向一致，只差一个常量
+偏移。顺带一条**尺度无关性**：`inset = ratio × 屏高 / |lossyScale|` 的分子分母随屏高一起缩放，
+`cap` 又是局部单位，所以设备拿 `A = min(宽高比, 16/9)` 留黑边这件事不影响噪域几何（只影响
+`noise_margin` 那个世界单位的余量）。
+
+**没验的**：实机逐音符对账（`judge.py --compare`）。
+
+还有一处**已知的、不打算现在动**的：`conservative` 剩 2 个丢音（143.727s 的 DRAG @线0 上、
+72.409s 的 FLICK @线2 上，都在密集段里，法向和划动路径全被盖住）。要再收掉得把"沿法向挪"
+升级成"在判定区窄带里做二维搜索"（像 `_danger_strips` 那样扣掉禁区再取最近点）——
+那是给落点找更远的出路，代价是每次按下都多一次多边形运算。`geometric` / `geometric_pure` /
+`radical` 在同一张谱面上都是 1142/1142，所以这一条不急。
+
+（inset 拿到真值、并且改成按**当前** `lossyScale` 算之后，真命中集比视觉上的那块矩形**小一圈**
+—— 非 subtract 的块往里收 `min(0.05 × 屏高 / |lossyScale|, 0.25)`。`radical` 之前丢的那 2 个
+（76.364s HOLD / 72.409s FLICK @线2）就是这么回来的，现在它 0 丢音；`geometric` /
+`geometric_pure` 各有 2 段"被吃掉的手指"（66.29s、68.12s，都在 1009 号指针上），但都只在一瞬，
+裁判那边没丢。）
+
 ## 规划器
 
 三个都"吸收自" [phisap](https://github.com/kvarenzn/phisap) 的三个算法，但按本项目的
@@ -727,9 +866,10 @@ adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / \
 # 连上 127.0.0.1:<port>，先读掉一个哨兵字节再开始发
 ```
 
-两个路径是项目里的固定常量（`../src/backends/scrcpy.py` 顶部）：`adb` 用
-`C:\UserData\platform-tools\adb.exe`，server 用**与 `scrcpy.py` 同目录**的 `scrcpy-server-v4.1`
-（从 scrcpy release 里拿出来、不用改扩展名）。自检：
+两个路径里，`adb` **只从 `PATH` 里找**（`shutil.which`，找不到就报错退出，绝不留一个写死的
+后路 —— 它搬过家，写死的那一份一旦过期，"找不到 adb"会伪装成"一台设备都没有"），server 用
+**与 `scrcpy.py` 同目录**的 `scrcpy-server-v4.1`（从 scrcpy release 里拿出来、不用改扩展名）。
+自检：
 
 ```sh
 cd src
@@ -1007,7 +1147,7 @@ python src/selftest.py
 | 播放器 | 用记录后端跑一遍：每批事件比"游戏时钟走到那一刻"早 `latency` 秒发出（±30ms），`--mirror` 时坐标 `x → 16 − x`；外加**收尾那一发"把按着的手指全抬起来"**：计划自己留了没抬的、两根都还按着的、以及注入关着（一根都没按过，不许凭空发） |
 | 控制台 | 命令解析与那几个运行时旋钮：`latency` 的三种写法（`0.02` / `20ms` / `+5ms`）、`inject` / `gate` / `verbose` / `planner` 生效、`gate` 看不懂或不带参数时设置不动、换到不存在的规划器时设置不动、`devices` / `device` / `spawn` / `attach [pid]` / `backend` / `cache` / `save-chart` / `host` 各走各的（含"没有会话时换后端不该去重开"）、会落盘的真的落盘而 `inject` / `gate` / `verbose` 绝不落盘、打错/打空/打注释都不炸；回显三条规矩 —— 每条命令都得有回话（包括 `status_lines()` 给空的时候）、管道模式下命令要回显、别的线程打印完提示符必须画回来、`log()` 必须当场 flush；**空读不退出**：管道读到 EOF 要停靠（不退出、说清楚怎么收工）、终端上一次空读要接着读；再加一条**源码级检查**：任何 `subprocess` 调用都不许继承 stdin |
 | 附加目标 | 先问应用列表（包管理器给的 identifier → pid）、再问进程列表（精确名 → `包名:子进程` 前缀）、最后才按名字找；实机那种"进程名是应用标签 `Phigros`、包名不在进程列表里"必须附加得上；给了 pid 就跳过查找；两边都读不到时不瞎猜；失败清单里必须有 pid / 包名 / `--pid` 提示 |
-| 设备 | 列设备 / 选设备之前必须先确保 adb server 在跑（冷启动时它没起来，frida 走 USB 一台都看不到）：`adb start-server` 只调一次、成了才记账，失败（adb 不在、超时）不许抛异常也不许记成成功；一台都列不到**并且** adb 起不来时，这两件事要一起说出来；列到设备了就闭嘴。顶掉 `subprocess.run` 与 frida 的设备管理器，不碰真设备 |
+| 设备 | **adb 只从 `PATH` 里找**：`shutil.which` 找不到就抛 `AdbNotFound`，`start()` 头一件事查到它就直接报错退出（退出码 2，且根本不碰 frida）；列设备时也要指名道姓说"PATH 里没有 adb"，不许含糊成"server 没起来"；外加一条**源码级检查**：`src/` 里任何 `.py` 都不许出现盘符路径（adb 的位置只有 PATH 这一个来源）。另一半是冷启动那一下：列设备 / 选设备之前必须先确保 adb server 在跑（server 没起来，frida 走 USB 一台都看不到）：`adb start-server` 只调一次、成了才记账，失败（超时）不许抛异常也不许记成成功；一台都列不到**并且** server 起不来时，这两件事要一起说出来；列到设备了就闭嘴。顶掉 `shutil.which`、`subprocess.run` 与 frida 的设备管理器，不碰真设备 |
 | 配置 | `../config.json` 不存在时按默认值建一份、往返一致、坏文件先备份成 `.bak` 再重建、不认识的字段忽略而认识的照收；`inject` / `verbose` **不许**出现在落盘字段里 |
 | 日志 | 抄的是**到达屏幕的一切**（直接 `print` 的也要在里面，`scrcpy.py` 就属于这种）、一行里只留最后一个 `\r` 之后的内容（控制台擦提示符的回车不进文件）、`stop_file_log()` 之后不再写、`log_path()` 跟着开关走 |
 | 存活探测 | 三种结局都认得出来：答了 `pong` = `ok`、没有会话 = `dead`、`ping` 抛异常 = `dead`（并记下原因）、`ping` 卡住 = `hang` 且按超时返回；另外钉住"收工只收一次" |
@@ -1709,4 +1849,33 @@ will bypass and go directly to the original implementation."；`Il2Cpp.Method.in
 主机拿它当存活探测：进程被杀了 frida 会自己报 detached，但进程被 Android 冻结（切后台缓存）时
 连接还在、脚本却不动了 —— 那种情况只有一次真调用才问得出来。闸门正按着 Unity 主线程时它也要能
 立刻应答，所以不能去碰任何 il2cpp 对象。
+
+### 设备与环境（Android 侧）
+
+#### 这台设备上 tombstone 拿不到，别在它身上浪费时间（2026-10-13 查过）
+
+CPH2491 上 **`/data/tombstones/` 从 2026-09-28 起再没进过一个文件**，而崩溃一直在发生
+（`logcat -b crash` 里 `F libc: Fatal signal 11 …` 一条不少）。管线本身是活的：`tombstoned` 在跑、
+目录可写、`debug.debuggerd.disable=0` —— 不是"没开"。真实的链条（`logcat -s tombstoned
+crash_dump64 DEBUG` 一看就明白）：
+
+1. 进程挨了致命信号 → libc 打印 `F libc: Fatal signal 11 (SIGSEGV) …`，fork+exec
+   `crash_dump64 <tid> <tid> <dump_type>`；
+2. `crash_dump64` 对**每个线程**都报 `failed to get the guest state header for thread …: Bad address`。
+   这条是**噪音**：它在问"这个线程跑的是不是 native bridge 翻译出来的客户机代码"（AOSP
+   `debuggerd/crash_dump.cpp` 读 `TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE` 指过去的
+   `NativeBridgeGuestStateHeader`，签名不对就 `return false`）；纯 arm64 上没有 guest，读到的是
+   垃圾指针，EFAULT 而已 —— 既不是"32/64 位不匹配"，也**不是**这次崩溃的原因；
+3. 真正致命的是紧随其后的 `waitpid failed on child: No child processes`（`crash_dump.cpp` 里那句
+   `PLOG(FATAL) "failed to waitpid on child"`）：转储器在写任何东西之前自己先死了；
+4. 它临死前还想跟 `tombstoned` 报个信，AOSP 那条路用的正是 `kDebuggerdAnyIntercept`，而这台机器的
+   `tombstoned` 回一句 `unexpected dump type: kDebuggerdAnyIntercept`，于是
+   `failed to connected to tombstoned to report failure` → `_exit(1)`。
+
+两条推论：**`logcat` 里的 `kDebuggerdAnyIntercept` + "unexpected dump type" 不是"有人在抓 ANR 栈"，
+而是 crash_dump 在报自己的失败**；同一个原因让 `/data/anr/` 几乎是空的（只剩一个 09-26 的文件）。
+第 3 步为什么会失败**没查出来**（怀疑与 root/内核侧对 `ptrace` 的干预有关，但没有证据）。
+
+要现场就只能自己 ptrace：frida 挂在目标进程上装 `Process.setExceptionHandler`，拿 `fault addr` +
+每个线程的 `模块!偏移` —— 这才是这台设备上的"tombstone"。（这次没做，先记着。）
 

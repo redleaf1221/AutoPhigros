@@ -19,9 +19,11 @@ pip install -r requirements.txt
 
 * **frida-server**：与客户端同版本（`17.10.1` 或 `17.17.0` 都实测可用），
   push 到设备、以 root 跑起来。Phigros 是 arm64。
-* **adb**：scrcpy 后端要用它。路径是 `src/backends/scrcpy.py` 顶部的 `ADB` 常量
-  （默认 `C:\UserData\platform-tools\adb.exe`）—— 不在这个位置就改那一行。
-  列设备（`devices`）和选设备（`device <id>`）之前会自动跑一次 `adb start-server`：
+* **adb**：scrcpy 后端要用它，**只从 `PATH` 里找**（`shutil.which("adb")`，代码里没有任何
+  写死的路径）—— 装一份 platform-tools，把它的目录加进 `PATH` 就行，搬去哪儿都不用改代码。
+  `python src/main.py` 起来的第一件事就是查它：**找不到就报错退出**（不然"没有 adb"会伪装成
+  "一台设备都没有"，人会跑去查线、查驱动、查 frida-server）。列设备（`devices`）和选设备
+  （`device <id>`）之前会自动跑一次 `adb start-server`：
   冷启动时 server 没起来，frida 走 USB 会一台设备都看不到。
 * **scrcpy server**：从 [scrcpy](https://github.com/Genymobile/scrcpy) v4.1 的 release
   里取 `scrcpy-server`，放到 `src/backends/scrcpy-server-v4.1`。
@@ -147,6 +149,15 @@ auto> help
 `option flick_repeats 3` 改一个、`option flick_repeats reset` 还原。同一份东西也在
 `config.json` 的 `planner_options` 里（`{"radical": {"flick_repeats": 3}}`），可以照着改。
 换参数会让那份规划结果的缓存失效并重算 —— 参数算进了 cache_key，但**不进文件名**。
+
+**4.0.1 起谱面里可能有噪域**（`blockAreaList`）：触点落进生效中的噪域，那根手指会被游戏
+摘掉，而且**废到抬起来为止**。规划器默认躲着它走（`geometric` 会沿判定线的法向把按下点
+挪出去，法向平移不影响判定），参数是 `avoid_noise` / `noise_margin`；四个规划器收尾都会
+再修一遍"按住期间被噪域扫到"的手指（提前松开、出来再按）。**躲法与收尾是各规划器自己的一份**
+（`NoiseGuard` / `finish_noise` 在四个规划器里各有一个），共用的只有"哪一点会被吃"这套机制
+（`blocks.py`）—— 换规划器就是换一套躲法。规划结果里如果还有绕不开的，
+会写成 `warnings`（`judge.py` 也照实报丢音）。详见
+[impl.md](impl.md#噪域401) 与[逆向报告](Phigros4.0-音游内核逆向报告.md) §11。
 
 **`inject` / `gate` / `verbose` 故意不落盘**：一个持久化的 `inject off` 会让人下一次以为在打歌、
 其实一根手指都没发出去；`gate` 关着是排查时用的临时状态，不该悄悄留到下次。

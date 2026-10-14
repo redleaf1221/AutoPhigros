@@ -15,6 +15,7 @@ import math
 from enum import IntEnum
 from typing import Any, NamedTuple
 
+from .blocks import BlockArea, MoveKey, NoiseField, RotateKey, ScaleKey
 from .geometry import Screen
 from .utils import Position, Vector
 
@@ -130,19 +131,29 @@ class JudgeLine:
 
 
 class Chart:
-    __slots__ = ("format_version", "offset", "screen", "lines")
+    __slots__ = ("format_version", "offset", "screen", "lines", "blocks")
 
     def __init__(
-        self, format_version: int, offset: float, screen: Screen, lines: list[JudgeLine]
+        self,
+        format_version: int,
+        offset: float,
+        screen: Screen,
+        lines: list[JudgeLine],
+        blocks: tuple[BlockArea, ...] = (),
     ) -> None:
         self.format_version = format_version
         self.offset = offset
         self.screen = screen
         self.lines = lines
+        self.blocks = blocks
 
     @property
     def note_count(self) -> int:
         return sum(len(line.notes) for line in self.lines)
+
+    def noise_field(self, **override: float) -> NoiseField:
+        """这张谱面的噪域。inset 那两个参数是**关卡场景**的（不是谱面的），所以从这里传。"""
+        return NoiseField(blocks=self.blocks, screen=self.screen, **override)  # type: ignore[arg-type]
 
     @classmethod
     def parse(cls, text: str) -> Chart:
@@ -160,7 +171,8 @@ class Chart:
         version = int(raw.get("formatVersion") or 0)
         offset = float(raw.get("offset") or 0.0)
         lines = [_parse_judge_line(entry, version) for entry in raw_lines]
-        return cls(version, offset, OFFICIAL_SCREEN, lines)
+        blocks = tuple(_parse_block(entry) for entry in raw.get("blockAreaList") or ())
+        return cls(version, offset, OFFICIAL_SCREEN, lines, blocks)
 
 
 def _parse_judge_line(raw: Any, version: int) -> JudgeLine:
@@ -223,6 +235,79 @@ def _position(x: float, y: float) -> Position:
     ``start2``/``end2`` 是 0~1 的纵向比例（**0 = 下边缘，1 = 上边缘**）；换算到虚拟屏就是
     干干净净的 ``(16x, 9y)``。"""
     return Position(x * OFFICIAL_SCREEN.width, y * OFFICIAL_SCREEN.height)
+
+
+# --------------------------------------------------------------- 噪域（blockAreaList）
+
+
+def _parse_percentage(raw: Any, key: str) -> tuple[float, float]:
+    """``{"x": .., "y": ..}``：噪域的角与事件锚点都是这种百分比。"""
+    value = (raw or {}).get(key)
+    if not isinstance(value, dict):
+        raise ChartFormatError(f"噪域缺少 {key}")
+    return float(value["x"]), float(value["y"])
+
+
+def _parse_block(raw: Any) -> BlockArea:
+    """一块噪域。时间字段的单位是**秒**（与 :attr:`Note.seconds` 同一个时间基），不是拍。
+
+    事件是**键帧**：``GameInformation::MoveEvent`` / ``ScaleEvent`` / ``RotateEvent`` 各存
+    "某个时刻的目标值"，而不是判定线那套 ``JudgeLineEvent`` 的 ``startTime``/``endTime``。
+    两族的字段名完全不同，别互相套。
+    """
+    if not isinstance(raw, dict):
+        raise ChartFormatError("blockAreaList 的元素不是对象")
+    try:
+        return BlockArea(
+            top_right=_parse_percentage(raw, "topRightPercentage"),
+            bottom_left=_parse_percentage(raw, "bottomLeftPercentage"),
+            appear=float(raw.get("appearTime") or 0.0),
+            enable=float(raw.get("enableTime") or 0.0),
+            disable=float(raw.get("disableTime") or 0.0),
+            disappear=float(raw.get("disappearTime") or 0.0),
+            subtract=bool(raw.get("isSubtract") or False),
+            moves=tuple(_parse_move(entry) for entry in raw.get("moveEvents") or ()),
+            scales=tuple(_parse_scale(entry) for entry in raw.get("scaleEvents") or ()),
+            rotates=tuple(_parse_rotate(entry) for entry in raw.get("rotateEvents") or ()),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ChartFormatError(f"噪域解析失败：{raw!r}（{error}）") from error
+
+
+def _parse_move(raw: Any) -> MoveKey:
+    x, y = _parse_percentage(raw, "endPosition")
+    return MoveKey(
+        seconds=float(raw["time"]),
+        x=x,
+        y=y,
+        ease_x=int(raw.get("easeTypeX") or 0),
+        ease_y=int(raw.get("easeTypeY") or 0),
+    )
+
+
+def _parse_scale(raw: Any) -> ScaleKey:
+    anchor_x, anchor_y = _parse_percentage(raw, "anchor")
+    x, y = _parse_percentage(raw, "scale")
+    return ScaleKey(
+        seconds=float(raw["time"]),
+        x=x,
+        y=y,
+        anchor_x=anchor_x,
+        anchor_y=anchor_y,
+        ease_x=int(raw.get("easeTypeX") or 0),
+        ease_y=int(raw.get("easeTypeY") or 0),
+    )
+
+
+def _parse_rotate(raw: Any) -> RotateKey:
+    anchor_x, anchor_y = _parse_percentage(raw, "anchor")
+    return RotateKey(
+        seconds=float(raw["time"]),
+        degrees=float(raw.get("rotation") or 0.0),
+        anchor_x=anchor_x,
+        anchor_y=anchor_y,
+        ease=int(raw.get("easeType") or 0),
+    )
 
 
 def _legacy_position(value: float) -> Position:

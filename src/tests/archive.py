@@ -84,6 +84,10 @@ def mirror_chart(text: str) -> str:
 
     ``Chart::Mirror`` @ ``0x1d286ac`` 只动三样：移动事件 ``x → 1 − x``、旋转事件 ``θ → −θ``、
     音符 ``positionX → −positionX``；v1 老谱另走 ``oldVersion`` 那一支（见 :func:`_legacy_mirror`）。
+
+    ``blockAreaList``（4.0.1 的噪域）走 ``GameInformation::BlockArea::Mirror``（``0x1cbe3e4``）：
+    两个角的 x 互换取反、rotate 的 ``anchor.x`` 取反且角度取反、move 的 ``endPosition.x`` 取反、
+    scale **只**取反 ``anchor.x``（倍率不动）。**y 一律不翻**。
     """
     chart = json.loads(text)
     old_version = int(chart.get("formatVersion") or 0) == 1
@@ -101,6 +105,17 @@ def mirror_chart(text: str) -> str:
         for key in ("notesAbove", "notesBelow"):
             for note in line.get(key) or ():
                 note["positionX"] = -note["positionX"]
+
+    for block in chart.get("blockAreaList") or ():
+        top, bottom = block["topRightPercentage"], block["bottomLeftPercentage"]
+        top["x"], bottom["x"] = 1.0 - bottom["x"], 1.0 - top["x"]
+        for event in block.get("moveEvents") or ():
+            event["endPosition"]["x"] = 1.0 - event["endPosition"]["x"]
+        for event in block.get("scaleEvents") or ():
+            event["anchor"]["x"] = 1.0 - event["anchor"]["x"]
+        for event in block.get("rotateEvents") or ():
+            event["anchor"]["x"] = 1.0 - event["anchor"]["x"]
+            event["rotation"] = -event["rotation"]
     return json.dumps(chart)
 
 

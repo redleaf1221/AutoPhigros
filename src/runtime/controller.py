@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import frida
@@ -16,7 +17,7 @@ import frida
 import backends
 import planner
 import touch
-from backends.scrcpy import ADB, start_adb_server
+from backends.scrcpy import AdbNotFound, adb_path, start_adb_server
 from .agent import Agent, LevelStart, MIN_LATENCY_SAMPLES, PING_TIMEOUT, READY_TIMEOUT, TESTED_FRIDA
 from algorithms.chart import OFFICIAL_SCREEN
 from algorithms.utils import PlanResult
@@ -51,13 +52,34 @@ REANCHOR_WARN = 0.02
 """时钟重锚挪动超过这么多秒就报警：重锚会让接下来一小段的事件整体偏晚，"最大迟到"看不见它。"""
 
 
-def _ensure_adb() -> bool:
-    """设备枚举之前先保证 adb server 在跑，返回这一趟成不成。
+def require_adb() -> Path:
+    """确认 PATH 里有 adb 并返回它的路径；**找不到就报错退出**。
 
-    冷启动时它没起来，frida 走 USB 一台设备都看不到 —— 列表空着，人只会以为线没插好。
-    失败不在这里报：列表非空时它无关紧要，空的时候 :meth:`Controller.list_devices` 一起说。
+    只认 PATH，不写死也不去猜常见位置：猜错的话"找不到 adb"会伪装成"一台设备都没有"，人就
+    跑去查线、查驱动、查 frida-server 了。退出是因为整个主干都靠它 —— 枚举设备要它把 adb
+    server 拉起来，触控后端要它推 server、开 forward，没有它这一趟什么都做不了。
     """
-    return start_adb_server()
+    try:
+        return adb_path()
+    except AdbNotFound as error:
+        log(f"[main] {error}", file=sys.stderr)
+        log("[main] 这一趟没法继续：设备、注入、触控都走 adb", file=sys.stderr)
+        raise SystemExit(2) from error
+
+
+def _ensure_adb() -> str | None:
+    """让 adb server 跑起来；返回"没弄好"的一句话（弄好了就是 None）。
+
+    冷启动时 server 还没起来，frida 走 USB 会**一台设备都看不到** —— 列表空着，人只会以为线
+    没插好。失败不在这里报：列表非空时它无关紧要，真的列不到设备时
+    :meth:`Controller.list_devices` 会连着一起说；adb 整个不在也走这条路（说清是 PATH 里没有）。
+    """
+    if start_adb_server():
+        return None
+    try:
+        return f"adb start-server 没成功（{adb_path()}）"
+    except AdbNotFound as error:
+        return str(error)
 
 
 class Controller:
@@ -181,7 +203,7 @@ class Controller:
         滤掉 ``local`` / ``socket`` / ``barebone``：跟 Phigros 没关系却永远存在（Windows 上都报
         ``remote``），留着的话"只有一台就自动选中"永远不会触发；远程 server 用加进去时返回的认。
         """
-        adb = _ensure_adb()
+        trouble = _ensure_adb()
         manager = frida.get_device_manager()
         found: dict[str, frida.core.Device] = {}
         for host in self.config.hosts:
@@ -194,8 +216,8 @@ class Controller:
         for device in manager.enumerate_devices():
             if device.type == "usb":
                 found[device.id] = device
-        if not found and not adb:
-            log(f"[main] 一台设备都没有，而且 adb start-server 没成功（{ADB}）", file=sys.stderr)
+        if not found and trouble:
+            log(f"[main] 一台设备都没有，而且 {trouble}", file=sys.stderr)
         return list(found.values())
 
     def add_host(self, host: str) -> bool:
@@ -468,7 +490,11 @@ class Controller:
 
         **主干是控制台**（跑在主线程上读输入），所以这里只起后台件；poll 退到守护线程后
         Ctrl+C 天然落在"正在读输入的那个线程"上。
+
+        头一件事是把 adb 落实了：PATH 里没有它就直接报错退出（顺手把用的是哪一个写进日志 ——
+        它会搬家，出了事第一个要确认的就是我们找的是哪一个）。
         """
+        log(f"[main] adb：{require_adb()}")
         if self.config.device:
             log(f"[config] 上次选的是 {self.config.device}，试着连回来")
             if not self.select_device(self.config.device):

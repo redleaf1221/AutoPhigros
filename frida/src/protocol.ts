@@ -6,20 +6,42 @@
  * 6 游戏时钟（clock.ts）、7/8 判定与结算（score.ts）、9/10 播放状态与关卡销毁（level.ts）。
  * ========================================================================== */
 
-/* 参考地址 A：谱面加载链（Phigros 4.0 / libil2cpp.so，MD5 4086181c2803dc92561c0e23488fe74c）
- *   UnityEngine.JsonUtility::FromJson(String, Type)  0x3a5025c   hook 1
- *   Chart::GetNoteCount()                            0x1d28918   hook 2
- *   SongsItem::GetLevelStartInfo(Int32)              0x1c9bd80   hook 3
- *   LevelControl::SortForNoteWithFloorPosition()     0x1d25350   hook 4，闸门
- *   LevelControl::SetCodeForNote()                   0x1d2516c   发 noteCode，在 hook 5 之前
- *   LevelControl::SetInformation()                   0x1d2563c   hook 5，音符表
+/* 参考地址 A：谱面加载链（Phigros 4.0.1 / libil2cpp.so，MD5 a743ac04b53ab246c107f9372f050d9e）
+ *   UnityEngine.JsonUtility::FromJson(String, Type)  0x3cacb04   hook 1
+ *   Chart::GetNoteCount()                            0x1d7a258   hook 2
+ *   SongsItem::GetLevelStartInfo(Int32)              0x1cb6d48   hook 3
+ *   LevelControl::SortForNoteWithFloorPosition()     0x1d76c90   hook 4，闸门
+ *   LevelControl::SetCodeForNote()                   0x1d76aac   发 noteCode，在 hook 5 之前
+ *   LevelControl::SetInformation()                   0x1d76f7c   hook 5，音符表
+ *
+ * 4.0.0 的那一套（MD5 4086181c2803dc92561c0e23488fe74c）见 docs/Phigros4.0-音游内核逆向报告.md。
+ * **hook 一律按"类名 + 方法名 + 参数个数"找**（`findClass(...).method(name, n)`），不认地址 ——
+ * 4.0.0 → 4.0.1 这十个目标的名字与签名逐个对得上，所以换版本 agent 不用改，只需要换这份注释。
  */
-/* 参考地址 B：时钟 / 判定 / 结算 / 关卡
- *   ProgressControl::Update()                        0x1d3483c   hook 6
- *   ScoreControl::Perfect / Good / Bad / Miss        0x1d30a84 / 0x1d30c3c / 0x1d30e20 / 0x1d30ff0   hook 7
- *   ScoreControl::GetLevelResultInfo()               0x1d3505c   hook 8
- *   ProgressControl::Play(bool)                      0x1d34270   hook 9
- *   LevelControl::OnDestroy()                        0x1d25118   hook 10
+/* 参考地址 B：时钟 / 判定 / 结算 / 关卡（4.0.1）
+ *   ProgressControl::Update()                        0x1d85b5c   hook 6
+ *   ScoreControl::Perfect / Good / Bad / Miss        0x1d87864 / 0x1d87680 / 0x1d8758c / 0x1d874ac   hook 7
+ *   ScoreControl::GetLevelResultInfo()               0x1d86388   hook 8
+ *   ProgressControl::Play(bool)                      0x1d859d0   hook 9
+ *   LevelControl::OnDestroy()                        0x1d76a58   hook 10
+ *   LevelStartInfo::get_mirror()                     0x1cbf1e8   镜像开关
+ *   LevelControl::Start() 0x1d769d0   SetCodeForNote() 0x1d76aac
+ */
+/* 参考地址 C：噪域（4.0.1 新增的判定机制，见 algorithms/blocks.py）
+ *   JudgeControl::Update()                   0x1d71d20   每帧：CheckBlocks → 判音符
+ *   JudgeControl::CheckBlocks()              0x1d72100   摘掉被吃掉的手指
+ *   JudgeControl::ProcessBlockedTouches()    0x1d73398   拿原始 touches 逐个测
+ *   JudgeControl::TryGetBlockingBlock()      0x1d735d8   奇偶判定（isSubtract 是洞）
+ *   JudgeControl::IsPositionInsideBlock / Original   0x1d73c7c / 0x1d73b80
+ *   JudgeControl::TryGetBlockTouchHalfSize() 0x1d73d08   inset = ratio × 屏高 / 块尺寸
+ *   JudgeControl::UpdateLowPassFilterState() 0x1d7332c   进出噪域时的低通滤波（音效侧）
+ *   PreviewBlockControl::Update / UpdateBlocksTransform / UpdateBlockAnimations
+ *                                            0x1cdb588 / 0x1cdb5b0 / 0x1cdb864
+ *   PreviewBlockControl::IsTimeValid / IsActive / GetBlockGeometry / SafeDiv /
+ *                       CalculateEasedProgress
+ *                                            0x1cdbaf4 / 0x1cdcab8 / 0x1cdbb38 / 0x1cdc518 / 0x1cdc850
+ *   GameInformation::BlockArea::Mirror()     0x1cbe3e4
+ *   GetEase::GetEaseWithProgress / Instantiation     0x1cc92fc / 0x1cc95e4
  */
 
 /* 消息一览（各字段的类型与含义见下方 interface）

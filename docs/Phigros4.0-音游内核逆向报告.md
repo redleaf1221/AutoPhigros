@@ -1336,6 +1336,176 @@ bool get_Passed()           { return _IntScore_k__BackingField > 699999; }   // 
 
 ---
 
-## 附：本次分析产出的伪代码
+## 11. 4.0.1 新增：噪域（`blockAreaList`）
+
+4.0.1 的 `libil2cpp.so` MD5 `a743ac04b53ab246c107f9372f050d9e`（4.0.0 是
+`4086181c2803dc92561c0e23488fe74c`）。谱面根上多了 `blockAreaList`，游戏里叫**噪域**
+（本地化：简中「噪域」/ 繁中「噪域」/ 日「ノイズフィールド」/ 韩「노이즈 필드」；挑战条件原文
+「不因噪域的影响而产生失误，并达到A等成绩」）。
+
+**4.0.0 里字段就已经在**（`Chart.blockAreaList`、`GameInformation.BlockArea` 两个版本逐字段一致），
+但 4.0.0 抓下来的 50 来张谱面里 `blockAreaList` **一张都没有** —— 变的是 4.0.1 的**判定侧**：
+多了一圈 inset、`isSubtract` 参与奇偶、以及"吃掉手指"的时序。
+
+### 11.1 数据
+
+```
+GameInformation.BlockArea {          // 谱面 JSON 里的 blockAreaList[i]
+    Vector2 topRightPercentage;      // 两个角，0~1 的屏幕比例（0 = 左/下边缘）
+    Vector2 bottomLeftPercentage;
+    float appearTime, enableTime, disableTime, disappearTime;   // **秒**，与 note.realTime 同一时间基
+    bool  isSubtract;
+    List<RotateEvent> rotateEvents;  // 键帧：{anchor:{x,y}, time, easeType, rotation}
+    List<MoveEvent>   moveEvents;    //       {endPosition:{x,y}, time, easeTypeX, easeTypeY}
+    List<ScaleEvent>  scaleEvents;   //       {anchor:{x,y}, time, easeTypeX, easeTypeY, scale:{x,y}}
+}
+```
+
+事件是**键帧**（"某时刻的目标值"），不是判定线那套 `JudgeLineEvent`
+（`startTime/endTime/start/end/start2/end2`，见 §2）—— 两族字段名完全不同，别互相套。
+真谱面样例（`TrueHomeTrueWorldRework.816ThreeNumbers.0` IN，23 块）：
+
+```json
+{"topRightPercentage":{"x":0.5,"y":0.0},"bottomLeftPercentage":{"x":0.0,"y":1.0},
+ "appearTime":73.09091,"enableTime":73.09091,"disableTime":84.27273,"disappearTime":85.36364,
+ "isSubtract":false,
+ "moveEvents":[{"endPosition":{"x":-0.5,"y":0.5},"time":73.09091,"easeTypeX":5,"easeTypeY":0}],
+ "scaleEvents":[{"anchor":{"x":0.0,"y":0.0},"time":73.09091,"easeTypeX":13,"easeTypeY":13,
+                 "scale":{"x":1.0,"y":1.0}}],
+ "rotateEvents":[{"anchor":{"x":0.19830528,"y":0.5490265},"time":73.09091,"easeType":0,"rotation":0.0}]}
+```
+
+百分比到世界坐标：`localPosition = (p − 0.5) × (screenWidth, screenHeight)`、
+`localScale = |Δp| × 同款`；`screenHeight` 就是相机半高的两倍（10 个世界单位），
+`screenWidth = 10 × min(宽高比, 16/9)`。折到 16×9 的虚拟屏上就是干净的
+`(p.x × 16, p.y × 9)`，与判定线的 `start/start2` 同一套（`0 = 下边缘`）。
+
+### 11.2 判定侧：吃掉手指
+
+`JudgeControl::Update`（`0x1d71d20`）每帧的顺序是
+**`CheckBlocks()` → `GetFingerPosition()` → 逐个 `CheckNote` / `CheckFlick`**：
+
+1. `ProcessBlockedTouches()`（`0x1d73398`）遍历**原始 `Input.touches`**（phase 只取
+   Began/Moved/Stationary），屏幕坐标经 `Camera::ScreenToWorldPoint` 换成世界坐标；
+2. 每个触点问 `TryGetBlockingBlock(worldPosition)`（`0x1d735d8`）；命中就把 fingerId 加进
+   `FingerManagement.blockedFingerIds`；
+3. `CheckBlocks()`（`0x1d72100`）随后把 `fingers` 列表里 id 在 `blockedFingerIds` 里的
+   **整条删掉**（`RemoveAt`）—— 当帧起这根手指不在判定里了，不是"判成 Bad"，是**根本没这只手**；
+4. `blockedFingerIds` **只在手指抬起时清**：`FingerManagement::SyncFingers` 里
+   `RemoveWhere(id => FindTouchIndexWithFingerId(id) == -1)`。所以**一进噪域就废到抬起来为止**，
+   中途挪出去也不算数。
+
+"这一块吃不吃的"规则（`TryGetBlockingBlock`）照抄如下，别按"几何直觉"重写：
+
+```
+v23 = Σ(原矩形命中 且 isSubtract)        v24 = OR(原矩形命中 且 !isSubtract)
+v22 = Σ(inset 矩形命中 且 isSubtract)    v25 = 第一个 inset 矩形命中 且 !isSubtract
+v53 = 第一个 inset 矩形命中 且 isSubtract
+if ((v24 ^ v23) & 1) == 0: 不吃                     // 光有 subtract 时"扩出来的那一圈"不吃
+if ((v22 & 1) == (v25 != null)): 不吃               // 一个 normal + 一个 subtract 重叠 = 洞
+否则：吃，返回 v25 ?? v53
+```
+
+两套矩形：
+
+* **原矩形**（`IsPositionInsideOriginalBlock` `0x1d73b80`）：`InverseTransformPoint` 之后
+  `|x| ≤ 0.5 && |y| ≤ 0.5`（还要求两个 `lossyScale` 分量都不为 0）；
+* **inset 矩形**（`IsPositionInsideBlock` `0x1d73c7c` + `TryGetBlockTouchHalfSize` `0x1d73d08`）：
+  `half = 0.5 + (isSubtract ? +1 : −1) × min(inset_local, maxBlockTouchInsetLocal)`，
+  其中 `inset_local_y = ratio × screenHeight / |lossyScale.y|`、
+  `inset_local_x = ratio × screenHeight / |lossyScale.x|`（`ratio` 就是
+  `JudgeControl.blockTouchInsetScreenHeightRatio`；`screenHeight` 是**场景的世界高度**，
+  `PreviewBlockControl.AnchorToWorld` 用它把百分比换成世界坐标）。换成百分比即
+  `ratio / (|Δp.y| × s_y)` 与 `ratio / (|Δp.x| × 宽高比 × s_x)`，`s` 是**该时刻**缩放键帧的
+  倍率 —— `lossyScale` 是键帧算完之后的当前世界尺寸，不是基础矩形。
+
+  两个常量的值在 `JudgeControl::JudgeControl`（`0x1d73e88`，`_ZN12JudgeControlC1Ev`）里
+  一次 8 字节写一起给出：
+
+  ```c
+  *(_QWORD *)&this->blockTouchInsetScreenHeightRatio = 0x3E8000003D4CCCCDLL;
+  ```
+
+  `ratio = 0x3D4CCCCD = 0.05f`，`maxBlockTouchInsetLocal = 0x3E800000 = 0.25f`（两个 float
+  在类里相邻，编译器把两次 4 字节写合并成了一次，所以第二个字段**没有自己的赋值语句** ——
+  照着"找一个字段的赋值点"去找会漏掉它）。
+
+顺带两件不判定但要看一眼的事：进出"有人踩着噪域"这个状态时，
+`UpdateLowPassFilterState`（`0x1d7332c`）会切 `ProgressControl.SetLowPassFilter` 并抛
+`TouchBlockStateChanged`；`ScoreControl::FreezeScore` / `BlockCombo`
+（`0x1d87d80` / `0x1d87e9c`）只动 UI（藏分数、藏连击），**分数与连击本身不受影响**。
+
+### 11.3 几何：键帧怎么叠
+
+`PreviewBlockControl::Update`（`0x1cdb588`）依次跑
+`UpdateBlocksTransform` → `UpdateBlockActivation` → `UpdateBlockAnimations`：
+
+* `UpdateBlocksTransform`（`0x1cdb5b0`）：不在 `[appearTime, disappearTime)` 里就把
+  `localPosition.x` 甩到 1000（等于"这块不存在"）；在窗口里则
+  `localPosition = (bottomLeft + topRight)/2 × screen`、`localScale = |topRight − bottomLeft| × screen`；
+* `UpdateBlockAnimations`（`0x1cdb864`）再按 **scale → rotate → move** 叠键帧，三者都是
+  "当前事件与下一个事件之间按缓动插值"（`FindCurrentEventIndex` `0x1fd9dd4` 取最后一个
+  `time ≤ nowTime` 的下标，末条就钉在末条）：
+  - **scale**：`step = clamp(ease(进度))`，`value = lerp(scale_i, scale_{i+1}, step)`，
+    `size = value ⊙ 基础尺寸`；中心绕 `anchor_i` 按 `value / scale_i` 缩放（
+    `ScaleAroundAnchor`），并且**第 0..i−1 对事件的比值一路累积**叠上去；
+  - **rotate**：`delta = (rot_{i+1} − rot_i) × step`，`degrees = rot_i + delta`，
+    中心绕 `anchor_i` 转 `delta`（`RotateAroundAnchor`，逆时针为正、角度是**绝对**值）；
+  - **move**：`endPosition` 是**绝对中心**，落点是"相对基础中心的位移"。
+* `SafeDiv`（`0x1cdc518`）：分母绝对值小于 `max(|d|×1e−6, ε×8)` 时返回 **1.0**（缩放事件里
+  0 是合法值，含义是"这一对事件之间不缩放"）。
+
+缓动是**查表 + 线性插值**：`GetEase::Instantiation`（`0x1cc95e4`）建 15 张 101 点的表，
+`GetEaseWithProgress(progress, type)`（`0x1cc92fc`）取 `i = ⌊progress × 100⌋`（向零截断）、
+越界夹到两端、在 `[i, i+1]` 之间线性插值。表的内容：
+
+| type | 含义 | 构造 |
+|---|---|---|
+| 0 | 线性 | `i/100` |
+| 1 / 4 / 7 / 10 | 2/3/4/5 次幂 in | `t^p` |
+| 2 / 5 / 8 / 11 | 同上的 out | `1 − (1−t)^p` |
+| 3 / 6 / 9 / 12 | 同上的 inout | 前半 `in[2k] × 0.5`，后半 `out[2k] × 0.5 + 0.5`，末点 1 |
+| 13 / 14 | 恒 0 / 恒 1 | |
+
+### 11.4 4.0.1 地址速查（噪域相关）
+
+| 功能 | 函数 | 地址 |
+|---|---|---|
+| 每帧入口（先块后音符） | `JudgeControl::Update` | `0x1d71d20` |
+| 摘掉被吃掉的手指 | `JudgeControl::CheckBlocks` | `0x1d72100` |
+| 遍历原始触点 | `JudgeControl::ProcessBlockedTouches` | `0x1d73398` |
+| 奇偶判定 | `JudgeControl::TryGetBlockingBlock` | `0x1d735d8` |
+| 原矩形 / inset 矩形 | `JudgeControl::IsPositionInsideOriginalBlock` / `IsPositionInsideBlock` | `0x1d73b80` / `0x1d73c7c` |
+| inset 半宽 | `JudgeControl::TryGetBlockTouchHalfSize` | `0x1d73d08` |
+| 四角（画用） | `JudgeControl::GetBlockTouchCorner` | `0x1d73e2c` |
+| 低通滤波状态 | `JudgeControl::UpdateLowPassFilterState` | `0x1d7332c` |
+| 每帧刷新 transform | `PreviewBlockControl::Update` | `0x1cdb588` |
+| 基础矩形 | `PreviewBlockControl::UpdateBlocksTransform` | `0x1cdb5b0` |
+| 叠键帧 | `PreviewBlockControl::UpdateBlockAnimations` | `0x1cdb864` |
+| 窗口判定 | `PreviewBlockControl::IsTimeValid` / `IsActive` | `0x1cdbaf4` / `0x1cdcab8` |
+| 百分比 → 尺寸/中心 | `PreviewBlockControl::GetBlockGeometry` | `0x1cdbb38` |
+| 除零保护 | `PreviewBlockControl::SafeDiv` | `0x1cdc518` |
+| 缓动进度 | `PreviewBlockControl::CalculateEasedProgress` | `0x1cdc850` |
+| 噪域镜像 | `GameInformation::BlockArea::Mirror` | `0x1cbe3e4` |
+| 缓动表 / 查表 | `GetEase::Instantiation` / `GetEaseWithProgress` | `0x1cc95e4` / `0x1cc92fc` |
+| 分数冻结 / 连击屏蔽（UI） | `ScoreControl::FreezeScore` / `BlockCombo` | `0x1d87d80` / `0x1d87e9c` |
+| 谱面加载链（4.0.1） | `JsonUtility::FromJson(String,Type)` / `Chart::GetNoteCount` / `SongsItem::GetLevelStartInfo` | `0x3cacb04` / `0x1d7a258` / `0x1cb6d48` |
+| 闸门 / 音符表 / 关谱 | `LevelControl::SortForNoteWithFloorPosition` / `SetInformation` / `OnDestroy` | `0x1d76c90` / `0x1d76f7c` / `0x1d76a58` |
+| 时钟 / 暂停闸 / 判决 / 结算 | `ProgressControl::Update` / `Play` / `ScoreControl::Perfect` / `GetLevelResultInfo` | `0x1d85b5c` / `0x1d859d0` / `0x1d87864` / `0x1d86388` |
+| 镜像开关 | `LevelStartInfo::get_mirror` | `0x1cbf1e8` |
+
+十个 hook 的目标在 4.0.1 里**名字与签名逐个一致**（mangled 名完全相同），所以 agent 不用改。
+
+### 11.5 还没验的
+
+两个 inset 常量的值已经拿到（见上一节：`0.05` / `0.25`，出处是构造函数那一句 8 字节写），
+`algorithms/blocks.py` 里就是这两个数。百分比的 **y 方向**（0 = 下边缘）也是静态就定的：
+`UpdateBlocksTransform`（`0x1cdb5b0`）与 `GetBlockGeometry`（`0x1cdbb38`）都用
+`(p − 0.5) ⊙ (screenWidth, screenHeight)` 把百分比换成世界坐标（`AnchorToWorld` 同式），
+和音符、判定线共用一个空间 —— `p.y` 越大越靠上。
+
+还没验的是**实机逐音符对账**（`judge.py --compare`）：设备上跑一遍完整演奏，看逐音符流水。
+
+---
 
 全部反编译产物已保存在 `C:\UserData\phigros\_re\`（约 30 个 `.c` 文件），文件名即 `<类名>_<方法名>.c`，可直接对照本报告的地址与行号。

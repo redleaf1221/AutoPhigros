@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
@@ -25,8 +26,8 @@ from algorithms.utils import Touch, TouchEvent
 
 from .utils import to_pixels
 
-ADB = Path(r"C:\UserData\platform-tools\adb.exe")
-"""adb 可执行文件；项目里其他脚本用的也是这一个。"""
+ADB_NAME = "adb"
+"""adb 的可执行文件名；**只从 PATH 里找它**（见 :func:`adb_path`），项目里没有第二处认路径。"""
 
 SERVER = Path(__file__).resolve().parent / "scrcpy-server-v4.1"
 """scrcpy 4.1 的 server（release 里那个 `scrcpy-server`，没有扩展名）；就放在本模块旁边。"""
@@ -59,8 +60,31 @@ class ScrcpyError(RuntimeError):
     """起不来、连不上、推不进去。"""
 
 
+class AdbNotFound(ScrcpyError):
+    """PATH 里没有 adb。
+
+    单独一类是因为它**不是"这台设备不行"，而是"这台机器还没准备好"**：上层要报错退出，而不是
+    当成一次普通的连接失败去重试、或者降级成"只采集不打"。
+    """
+
+
+def adb_path() -> Path:
+    """从 PATH 里找 adb；找不到就抛 :class:`AdbNotFound`。
+
+    只认 PATH（`shutil.which`）：装在哪、搬去哪都是人的事，写死在代码里就等着它搬家那天。
+    每次调用都重新找、不记账 —— 中途改了 PATH、或者刚装好 adb，下一次就该找得着。
+    """
+    found = shutil.which(ADB_NAME)
+    if found is None:
+        raise AdbNotFound(
+            f"PATH 里找不到 {ADB_NAME}：装一份 platform-tools，把它的目录加进 PATH"
+        )
+    return Path(found)
+
+
 def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
-    command = [str(ADB)]
+    adb = adb_path()
+    command = [str(adb)]
     if serial:
         command += ["-s", serial]
     command += list(args)
@@ -70,7 +94,7 @@ def _adb(*args: str, serial: str | None = None, timeout: float = 30.0) -> str:
             command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False
         )
     except FileNotFoundError as error:
-        raise ScrcpyError(f"找不到 adb：{ADB}") from error
+        raise ScrcpyError(f"找不到 adb：{adb}") from error
     except subprocess.TimeoutExpired as error:
         raise ScrcpyError(f"adb {' '.join(args)} 超时") from error
 
@@ -94,8 +118,12 @@ def start_adb_server() -> bool:
     if _ADB_SERVER_READY.is_set():
         return True
     try:
+        adb = adb_path()
+    except AdbNotFound:
+        return False
+    try:
         finished = subprocess.run(
-            [str(ADB), "start-server"],
+            [str(adb), "start-server"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=10.0,
@@ -143,8 +171,7 @@ class ScrcpyBackend:
     # ------------------------------------------------------------ 生命周期
 
     def open(self, screen: Screen) -> None:
-        if not ADB.is_file():
-            raise ScrcpyError(f"找不到 adb：{ADB}")
+        adb_path()  # 先确认 PATH 里有 adb：没有就地抛 AdbNotFound，别先去碰 server 和设备
         if not SERVER.is_file():
             raise ScrcpyError(f"找不到 scrcpy server：{SERVER}")
 
@@ -225,7 +252,7 @@ class ScrcpyBackend:
             return int(probe.getsockname()[1])
 
     def _spawn_server(self) -> subprocess.Popen[bytes]:
-        command = [str(ADB)]
+        command = [str(adb_path())]
         if self.serial:
             command += ["-s", self.serial]
         command += [
@@ -304,8 +331,10 @@ BACKEND = ScrcpyBackend
 
 def available() -> str | None:
     """探测能不能用；能用返回 None，否则返回原因（不抛异常，方便上层降级）。"""
-    if not ADB.is_file():
-        return f"找不到 adb：{ADB}"
+    try:
+        adb = adb_path()
+    except AdbNotFound as error:
+        return str(error)
     if not SERVER.is_file():
         return f"找不到 scrcpy server：{SERVER}"
     return None
@@ -314,7 +343,7 @@ def available() -> str | None:
 if __name__ == "__main__":
     # 直接跑这个文件是不行的（包内相对 import），要 `python -m backends.scrcpy`
     reason = available()
-    print(reason or f"scrcpy 后端就绪：adb={ADB} server={SERVER} ({VERSION})")
+    print(reason or f"scrcpy 后端就绪：adb={adb_path()} server={SERVER} ({VERSION})")
     if reason is None:
         try:
             print(f"    当前设备屏幕：{screen_size()}")
