@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from algorithms import conservative, geometric, radical
@@ -18,8 +19,9 @@ from algorithms.blocks import (
     ScaleKey,
     ease_progress,
 )
-from algorithms.chart import Chart, Note, NoteType
-from algorithms.judging import Verdict, simulate, spine_offset
+from algorithms.chart import Chart, JudgeLine, Note, NoteType, Track
+from algorithms.geometry import JudgeAreaBuilder
+from algorithms.judging import TAP_TOLERANCE, Verdict, simulate, spine_offset
 from algorithms.utils import PlanResult, SilentProgress, Touch, TouchEvent
 
 from .archive import mirror_chart
@@ -527,7 +529,7 @@ def check_noise() -> list[str]:
     report = simulate(covered, avoiding)
     expect(
         _verdict_of(report, 1.0) is Verdict.PERFECT and not report.blocked,
-        f"规划器该把这一下沿法向挪出噪域：判定 {_verdict_of(report, 1.0)}，暴露 {report.blocked}",
+        f"规划器该把这一下从噪域里挪出去：判定 {_verdict_of(report, 1.0)}，暴露 {report.blocked}",
     )
     # 反面：关掉规避（配置项）就必然丢 —— 证明上面那条是"躲"救回来的
     blind = create("geometric", {"avoid_noise": False}).plan(covered, SilentProgress())
@@ -538,22 +540,118 @@ def check_noise() -> list[str]:
         f"{_verdict_of(report, 1.0)}，暴露 {report.blocked}",
     )
 
-    # 低层一点：clear() 挪出去的点必须与原点的横向偏差一样（判定只认横向）
-    alone = _field(_block(0.45, 0.55, 0.3, 0.7, enable=0.0, disable=100.0), ratio=0.0, cap=0.0)
-    origin = complex(TAP_X, 4.5)
-    for who, policy in _policies(alone):
-        moved = policy.clear(origin, 1 + 0j, SCREEN, lo=0.0, hi=0.1, margin=0.05)
+    # 同一条链走 Petrichor 的形状：屏幕左半边被盖住、判定点压在盖住的边上。判定线是横的，
+    # 法向（竖直）整条都在噪域里 —— 只搜法向的实现会把这 20 个 TAP 全按在原处、被吃掉；
+    # 沿判定线挪出去就好。落点还必须**落在判定线上**（法向偏差 0 = 判定权最小）。
+    dodged = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [_line(TAP_X, PRESS_Y, [Note(NoteType.TAP, 1.0, 0.0, 0.0)])],
+        (_block(0.0, 0.55, 0.0, 1.0, enable=0.0, disable=100.0),),
+    )
+    expect(
+        dodged.noise_field().blocking(complex(TAP_X, PRESS_Y), 0.0) is not None,
+        "合成谱没造对：判定点应当落在「左半边」那块噪域的命中矩形里（inset 之后）",
+    )
+    plan = create("geometric", None).plan(dodged, SilentProgress())
+    report = simulate(dodged, plan)
+    downs = [
+        (stamp, event)
+        for stamp, batch in plan.frames
+        for event in batch
+        if event.action is Touch.DOWN
+    ]
+    expect(
+        _verdict_of(report, 1.0) is Verdict.PERFECT and not report.blocked,
+        f"沿判定线挪出去就干净了：判定 {_verdict_of(report, 1.0)}，暴露 {report.blocked}",
+    )
+    expect(
+        bool(downs)
+        and abs(downs[0][1].y - PRESS_Y) < 1e-6
+        and 0.3 < abs(downs[0][1].x - TAP_X) < 0.45,
+        f"这一下的落点该落在判定线上、横向**只让出必要的那一点**（真实需要 0.35）：{downs[:2]}",
+    )
+
+    # 低层一点：aim() 挑出来的点必须（a）不在噪域里、（b）判定线还有干净的部分时就落在线上
+    #（法向偏差 0 是"判定权"最小的位置）、（c）横向让出的量不超过游戏判得到的容差。
+    #
+    # 这一条构造的是"**法向被堵死、只有沿判定线**能出去"的那种几何（判定线横着、左半边被一块
+    # 噪域整条盖住）。它和老 `clear` 的差别很直接：老的那份只沿法向探，这种形状它必然报
+    # "挪不出去"。Petrichor 里那 14 个 TAP 是**反过来**的那一半（判定线竖直、法向能出去），
+    # 见下面 §9b。
+    origin = complex(TAP_X, PRESS_Y)
+    edge = _field(_block(0.0, 0.55, 0.0, 1.0, enable=0.0, disable=100.0), ratio=0.0, cap=0.0)
+    for who, policy in _policies(edge):
+        band = JudgeAreaBuilder(SCREEN).band(origin, 1 + 0j, half_width=TAP_TOLERANCE)
+        moved = policy.aim(band, origin, 1 + 0j, tick=0, span_ticks=1)
+        expect(
+            moved is not None and policy.clean(moved, 0.0, 0.05),
+            f"[{who}] 法向整条都在噪域里、沿判定线挪一下就好：aim 该给出一个干净的点：{moved}",
+        )
         expect(
             moved is not None
-            and abs(_lateral_gap(moved, origin)) < 1e-9,
-            f"[{who}] 沿法向挪出去的点横向偏差必须不变（判定线沿 +x）：{moved}",
+            and abs(moved.imag - PRESS_Y) < 1e-6
+            and 0.7 < _lateral_gap(moved, origin) < 0.9,
+            f"[{who}] 挪出去的点该落在判定线上（法向 0）、横向**只让出必要的那一点**"
+            f"（真实需要 0.8；带上保险余量就会更大）：{moved}",
         )
-    # 整块盖满屏（法向也躲不开）时返回 None，交给裁判报 Miss
+    # ---- 9b) Petrichor 那 14 个 TAP：**法向**是唯一出路，而且出路在 4.2~4.9 那么远
+    # 实测（真谱面，`_re/dbg_pick.py`）：判定线**竖直**（所以法向是水平的），质点 (3.2 或
+    # 12.8, 4.5)，沿法向要走 4.22~4.93 才出噪域，沿判定线 ±4 之内一个干净点都没有。老
+    # `NoiseGuard.clear` 方向没找错，是**两个自设的常量**把它卡住的：探针上限 `reach = 4.5`
+    # （出路正好骑在这个数上下）和 0.3 的保险余量（把出路又推远 0.3）—— 余量一开，14 个**全**
+    # 报"挪不出去"；余量关掉也有 5 个够不着（`_re/dbg_oldclear.py` 的重放）。
+    # 所以这里两头都要立判据：落点必须**只要必要的那一点**（不许被余量推远），而且**不许有
+    # "探到 4.5 就放弃"**这种上限。
+    def _vertical(notes: list[Note], y: float = PRESS_Y) -> JudgeLine:
+        """竖着的判定线：``rotation = e^{iπ/2} = i``，法向是 ±x（和 Petrichor 那几条一样）。"""
+        move, rotate = Track(), Track()
+        move.cut(0.0, 1000.0, complex(TAP_X, y), complex(TAP_X, y))
+        rotate.cut(0.0, 1000.0, math.pi / 2, math.pi / 2)
+        return JudgeLine(bpm=120.0, notes=notes, move=move, rotate=rotate)
+
+    # 原矩形 x ∈ [0, 13.2]（屏宽 16 → 82.5%）：inset 之后**命中矩形**的右边缘落在 12.75，
+    # 离判定点 4.75 —— 正好越过老代码那个 4.5 的探针上限。
+    far = Chart(
+        3,
+        0.0,
+        SCREEN,
+        [_vertical([Note(NoteType.TAP, 1.0, 0.0, 0.0)])],
+        (_block(0.0, 0.825, 0.0, 1.0, enable=0.0, disable=100.0),),
+    )
+    expect(
+        far.noise_field().blocking(complex(TAP_X, PRESS_Y), 1.0) is not None,
+        "合成谱没造对：判定点应当落在噪域的命中矩形里",
+    )
+    far_plan = create("geometric", None).plan(far, SilentProgress())
+    far_report = simulate(far, far_plan)
+    far_downs = [
+        (stamp, event)
+        for stamp, batch in far_plan.frames
+        for event in batch
+        if event.action is Touch.DOWN
+    ]
+    expect(
+        _verdict_of(far_report, 1.0) is Verdict.PERFECT and not far_report.blocked,
+        f"沿法向挪出去就干净了（判定不受影响）：判定 {_verdict_of(far_report, 1.0)}，"
+        f"暴露 {far_report.blocked}",
+    )
+    expect(
+        bool(far_downs)
+        and abs(far_downs[0][1].y - PRESS_Y) < 1e-6
+        and 4.6 < abs(far_downs[0][1].x - TAP_X) < 5.0,
+        f"沿法向挪：横向偏差必须一点不变，而且**只挪必要的那一点**（真实需要 4.75；"
+        f"带保险余量就会到 5.05）：{far_downs[:2]}",
+    )
+
+    # 整屏都被盖住时没有落点 → None（不许"照原样按下去"）
     everything = _field(_block(0.0, 1.0, enable=0.0, disable=100.0), ratio=0.0, cap=0.0)
     for who, policy in _policies(everything):
+        band = JudgeAreaBuilder(SCREEN).band(origin, 1 + 0j, half_width=TAP_TOLERANCE)
         expect(
-            policy.clear(origin, 1 + 0j, SCREEN, lo=0.0, hi=0.1, margin=0.0) is None,
-            f"[{who}] 整屏都被噪域盖住、法向也躲不开时应当返回 None（这一下没救）",
+            policy.aim(band, origin, 1 + 0j, tick=0, span_ticks=1) is None,
+            f"[{who}] 整屏都被噪域盖住时应当返回 None（这一下真没救，交给裁判报 Miss）",
         )
     # flick 的划动那一段也得干净：两段块中间留一条 0.9 宽的缝，按下点能躲进缝里，
     # 但一划（半径 1.6）就进了另一段 —— 这时候必须判定"没处躲"，而不是躲进缝里就算完
@@ -565,16 +663,14 @@ def check_noise() -> list[str]:
     )
     press = complex(8.0, 4.0)
     for who, policy in _policies(two_bands):
-        parked = policy.clear(press, 1 + 0j, SCREEN, lo=0.0, hi=0.1, margin=0.0)
+        band = JudgeAreaBuilder(SCREEN).band(press, 1 + 0j, half_width=TAP_TOLERANCE)
+        parked = policy.aim(band, press, 1 + 0j, tick=0, span_ticks=1)
         expect(
             parked is not None and abs(parked.imag - 4.0) < 0.2,
-            f"[{who}] 不管划动时，缝里那点就该被选中：{parked}",
+            f"[{who}] 不管划动时，缝里贴着边的那点就该被选中（法向只让出必要的一点）：{parked}",
         )
         expect(
-            policy.clear(
-                press, 1 + 0j, SCREEN, lo=0.0, hi=0.1, margin=0.0, extend=1.6, along=1j
-            )
-            is None,
+            policy.aim(band, press, 1 + 0j, tick=0, span_ticks=1, extend=1.6, along=1j) is None,
             f"[{who}] 把划动半径算进去之后，缝里那点（一划就进另一段）不该再算数 —— 应当返回 None",
         )
 
@@ -652,10 +748,10 @@ def check_noise() -> list[str]:
             f"[{who}] 修好的那一份也要过流自检：{check_stream(repaired_plans[who])}",
         )
 
-    # ---- 11) 保守禁区 ⊇ 真命中集：`margin=0` 也一个点都不能漏
-    # `forbidden()` 是规划器唯一看的东西（"这一片别踩"）。它必须**包住**裁判会吃人的每一个点，
+    # ---- 11) 禁区 ⊇ 真命中集：一个点都不能漏
+    # `forbidden()` 给的是"这一段里每一刻的命中区域的并集"，必须**包住**裁判会吃人的每一个点，
     # 否则规划器会心安理得地把落点放进一个真会被吃掉的位置。网格上把两个谓词对一遍：
-    # 凡是 `blocks_at` 说"吃"的点，都得落在 `forbidden(那么一刻, margin=0)` 里。
+    # 凡是 `blocks_at` 说"吃"的点，都得落在 `forbidden(那么一刻)` 里。
     from shapely.geometry import Point
 
     moving = _block(
@@ -682,7 +778,7 @@ def check_noise() -> list[str]:
         for index in range(16):
             seconds = index * 0.2
             # 窗口是**半开**的 `[lo, hi)`，`hi` 要给一点余量，否则 `enable == lo == hi` 会被当成空窗
-            area = policy.forbidden(seconds, seconds + 1e-6, margin=0.0)
+            area = policy.forbidden(seconds, seconds + 1e-6)
             for xi in range(41):
                 for yi in range(23):
                     point = complex(xi * 0.4, yi * 0.4)
@@ -697,7 +793,7 @@ def check_noise() -> list[str]:
                             )
     expect(
         eaten_points > 200 and leaked == 0,
-        f"保守禁区必须包住真命中集（margin=0）：{leaked} 个吃手点漏在禁区外"
+        f"禁区必须包住真命中集：{leaked} 个吃手点漏在禁区外"
         f"（四份策略共采样 {eaten_points} 个），例如 {samples}",
     )
 
@@ -789,7 +885,7 @@ def check_noise() -> list[str]:
         "盖满全屏的 subtract 单独在的地方应当吃人（否则这块谱面就没有危险区了）",
     )
     for who, policy in _policies(sheet):
-        area = policy.forbidden(1.0, 1.0 + 1e-6, margin=0.0)
+        area = policy.forbidden(1.0, 1.0 + 1e-6)
         expect(
             area is not None and not area.covers(Point(hole.real, hole.imag)),
             f"[{who}] 安全点被算进了禁区（整屏 subtract 被当成整屏危险）—— 这就是 Ametrine 那条误报",

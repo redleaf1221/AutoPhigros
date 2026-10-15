@@ -54,6 +54,11 @@ NEAR_TIME = 0.01
 """`CheckNote` / `CheckFlick` 里那条 10ms：`minDeltaTime` 守卫（`>= minDeltaTime + 0.01`）与
 "只有 10ms 内的候选才比度量"（`fabsf(realTime 差) > 0.01`）用的是同一个数。"""
 
+NORMAL_WEIGHT = 2.2
+"""挑候选的度量 `|Δx| + |Δy| / 2.2` 里那个 2.2（`CheckNote` 第 405-409 行）：法向偏差**除以它**
+才与横向偏差同权 —— 横向是严格判定的那一维，法向只在并列时用来分胜负。规划器挑落点用的也是
+这一个数（把法向压 2.2 倍之后，"度量最小"就是欧氏最近点）。"""
+
 FUTURE = 10000.0
 """那两个函数开头把 `minDeltaTime` 写成 `10000.0f`（`0x461C4000`）—— 初值只为了让**第一个**
 过门的候选无条件通过；每接受一个候选就把它改成那个候选的 `|realTime − nowTime|`。"""
@@ -485,7 +490,7 @@ def selection_metric(slot: Slot, position: complex, seconds: float) -> float:
     见 :func:`judge_taps` 与 :func:`lit_flicks`。"""
     return deviation(slot.geometry, slot.note, position, seconds) + normal_offset(
         slot.geometry, position, seconds
-    ) / 2.2
+    ) / NORMAL_WEIGHT
 
 
 def candidates_in_window(

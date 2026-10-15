@@ -12,17 +12,20 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping, NamedTuple
 
+from shapely.affinity import affine_transform
 from shapely.geometry import Point, Polygon
-from shapely.ops import unary_union
+from shapely.ops import nearest_points, unary_union
 
 from .blocks import (
     INSET_CAP,
     INSET_RATIO,
+    SAMPLE_MS,
     NoiseField,
     exposure,
 )
 from .chart import Chart, NoteType
-from .geometry import Screen, place_note
+from .geometry import JudgeAreaBuilder, Screen, interior_of, place_note
+from .judging import DRAG_TOLERANCE, NORMAL_WEIGHT, TAP_TOLERANCE
 from .track import EventTrack
 from .utils import (
     MIN_DWELL_MS,
@@ -49,12 +52,54 @@ from .utils import (
 # `tests/noise.py` 会挨个跑四个规划器，谁跟机制对不上就会红。
 
 
+EPSILON = 1e-4
+"""挑落点时把可玩区往内收的**数值**余量（虚拟屏单位，万分之一个格）。
+
+``area.difference(噪域)`` 出来的边界**正压在**噪域边上，而游戏的判据是闭区间
+（``|local| <= half``，边界也算被吃）；"多边形上离目标最近的点"于是常常正落在边界上。往里收
+这一丝是为了让最近点落在里面 —— 它跟"保险余量"不是一回事：按经验加的那圈
+``buffer(noise_margin)`` 已经删掉了（它会把游戏认得的落点也一起禁掉），落点收不收最后由
+:meth:`NoiseGuard.clean`（游戏自己的逐点判据）说了算，这里只是让候选落在里面。"""
+
+
+# ------------------------------------------------- 噪域：本规划器自己的策略
+# 游戏机制（噪域是什么、哪一点会被吃、会被吃到什么时候）只有一份，在 `blocks.NoiseField` 里。
+# **这一段是"遇到噪域怎么办"** —— 禁区算多保守、手指往哪儿挪、将死的要不要提前松、收尾怎么补按
+# —— 它跟本规划器的时间栅格、手指大概要待多久、以及"这一下按下会顺手判掉谁"绑在一起，所以归
+# 本规划器自己，不跟别的规划器共用：换规划器就是换这一整段。
+#
+# 四个规划器手上这一份**各自独立**（都是当初从 blocks.py 搬过来的），谁想换算法就改自己这份；
+# `tests/noise.py` 会挨个跑四个规划器，谁跟机制对不上就会红。
+
+
+NOISE_TICK_STRIDE = 4
+"""噪域生效期间，就算没有音符也要每隔这么多 tick 走一遍分配器（4 tick = 32ms）。
+
+分配器只在"有音符的帧"上跑，手指却一直按在屏幕上：两根音符之间只要空得久一点（Ametrine 里
+那段空档 1.3 秒），就没人复查在屏手指，噪域扫过来把它吃掉，规划器却仍以为它按着 —— 后面
+依赖它的音符一次都不按。空帧很便宜（只做"复查 + 退休"），所以这段窗口干脆按固定步长走。"""
+
+
 class NoiseGuard:
     """本规划器自己的"噪域门房"：**禁区、落点、接下来会不会死**这三件事归它管。
 
     它拿到的是一张谱面的 :class:`~algorithms.blocks.NoiseField`（机制那一份），再加上本规划器
-    的时间栅格与"手指大概要待多久"；``forbidden`` / ``clear`` 原来是 ``NoiseField`` 上的方法，
-    现在已经归到这里 —— 因为"禁区算多保守、往哪挪"是**规划**，不是游戏的规则。
+    的时间栅格与"手指大概要待多久"；``forbidden`` / ``aim`` 原来是 ``NoiseField`` 上的方法，
+    现在已经归到这里 —— 因为"手指要待多久、落点挑哪一个"是**规划**，不是游戏的规则。
+
+    **这里没有"保守禁区"**：游戏吃不吃一个点，``NoiseField.blocking`` / ``blocking_area`` 已经
+    逐点逐格对拍过了（``tests/noise.py``），禁区就是那个集合本身。唯一还算策略的是这两件：
+
+    * **窗口**：手指不是一瞬间，而是从 ``tick`` 待到 ``tick + span_ticks`` —— 它在这段时间里每
+      一帧都得干净，所以把这段里每一刻的禁区**并起来**（并集只会多禁、不会少禁）；
+    * **落点**：在"这一下判得到的区域"里挑，优先挑判定权（``CheckNote`` 的度量）最小的那个点，
+      见 :meth:`aim`。
+
+    以前那圈 ``buffer(noise_margin)`` 是拿"采样步长 / 我的几何与游戏的误差"当借口加的保险，
+    代价是**把游戏认的落点也一起禁掉**：Petrichor 那 14 个 TAP 就是这么丢的 —— 左半边被一块
+    噪域盖住、音符正好压在盖住的边上，往外挪 0.2 就干净了，被撑大的禁区却报"挪不出去"，
+    于是照样按在会被吃掉的点上。现在改成**候选点由几何提，收不收由游戏自己的逐点判据说了算**
+    （:meth:`clean`），边界上那点浮点误差就自然被否掉，不需要任何外扩。
     """
 
     def __init__(
@@ -62,18 +107,18 @@ class NoiseGuard:
         field: NoiseField | None,
         screen: Screen,
         *,
-        margin: float = 0.0,
         tick_ms: float = 8.0,
-        dwell_ticks: int = 0,
-        lead_ticks: int = 0,
+        span_ticks: int = 1,
         enabled: bool = True,
     ) -> None:
         self.field = field if (enabled and field is not None and field.blocks) else None
         self.screen = screen
-        self.margin = margin
         self.tick_ms = tick_ms
-        self.span_ticks = max(1, dwell_ticks + lead_ticks + 1)
+        self.step = max(tick_ms, SAMPLE_MS) / 1000.0
+        """问"会不会被吃"的步长（秒）：不比 :data:`~algorithms.blocks.SAMPLE_MS` 更细。"""
+        self.span_ticks = max(1, span_ticks)
         self._cache: dict[int, Any] = {}
+        self._moment: dict[float, Any] = {}
         # 禁区/落点要用的几何（原来长在 NoiseField 上）
         self.blocks = tuple(field.blocks) if field is not None else ()
         self.inset_ratio = field.inset_ratio if field is not None else INSET_RATIO
@@ -84,94 +129,168 @@ class NoiseGuard:
         """禁区算的是"虚拟屏上的哪一片"，就是构造时给的那块屏。"""
         return self.screen
 
-    def forbidden(self, lo: float, hi: float, *, margin: float = 0.0, step: float = 1 / 60) -> Any:
-        """``[lo, hi)`` 里"任何时刻踩进去都会被吃掉"的区域（虚拟屏上的多边形）。
+    def moment(self, seconds: float) -> Any:
+        """``seconds`` 那一刻的禁区（``blocking_area``）：同一条时间栅格只算一次。
+
+        Petrichor 一张谱面有 427 块噪域、手指要问的时刻几十万个，而相邻窗口的时刻是重合的
+        （对齐之后重合 4/5），这一层把重复计算砍掉一个量级。
+        """
+        key = round(seconds, 6)
+        if key in self._moment:
+            return self._moment[key]
+        value = self.field.blocking_area(key) if self.field is not None else None
+        self._moment[key] = value
+        return value
+
+    def clean(self, point: Position, lo: float, hi: float) -> bool:
+        """一个**不动的**点从 ``lo`` 待到 ``hi`` 会不会被吃掉 —— 游戏自己的逐点判据。
+
+        这是"候选落点收不收"的**唯一**判据（几何只负责提出候选）。``blocking`` 里的
+        ``|local| <= half`` 是闭区间：落在边界上也算被吃，所以"多边形上离目标最近的点"这种
+        落在噪域边上的候选会被这里否掉 —— 不需要先用 ``buffer`` 把禁区撑大一圈。
+        """
+        if self.field is None:
+            return True
+        return self.field.hits(complex(point.real, point.imag), lo, hi, step=self.step) is None
+
+    def forbidden(self, lo: float, hi: float, *, step: float = 1 / 60) -> Any:
+        """``[lo, hi)`` 里"任何一帧踩进去都会被吃掉"的区域（虚拟屏上的多边形）。
 
         用的是 :meth:`blocks.NoiseField.blocking_area` —— **游戏自己的那两道奇偶门**（原矩形走
-        第一道、inset 矩形走第二道），不是"所有块原矩形的并集"那种保守近似。这一条是要紧的：
-        Ametrine 的 subtract 块（对角可玩空间之外的"洞"）会盖住**全屏**，按原矩形并集算出来的
-        禁区就是全屏，于是每个 drag 都被判成"整块在噪域里" —— 那是**误报**，而且是会害人的误报
-        （照它办就会把触点放进真会被吃的地方）。
+        第一道、inset 矩形走第二道），不是"所有块原矩形的并集"那种保守近似，也**不往外撑余量**。
+        这一条是要紧的：Ametrine 的 subtract 块（对角可玩空间之外的"洞"）会盖住**全屏**，按原
+        矩形并集算出来的禁区就是全屏，于是每个 drag 都被判成"整块在噪域里" —— 那是**误报**，
+        而且是会害人的误报（照它办就会把触点放进真会被吃的地方）。
 
-        这一层只做两件**策略**决定：
-
-        * **窗口**：手指在这一段里得一直站着，所以把 ``[lo, hi)`` 按 ``step`` 采样、把每一刻的
-          禁区**并起来** —— 并集只会多禁、不会少禁；
-        * **余量**：把并集整体往外 ``buffer(margin)``（洞会被缩小，同样是"多禁"那一侧）。
+        采样时刻是"``[lo, hi)`` 按 ``step`` **对齐到绝对时间栅格**"的那些点，外加两端。对齐是为了
+        让相邻 tick（窗口重合 4/5）共享同一次计算（见 :meth:`moment`）—— Petrichor 那张 427 块
+        的谱面，光这一步就值二十几秒。
 
         没有生效的块就返回 ``None``。
         """
         if self.field is None:
             return None
-        moments: set[float] = set()
-        for block in self.field.blocks:
+        moments: set[float] = {lo, hi}
+        if hi > lo:
+            index = math.ceil(lo / step)
+            while index * step < hi:
+                moments.add(index * step)
+                index += 1
+        for block in self.blocks:
             if block.disable <= lo or block.enable >= hi:
                 continue
-            begin, end = max(lo, block.enable), min(hi, block.disable)
-            moments.add(begin)
-            moments.add(end)
-            index = 0
-            while begin + index * step <= end:
-                moments.add(begin + index * step)
-                index += 1
-        shapes: list[Polygon] = []
-        for seconds in moments:
-            area = self.field.blocking_area(seconds)
-            if area is None or area.is_empty:
-                continue
-            shapes.append(area if margin == 0.0 else area.buffer(margin))
+            moments.add(max(lo, block.enable))
+            moments.add(min(hi, block.disable))
+        shapes = [
+            area
+            for area in (self.moment(seconds) for seconds in moments)
+            if area is not None and not area.is_empty
+        ]
         return unary_union(shapes) if shapes else None
 
-    def clear(
+    def aim(
         self,
+        area: Any,
         point: Position,
         rotation: Any,
-        screen: Screen,
         *,
-        lo: float,
-        hi: float,
-        margin: float = 0.0,
-        reach: float = 4.5,
-        samples: int = 48,
-        area: Any = None,
+        tick: int,
+        span_ticks: int | None = None,
+        avoid: Any = None,
         extend: float = 0.0,
         along: Any = None,
     ) -> Position | None:
-        """把一次按下从噪域里挪出来：**沿判定线的法向**平移。
+        """在"这一下判得到的区域"里挑一个落点；挑不出来返回 ``None``。
 
-        垂直判定下唯一进判定的是**横向**偏差（``judging.spine_offset``），沿法向平移一点都
-        不改变它 —— 这是"白拿"的自由度：既不损失判定，也不用牺牲落点（只需还在屏上）。
-        返回挪过去的位置；整条法向都被禁（或都出屏）就返回 ``None``，那说明这一下本来就没救，
-        交给裁判去报 Miss。
+        ``area`` 是**这一下（这一组）判得到的区域** —— 交集思想就在这儿：一次按下要判掉一整组，
+        落点就必须落在这组每个成员都够得着的地方，所以调用方给的是交集。
 
-        ``reach`` 是往两侧各探多远（虚拟屏单位，默认半个屏高）。
-        ``extend`` / ``along``：按下之后手指还要沿 ``along`` 走 ``extend`` 那么远（flick 的
-        划动半径）—— 那一段也得是干净的，否则落点刚躲开、一划又进去了。
+        候选按"判定权"从优到劣，**每一个都用游戏自己的判据验一遍**（:meth:`clean`）：
+
+        1. **音符自己那个点**（横向、法向偏差都是 0）：``CheckNote`` 挑候选的度量
+           ``|Δx| + |Δy| / 2.2`` 在这里取到 0，同一刻/邻近的别的音符再近也顶不掉它 —— 这就是
+           "点在判定线上"的**唯一**作用，不是一条额外要求。它同时还落在窄带里，于是串在后面的
+           drag 会被它"顺手判掉"，手指不用重新按；
+        2. **可玩区里度量最小的点**（:meth:`_cheapest`）：判定线还有干净的部分时它自然落在线上
+           （法向偏差 0 最省），躲不开了就贴着噪域的边、只让出必要的横向偏差；
+        3. **可玩区的代表点**（区域内部一点；重心可能落在凹形区域外面）。
+
+        ``avoid`` 是"这一下按下会顺手判掉别的音符"的**区域**（风格约束：蹭一下换来的是别人一个
+        Bad）。它是在 ``area`` **里面**再切一刀 —— 落点仍旧必须落在这组人的交集里（交集思想），
+        只是尽量躲开别人。躲不开也不能因此丢掉这一下（按下是当帧必须发生的事），所以它是两遍里的
+        第一遍，第二遍放开它。禁区取这一段的并集（见 :meth:`forbidden`）。
+
+        一个候选都不行 = 这几帧真的没有落点，返回 ``None``（调用方据此报账）。
         """
-        if not self.blocks:
+        span = self.span_ticks if span_ticks is None else max(1, span_ticks)
+        lo = self._seconds(tick)
+        hi = self._seconds(tick + span)
+        direction = along if along is not None else rotation * 1j
+        noise = None
+        if self.field is not None and (extend > 0.0 or not self.clean(point, lo, hi)):
+            noise = self.area(tick) if span == self.span_ticks else self.forbidden(lo, hi)
+
+        def usable(candidate: Position) -> bool:
+            if noise is not None and not _ray_clear(noise, self.screen, candidate, direction, extend):
+                return False
+            return self.clean(candidate, lo, hi)
+
+        # 1) 音符自己那个点：禁区干净、也不蹭着别人 —— 就用它（度量 0）
+        if usable(point) and (
+            avoid is None
+            or avoid.is_empty
+            or not avoid.covers(Point(point.real, point.imag))
+        ):
             return point
-        if area is None:
-            area = self.forbidden(lo, hi, margin=margin)
-        # 用 covers 而不是 contains：游戏的 `|local| <= half` 是**闭**区间，落在边界上也算被吃
-        if area is None or not area.covers(Point(point.real, point.imag)):
-            return point
-        normal = rotation * 1j
-        if normal == 0:
+        free = area if noise is None else area.difference(noise)
+        if free.is_empty:
             return None
-        for index in range(1, samples + 1):
-            offset = reach * index / samples
-            for sign in (1.0, -1.0):
-                candidate = point + normal * (sign * offset)
-                if not screen.visible(candidate):
-                    continue
-                if area.covers(Point(candidate.real, candidate.imag)):
-                    continue
-                if extend > 0.0 and not _ray_clear(
-                    area, screen, candidate, along if along is not None else normal * sign, extend
-                ):
-                    continue
-                return candidate
+        # 数值上的一层：`difference` 的边界**正压在**噪域边上，而游戏的判据是闭区间，所以把
+        # 可玩区往内收一丝（1e-4 虚拟屏单位），让"最近点"落在里面；收空了就退回不收的版本，
+        # 由 `clean` 去判。这是万分之一格的数值处理，不是"保险余量"（那圈 0.3 的 buffer 已经删了）。
+        inner = free.buffer(-EPSILON)
+        if not inner.is_empty:
+            free = inner
+        passes = []
+        if avoid is not None and not avoid.is_empty:
+            passes.append(free.difference(avoid))
+        passes.append(free)
+        for candidate_area in passes:
+            if candidate_area.is_empty:
+                continue
+            for candidate in (
+                self._cheapest(candidate_area, point, rotation),
+                interior_of(candidate_area),
+            ):
+                if usable(candidate):
+                    return candidate
         return None
+
+    def _cheapest(self, free: Any, point: Position, rotation: Any) -> Position:
+        """可玩区里**度量最小**的那个点：`CheckNote` 的度量是 `|Δx| + |Δy| / 2.2`。
+
+        把法向压 2.2 倍（:data:`~algorithms.judging.NORMAL_WEIGHT`）之后它就是欧氏距离，于是
+        "最近点"就是这个度量的最小点 —— 判定线还有干净的部分时结果自然落在线（Δy = 0）上，
+        躲不开时贴着噪域边（横向刚好让出必要的量、法向不浪费）。度量与游戏是同一个数，
+        方向也就不用再定：横向 1 倍、法向 1/2.2 倍。
+        """
+        if rotation == 0:
+            return interior_of(free)
+        inverse = rotation.conjugate()
+        weight = NORMAL_WEIGHT
+        x0, y0 = point.real, point.imag
+        # [Δx, Δy / 2.2]，其中 [Δx, Δy] = conj(rotation) · (p − point)
+        matrix = [
+            inverse.real,
+            -inverse.imag,
+            inverse.imag / weight,
+            inverse.real / weight,
+            -(inverse.real * x0 - inverse.imag * y0),
+            -(inverse.imag / weight * x0 + inverse.real / weight * y0),
+        ]
+        here = nearest_points(affine_transform(free, matrix), Point(0.0, 0.0))[0]
+        local = complex(here.x, here.y * weight) * rotation
+        return Position(point.real + local.real, point.imag + local.imag)
 
     @property
     def active(self) -> bool:
@@ -186,40 +305,9 @@ class NoiseGuard:
             return None
         if tick in self._cache:
             return self._cache[tick]
-        value = self.forbidden(
-            self._seconds(tick), self._seconds(tick + self.span_ticks), margin=self.margin
-        )
+        value = self.forbidden(self._seconds(tick), self._seconds(tick + self.span_ticks))
         self._cache[tick] = value
         return value
-
-    def place(
-        self,
-        point: Position,
-        rotation: Any,
-        tick: int,
-        *,
-        span_ticks: int | None = None,
-        extend: float = 0.0,
-        along: Any = None,
-    ) -> Position | None:
-        """按下点落在禁区里就沿判定线的法向挪出去；挪不出去返回 ``None``。
-
-        ``extend`` / ``along`` 给 flick 用：划动那一段也得干净（见 :meth:`NoiseField.clear`）。
-        """
-        if self.field is None:
-            return point
-        span = self.span_ticks if span_ticks is None else max(1, span_ticks)
-        return self.clear(
-            point,
-            rotation,
-            self.screen,
-            lo=self._seconds(tick),
-            hi=self._seconds(tick + span),
-            margin=self.margin,
-            area=self.area(tick),
-            extend=extend,
-            along=along,
-        )
 
     def doomed(self, position: Position, tick: int, until_tick: int) -> bool:
         """这根手指停在 ``position`` 不动、一直占到这个 tick，会不会被噪域吃掉。"""
@@ -229,8 +317,8 @@ class NoiseGuard:
             self.field.hits(
                 position,
                 self._seconds(tick),
-                self._seconds(until_tick) + self.tick_ms / 1000.0,
-                step=self.tick_ms / 1000.0,
+                self._seconds(until_tick) + self.step,
+                step=self.step,
             )
             is not None
         )
@@ -348,6 +436,11 @@ def repair_noise(
     )
 
 
+def _tolerance(kind: NoteType) -> float:
+    """这一类音符游戏**判得到**的横向容差：drag 是 2.1 谱面单位（1.89），其余是 1.9（1.71）。"""
+    return DRAG_TOLERANCE if kind is NoteType.DRAG else TAP_TOLERANCE
+
+
 def _ray_clear(area: Any, screen: Screen, start: Position, along: Any, length: float) -> bool:
     """从 ``start`` 沿 ``along`` 走 ``length`` 这一条线段是不是整段都在禁区外、且都在屏上。
 
@@ -392,13 +485,6 @@ class RadicalConfig:
     avoid_noise: bool = field(
         default=True,
         metadata={"help": "按下时避开噪域（4.0.1 的 blockAreaList）：落进噪域的手指会被废掉"},
-    )
-    noise_margin: float = field(
-        default=0.3,
-        metadata={
-            "help": "避噪域时把区域往外扩这么多（虚拟屏单位）：inset 的真值已经有了（0.05 / 0.25，见 "
-            "blocks.INSET_*），这一圈余量现在只是保险（采样步长 + 我的几何与游戏之间的误差）"
-        },
     )
 
 
@@ -459,6 +545,7 @@ class Pointer:
 class PointerAllocator:
     __slots__ = (
         "screen",
+        "builder",
         "flick_start",
         "flick_duration",
         "flick_repeats",
@@ -482,6 +569,7 @@ class PointerAllocator:
         warnings: list[str] | None = None,
     ) -> None:
         self.screen = screen
+        self.builder = JudgeAreaBuilder(screen)
         self.flick_start = config.flick_start
         self.flick_duration = config.flick_end - config.flick_start
         if self.flick_duration <= 0:
@@ -501,31 +589,32 @@ class PointerAllocator:
         self.guard = NoiseGuard(
             noise,
             screen,
-            margin=config.noise_margin,
             tick_ms=1.0,
-            dwell_ticks=MIN_DWELL_MS,
+            span_ticks=MIN_DWELL_MS,
             enabled=config.avoid_noise,
         )
         self.warnings = warnings if warnings is not None else []
 
     def _place(self, note: PlainNote, *, swipe: bool = False) -> Position:
-        """按下点落在噪域里就沿判定线的法向挪出去（横向偏差不变，判定不受影响）。
+        """落在噪域里就改到"这一下判得到的区域"里**度量最小**的那个点（见 :meth:`NoiseGuard.aim`）。
 
         ``swipe`` 给 flick 用：划动那一段（``flick_radius``）也得干净，否则落点刚躲开、
         一划又进去了。
         """
-        place = self.guard.place(
+        area = self.builder.band(note.position, note.rotation, half_width=_tolerance(note.kind))
+        place = self.guard.aim(
+            area if area is not None else note.position,
             note.position,
             note.rotation,
-            self.now,
+            tick=self.now,
             extend=self.screen.flick_radius if swipe else 0.0,
             along=note.rotation * self.rotate_factor,
         )
         if place is None:
-            if len(self.warnings) < 20:
+            if len(self.warnings) < WARNING_LIMIT:
                 self.warnings.append(
-                    f"{self.now / 1000.0:.3f}s 的 {note.kind.name} 落在这张谱面保守判定的噪域"
-                    f"禁区里、沿判定线法向也挪不出去（是否真丢由裁判说了算）"
+                    f"{self.now / 1000.0:.3f}s 的 {note.kind.name} 这一刻的判定区整块都在噪域里、"
+                    f"没有可玩的落点（这一下会丢）"
                 )
             return note.position
         return place

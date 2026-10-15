@@ -46,7 +46,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, NamedTuple
 
 
@@ -239,6 +239,14 @@ class BlockArea:
     moves: tuple[MoveKey, ...]
     scales: tuple[ScaleKey, ...]
     rotates: tuple[RotateKey, ...]
+    _shapes: dict[tuple[float, float, float], BlockShape | None] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    """``shape()`` 的缓存：``(屏宽, 屏高, 时刻) -> 形状``。
+
+    **纯缓存，不改任何判据**：形状本来就是 ``seconds`` 的纯函数，而同一块噪域在同一帧里会被问
+    好几遍（"这根手指会不会死""落点在不在禁区里""禁区多边形"各问一次）—— Petrichor 一张谱面
+    427 块，`shape()` 的调用次数上百万。表满了整表丢掉，不做淘汰策略。"""
 
     # ---- 时间窗 ----
 
@@ -271,6 +279,17 @@ class BlockArea:
         )
 
     def shape(self, seconds: float, screen: Screen) -> BlockShape | None:
+        """这一时刻的形状（带缓存，见 :attr:`_shapes`）：真算在 :meth:`_shape` 里。"""
+        key = (screen.width, screen.height, round(seconds, 6))
+        if key in self._shapes:
+            return self._shapes[key]
+        if len(self._shapes) > 8192:
+            self._shapes.clear()
+        value = self._shape(seconds, screen)
+        self._shapes[key] = value
+        return value
+
+    def _shape(self, seconds: float, screen: Screen) -> BlockShape | None:
         """把 ``UpdateBlocksTransform``（0x1cdb5b0）与 ``UpdateBlockAnimations``（0x1cdb864）
         合起来算一遍：返回这一时刻的形状；不在 ``[appear, disappear)`` 里返回 ``None``。
 
@@ -486,6 +505,14 @@ INSET_CAP = 0.25
 当前世界尺寸才换成局部单位，所以屏高在 5 个单位以上的块都被这个上限压住。
 """
 
+SAMPLE_MS = 8.0
+"""问"这根手指会不会被吃掉"的时间步长（毫秒）：**采样不必比游戏的一帧更细**。
+
+游戏是逐帧问一次（60fps ≈ 16.7ms），8ms 已经细一倍；规划器自己的时间栅格比这更细时（激进算法
+是 1ms）再按自己的栅格采只是白算 —— 一次采样要过一遍全场每一块噪域的命中判定。设计侧的
+``exposure`` / ``repair_noise`` 用的也是这个粒度。
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class NoiseField:
@@ -495,6 +522,27 @@ class NoiseField:
     screen: Screen | None = None
     inset_ratio: float = INSET_RATIO
     inset_cap: float = INSET_CAP
+    _seconds: dict[int, tuple[BlockArea, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    """按整秒索引"这一秒里**可能**生效的块"（纯索引，见 :meth:`at`）。
+
+    Petrichor 一张谱面 427 块、手指要问的时刻上百万个，逐点问一次命中要扫 427 遍 ``is_active``
+    —— 索引之后每次只扫十几遍。**判据仍然是 ``is_active`` 那一条**，索引只负责缩小范围。"""
+
+    def at(self, seconds: float) -> tuple[BlockArea, ...]:
+        """``seconds`` 所在的那一秒里**可能**生效的块（超集；真正生效仍由 ``is_active`` 判）。"""
+        second = math.floor(seconds)
+        cached = self._seconds.get(second)
+        if cached is not None:
+            return cached
+        bucket = tuple(
+            block
+            for block in self.blocks
+            if block.enable < second + 1.0 and block.disable > second
+        )
+        self._seconds[second] = bucket
+        return bucket
 
     def __bool__(self) -> bool:
         return bool(self.blocks)
@@ -546,7 +594,7 @@ class NoiseField:
         first_subtract: BlockArea | None = None
         first_normal: BlockArea | None = None
 
-        for block in self.blocks:
+        for block in self.at(seconds):
             if not block.is_active(seconds):
                 continue
             if block.contains_original(point, seconds, screen):
@@ -605,7 +653,7 @@ class NoiseField:
         subtract_original: list[Polygon] = []
         normal_touch: list[Polygon] = []
         subtract_touch: list[Polygon] = []
-        for block in self.blocks:
+        for block in self.at(seconds):
             if not block.is_active(seconds):
                 continue
             shape = block.shape(seconds, screen)
@@ -655,7 +703,7 @@ class NoiseField:
     def active_near(self, lo: float, hi: float) -> bool:
         """``[lo, hi]`` 里有没有任何一块噪域可能生效（便宜的前置判断）。"""
         return any(
-            block.enable < hi and block.disable > lo for block in self.blocks
+            block.enable < hi and block.disable > lo for block in self.at(lo)
         )
 
     def mirrored(self) -> NoiseField:

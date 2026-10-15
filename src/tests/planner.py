@@ -1,7 +1,9 @@
-"""规划器自检：按下落点不许"顺手判掉"别的音符（`geometric` 的补集落脚点）。
+"""规划器自检：新按下的落点尽量别"顺手判掉"别的音符，但躲的时候不许跑出这一下判得到的范围。
 
 判据是**风格约束**，不是判定：每一发 `DOWN` 若落在某个 TAP / Hold 头的容差带里，那一下就必须
-是"冲着它去的"（Δ 在 `HEAD_WINDOW` 里）；否则这一发就是计划自己埋的蹭键。
+是"冲着它去的"（Δ 在 `HEAD_WINDOW` 里）；否则这一发就是计划自己埋的蹭键。躲的办法是在
+"这一下判得到的区域"**里面**再切掉别人的容差带（不是跳到别处去按），所以躲完还必须判得到自己
+那一下 —— 这两条一起才是完整的：躲是风格，判得到是实效。
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import math
 from algorithms.chart import Chart, JudgeLine, Note, NoteType, Track
 from algorithms.geometry import Screen
 from algorithms.judging import (
+    DRAG_TOLERANCE,
     HEAD_WINDOW,
     SCAN_AHEAD,
     SCAN_BACK,
@@ -66,7 +69,8 @@ class _Quiet:
 
 
 def check_planner() -> list[str]:
-    """一个 drag 挤在一个还没按的 Hold 前面：新按下的落点必须避开它的容差带。"""
+    """一个 drag 挤在一个还没按的 Hold 前面：新按下的落点要让开 Hold 的容差带，还不能跑出
+    drag 自己判得到的范围（让开的办法是在交集里切一刀，不是跑到别处去按）。"""
     problems: list[str] = []
     try:
         from algorithms import geometric
@@ -80,33 +84,26 @@ def check_planner() -> list[str]:
 
     problems += stray_downs(chart, result)
 
-    # 正面判据：这一发真的"先按到别处、再 MOVE 过来"了（否则上面那条空过就没意义）
-    moved = False
-    for timestamp, events in result.frames:
-        for event in events:
-            if event.action is not Touch.DOWN or abs(event.x - TAP_X) < 1e-9:
-                continue
-            for later, later_events in result.frames:
-                if later <= timestamp or later - timestamp > 100:
-                    continue
-                if any(
-                    item.pointer == event.pointer
-                    and item.action is Touch.MOVE
-                    and abs(item.x - TAP_X) < 1e-9
-                    for item in later_events
-                ):
-                    moved = True
-    if not moved:
+    # 正面判据：那一发真的让开了 —— 横向让出的量至少一个容差带（不然还是踩在 Hold 的带子里），
+    # 但必须还在 drag 判得到的范围里（躲过头就等于丢掉 drag 那一笔）
+    pressed = [
+        (stamp, event)
+        for stamp, batch in result.frames
+        for event in batch
+        if event.action is Touch.DOWN and abs(stamp / 1000.0 - 10.0) < 0.02
+    ]
+    gap = abs(pressed[0][1].x - TAP_X) if pressed else 0.0
+    if not pressed or not (TAP_TOLERANCE <= gap < DRAG_TOLERANCE):
         problems.append(
-            "drag 那一发按下落在 Hold 的容差带里，却没有「先按到补集、再 MOVE 到目标」——"
-            "补集落脚点这一条被摘掉了？"
+            f"drag 那一发的落点该让出 Hold 的容差带（{TAP_TOLERANCE:.2f}）又不超出 drag 自己"
+            f"判得到的范围（{DRAG_TOLERANCE:.2f}）：实际横向让出 {gap:.2f}，{pressed[:2]}"
         )
 
-    # 关掉这一条（down_lead_ticks=0）时上面两条都该红 —— 反向验证
-    off = geometric.GeometricPlanner({"down_lead_ticks": 0}).plan(chart, _Quiet())
+    # 关掉这一条（avoid_grazes=False）时上面两条都该红 —— 反向验证
+    off = geometric.GeometricPlanner({"avoid_grazes": False}).plan(chart, _Quiet())
     if not stray_downs(chart, off):
         problems.append(
-            "把 down_lead_ticks 关到 0 之后，按下依旧没有落在别人带子里 —— "
+            "把 avoid_grazes 关到 False 之后，按下依旧没有落在别人带子里 —— "
             "判据抓不住东西（多半是容差带算错了）"
         )
 
