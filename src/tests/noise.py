@@ -23,6 +23,7 @@ from algorithms.chart import Chart, JudgeLine, Note, NoteType, Track
 from algorithms.geometry import JudgeAreaBuilder
 from algorithms.judging import TAP_TOLERANCE, Verdict, simulate, spine_offset
 from algorithms.utils import PlanResult, SilentProgress, Touch, TouchEvent
+from shapely.geometry import Point
 
 from .archive import mirror_chart
 from .referee import PRESS_Y, SCREEN, TAP_X, _line
@@ -78,7 +79,13 @@ def _policies(field: NoiseField, **options: Any) -> list[tuple[str, Any]]:
     return [
         (
             module.__name__.rsplit(".", 1)[-1],
-            module.NoiseGuard(field, field.screen or SCREEN, **options),
+            module.NoiseGuard(
+                field,
+                field.screen or SCREEN,
+                clearance=module.CONFIG().noise_clearance,
+                weight=module.CONFIG().noise_weight,
+                **options,
+            ),
         )
         for module in PLANNERS
     ]
@@ -569,8 +576,9 @@ def check_noise() -> list[str]:
     expect(
         bool(downs)
         and abs(downs[0][1].y - PRESS_Y) < 1e-6
-        and 0.3 < abs(downs[0][1].x - TAP_X) < 0.45,
-        f"这一下的落点该落在判定线上、横向**只让出必要的那一点**（真实需要 0.35）：{downs[:2]}",
+        and 0.595 < abs(downs[0][1].x - TAP_X) < 0.605,
+        f"这一下的落点该落在判定线上、横向**只让出必要的那一点 + 边界余量**"
+        f"（0.35 + 0.25 = 0.60）：{downs[:2]}",
     )
 
     # 低层一点：aim() 挑出来的点必须（a）不在噪域里、（b）判定线还有干净的部分时就落在线上
@@ -592,9 +600,9 @@ def check_noise() -> list[str]:
         expect(
             moved is not None
             and abs(moved.imag - PRESS_Y) < 1e-6
-            and 0.7 < _lateral_gap(moved, origin) < 0.9,
+            and 1.045 < _lateral_gap(moved, origin) < 1.055,
             f"[{who}] 挪出去的点该落在判定线上（法向 0）、横向**只让出必要的那一点**"
-            f"（真实需要 0.8；带上保险余量就会更大）：{moved}",
+            f"（真实需要 0.8，再加 {policy.clearance:.2f} 的边界余量）：{moved}",
         )
     # ---- 9b) Petrichor 那 14 个 TAP：**法向**是唯一出路，而且出路在 4.2~4.9 那么远
     # 实测（真谱面，`_re/dbg_pick.py`）：判定线**竖直**（所以法向是水平的），质点 (3.2 或
@@ -640,10 +648,90 @@ def check_noise() -> list[str]:
     expect(
         bool(far_downs)
         and abs(far_downs[0][1].y - PRESS_Y) < 1e-6
-        and 4.6 < abs(far_downs[0][1].x - TAP_X) < 5.0,
-        f"沿法向挪：横向偏差必须一点不变，而且**只挪必要的那一点**（真实需要 4.75；"
-        f"带保险余量就会到 5.05）：{far_downs[:2]}",
+        and 4.995 < abs(far_downs[0][1].x - TAP_X) < 5.005,
+        f"沿法向挪：横向偏差必须一点不变，而且**只挪必要的那一点 + 边界余量**"
+        f"（4.75 + 0.25 = 5.00）：{far_downs[:2]}",
     )
+
+    # ---- 9c) 落点必须**离噪域边界留出余量**（`noise_clearance`，默认 0.25）
+    # 这是 2026-10-15 那一局的账：手挪出去了、但挪到"压线"上（离边界 0.000），设备那边位置一
+    # 整量化、帧一晚，当帧就被吃掉 —— 三张谱面 11 个音符。价值函数（判定权 + 权重 × 还差多少
+    # 余量）保证"只要站远一点的代价付得起就站远"，所以落点到精确禁区的距离必须 ≥ 那圈余量。
+    for who, policy in _policies(edge):
+        band_low = JudgeAreaBuilder(SCREEN).band(origin, 1 + 0j, half_width=TAP_TOLERANCE)
+        blocked = policy.forbidden(0.0, 0.05)
+        moved_low = policy.aim(band_low, origin, 1 + 0j, tick=0, span_ticks=1)
+        expect(
+            policy.clearance > 0.0 and moved_low is not None and blocked is not None
+            and blocked.distance(Point(moved_low.real, moved_low.imag)) >= policy.clearance - 1e-6,
+            f"[{who}] 落点该离噪域边界留出 {policy.clearance} 的余量（压线会被设备吃掉）："
+            f"{moved_low}（离边界 "
+            f"{blocked.distance(Point(moved_low.real, moved_low.imag)) if moved_low is not None and blocked is not None else '—'}）",
+        )
+    far_blocked = far.noise_field().blocking_area(1.0)
+    if far_downs and far_blocked is not None:
+        chosen = Point(far_downs[0][1].x, far_downs[0][1].y)
+        expect(
+            far_blocked.distance(chosen) >= 0.24,
+            f"竖直判定线那一发也该离边界留余量：离边界 {far_blocked.distance(chosen):.3f}",
+        )
+
+    # ---- 9d) 禁区的**时间窗口**：游戏是按帧（60fps）更新噪域变换的，触控落进哪一帧有一两帧
+    # 的余量 —— 只问"按下那一刻"（以及按住那一小段）是不够的。实测（`_re/dbg_window.py`）：11 个
+    # 落点在按下那一刻都离边界 0.25，但在 **t−33ms** 正好压在边界上，而那一带的边界以 ~7 单位/秒
+    # 在走。所以禁区要取 [t−33ms, t+按住+33ms] 的**并集**，余量是对着这一片量的。
+    sliding = Chart(
+        3,
+        0.0,
+        SCREEN,
+        # 竖着的判定线：法向是 ±x，于是"往右挪出去"不改变判定（横向是 y）；噪域块在 y 上超出屏幕，
+        # 逼着落点只能从**会动的那个边**出去 —— 这样"窗口问不问前后几帧"才真的被测到。
+        [_vertical([Note(NoteType.TAP, 1.0, 0.0, 0.0)])],
+        (
+            _block(
+                0.0,
+                0.825,
+                -0.5,
+                1.5,
+                enable=0.0,
+                disable=100.0,
+                moves=(MoveKey(0.0, 0.0, 0.5, 0, 0), MoveKey(2.0, 0.6, 0.5, 0, 0)),
+            ),
+        ),
+    )
+    # 三个规划器各来一遍：这一段策略是三份拷贝，锚点必须对三份都红
+    for who, module in ((m.__name__.rsplit(".", 1)[-1], m) for m in PLANNERS):
+        sliding_plan = create(who, None).plan(sliding, SilentProgress())
+        sliding_report = simulate(sliding, sliding_plan)
+        sliding_downs = [
+            (stamp, event)
+            for stamp, batch in sliding_plan.frames
+            for event in batch
+            if event.action is Touch.DOWN
+        ]
+        expect(
+            _verdict_of(sliding_report, 1.0) is Verdict.PERFECT and not sliding_report.blocked,
+            f"[{who}] 滑动噪域下这一下也得判到：{_verdict_of(sliding_report, 1.0)}，"
+            f"暴露 {sliding_report.blocked}",
+        )
+        config = module.CONFIG()
+        guard = module.NoiseGuard(
+            sliding.noise_field(),
+            SCREEN,
+            tick_ms=geometric.FRAME_MS,
+            span_ticks=geometric.DRAG_DWELL_TICKS,
+            clearance=config.noise_clearance,
+            weight=config.noise_weight,
+        )
+        swept = guard.forbidden(1.0 - 0.033, 1.0 + geometric.DRAG_DWELL_TICKS * 0.008 + 0.033)
+        expect(
+            bool(sliding_downs)
+            and swept is not None
+            and swept.distance(Point(sliding_downs[0][1].x, sliding_downs[0][1].y))
+            >= config.noise_clearance - 0.05,
+            f"[{who}] 落点该离「前后各 33ms 扫过的那片噪域」也有余量"
+            f"（只问按下那一刻会漏掉相邻帧）：{sliding_downs[:2]}",
+        )
 
     # 整屏都被盖住时没有落点 → None（不许"照原样按下去"）
     everything = _field(_block(0.0, 1.0, enable=0.0, disable=100.0), ratio=0.0, cap=0.0)
@@ -666,8 +754,8 @@ def check_noise() -> list[str]:
         band = JudgeAreaBuilder(SCREEN).band(press, 1 + 0j, half_width=TAP_TOLERANCE)
         parked = policy.aim(band, press, 1 + 0j, tick=0, span_ticks=1)
         expect(
-            parked is not None and abs(parked.imag - 4.0) < 0.2,
-            f"[{who}] 不管划动时，缝里贴着边的那点就该被选中（法向只让出必要的一点）：{parked}",
+            parked is not None and abs(parked.imag - 4.0) < 0.35,
+            f"[{who}] 不管划动时，缝里贴着边的那点就该被选中（法向只让出必要的一点 + 余量）：{parked}",
         )
         expect(
             policy.aim(band, press, 1 + 0j, tick=0, span_ticks=1, extend=1.6, along=1j) is None,
@@ -752,8 +840,6 @@ def check_noise() -> list[str]:
     # `forbidden()` 给的是"这一段里每一刻的命中区域的并集"，必须**包住**裁判会吃人的每一个点，
     # 否则规划器会心安理得地把落点放进一个真会被吃掉的位置。网格上把两个谓词对一遍：
     # 凡是 `blocks_at` 说"吃"的点，都得落在 `forbidden(那么一刻)` 里。
-    from shapely.geometry import Point
-
     moving = _block(
         0.1,
         0.9,
@@ -831,8 +917,6 @@ def check_noise() -> list[str]:
     )
 
     # ---- 12) 精确禁区：两道奇偶门的**集合版**（`blocking_area`）必须与逐点 `blocking` 一致
-    from shapely.geometry import Point
-
     compared = 0
     # 第二个场专门盯"奇覆盖"：**两块重叠的 subtract**（单块时 奇覆盖 == 并集，退化了也看不出来）
     twin = _field(
